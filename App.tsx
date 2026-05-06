@@ -2113,6 +2113,10 @@ function EditSheet({ task, onSave, onCancel, accentColor }: EditSheetProps) {
   // either, since the IME covers it). When keyboard is down, lift above the system
   // nav inset so Cancel/Save aren't hidden behind the gesture bar / nav buttons.
   const panelBottom = kbHeight > 0 ? kbHeight : insets.bottom;
+  const visibleHeight = Dimensions.get('window').height - kbHeight - insets.top;
+  const scrollMaxHeight = kbHeight > 0
+    ? Math.max(140, Math.min(220, visibleHeight - 170))
+    : 508;
 
   return (
     <RootPortal onBack={cancel}>
@@ -2126,7 +2130,7 @@ function EditSheet({ task, onSave, onCancel, accentColor }: EditSheetProps) {
           </View>
           {/* Scrollable content. Buttons are pinned outside the ScrollView so they
               stay visible regardless of keyboard state or how much content scrolls. */}
-          <ScrollView style={{ maxHeight: kbHeight > 0 ? 248 : 508 }} contentContainerStyle={styles.sheetContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+          <ScrollView style={{ maxHeight: scrollMaxHeight }} contentContainerStyle={styles.sheetContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
             <Text style={[styles.sheetTitle, { color: T.textMute, fontFamily: jks('700') }]}>Edit Task</Text>
             <TextInput ref={setTextInputRef} defaultValue={task.text} onChangeText={handleChangeText} multiline scrollEnabled
               autoCorrect={false} autoComplete="off" spellCheck={false} importantForAutofill="no"
