@@ -1237,6 +1237,16 @@ const SAMPLE_ARCHIVE: ArchivedTask[] = [
   { id: 101, text: 'Completed tasks appear here. Visit Settings to configure auto-clear.', tier: 'low', completedAt: Date.now() - 3600000 },
 ];
 
+function ensurePersonalListPresent(lists: TaskList[] = []): TaskList[] {
+  const now = Date.now();
+  const personal = lists.find(l => l.id === DEFAULT_LIST_ID);
+  if (personal) return [personal, ...lists.filter(l => l.id !== DEFAULT_LIST_ID)];
+  return [
+    { id: DEFAULT_LIST_ID, name: DEFAULT_LIST_NAME, tasks: [], createdAt: now, updatedAt: now },
+    ...lists,
+  ];
+}
+
 async function loadAll() {
   const version = await AsyncStorage.getItem('tri_version');
   if (version !== APP_VERSION) {
@@ -1277,7 +1287,7 @@ async function loadAll() {
     const parsed = JSON.parse(listsRaw) as TaskList[];
     if (Array.isArray(parsed) && parsed.length > 0) {
       // Backfill updatedAt for any pre-v1.2-pre-final lists missing it.
-      lists = parsed.map(l => ({ ...l, updatedAt: l.updatedAt ?? l.createdAt ?? now }));
+      lists = ensurePersonalListPresent(parsed.map(l => ({ ...l, updatedAt: l.updatedAt ?? l.createdAt ?? now })));
     } else {
       lists = [{ id: DEFAULT_LIST_ID, name: DEFAULT_LIST_NAME, tasks: SAMPLE_TASKS, createdAt: now, updatedAt: now }];
     }
@@ -1300,6 +1310,7 @@ async function loadAll() {
       ];
     } catch {}
   }
+  lists = ensurePersonalListPresent(lists);
 
   let activeListId = activeIdRaw ? JSON.parse(activeIdRaw) as string : lists[0].id;
   if (!lists.some(l => l.id === activeListId)) activeListId = lists[0].id;
@@ -4430,13 +4441,14 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
               });
             }}
             onClose={() => setActionList(null)}
-            onShareList={sharedDoc || !isPaid || isPersonal ? undefined : () => {
+            onShareList={sharedDoc || !isPaid || isPersonal ? undefined : (pendingName?: string) => {
               // Promote to shared. Defer the confirm() call into a microtask
               // so it runs AFTER the action sheet unmount cycle settles —
               // React can drop state updates issued from inside an unmounting
               // subtree, and we were seeing the dialog never appear.
-              const target = actionList;
-              if (!target) return;
+              const baseTarget = actionList;
+              if (!baseTarget) return;
+              const target = pendingName ? { ...baseTarget, name: pendingName } : baseTarget;
               setActionList(null);
               setTimeout(() => {
                 confirm({
@@ -5914,7 +5926,7 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
             <View style={{ paddingVertical: 14, paddingHorizontal: 14 }}>
               <Text style={[styles.settingRowLabel, { color: T.text, fontFamily: jks('600') }]}>Join a shared list</Text>
               <Text style={{ color: T.textMute, fontSize: 12, fontFamily: jks('400'), marginTop: 6, lineHeight: 17 }}>
-                Got a 6-character share code from someone? Enter it to add their list to your pill row.
+                Got a 6-character share code from someone? Enter it to add their list to your lists.
                 You can be in {SHARED_TASK_LIST_LIMIT} shared task lists and {SHARED_GROCERY_LIMIT} shared grocery list at a time.
               </Text>
               <TouchableOpacity
@@ -6787,8 +6799,12 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   // Apply a restored remote slice back into local state + AsyncStorage. Mirrors
   // the writes that loadAll() does so the local cache stays consistent.
   function applyRestoredState(s: SyncedState) {
-    setListsState(s.lists);
-    setActiveListIdState(s.activeListId);
+    const restoredLists = ensurePersonalListPresent(s.lists);
+    const restoredActiveListId = restoredLists.some(l => l.id === s.activeListId)
+      ? s.activeListId
+      : DEFAULT_LIST_ID;
+    setListsState(restoredLists);
+    setActiveListIdState(restoredActiveListId);
     setArchiveState(s.archive);
     setAccentLightState(s.accentLight);
     setAccentDarkState(s.accentDark);
@@ -6800,8 +6816,8 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     setDarkModeState(s.darkMode);
     setGroceryItemsState(s.groceryItems);
     AsyncStorage.multiSet([
-      ['tri_lists', JSON.stringify(s.lists)],
-      ['tri_active_list_id', JSON.stringify(s.activeListId)],
+      ['tri_lists', JSON.stringify(restoredLists)],
+      ['tri_active_list_id', JSON.stringify(restoredActiveListId)],
       ['tri_archive', JSON.stringify(s.archive)],
       ['tri_theme', JSON.stringify(s.themeId)],
       ['tri_custom_themes', JSON.stringify(s.customThemeDrafts)],
