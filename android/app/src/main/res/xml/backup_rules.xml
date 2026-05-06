@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Legacy backup rules for Android 6–11 (pre targetSdk 31). Mirrors
+  data_extraction_rules.xml so behaviour is consistent across versions.
+-->
+<full-backup-content>
+  <include domain="database" path="RKStorage" />
+  <include domain="sharedpref" path="." />
+  <include domain="file" path="." />
+  <exclude domain="sharedpref" path="RN_ENCRYPTED_STORAGE_SHARED_PREF.xml" />
+</full-backup-content>
