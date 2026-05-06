@@ -216,6 +216,7 @@ const SHARED_GROCERY_LIMIT = 1;
 // the user doc fields (joinedSharedLists, syncEnabledForGrocery) so a fresh
 // install on another device picks them up alongside the rest of the slice.
 const SHARED_JOINED_LISTS_KEY = 'tri_shared_joined';
+const SHARED_TASK_ORDER_KEY = 'tri_shared_task_order';
 const SHARED_GROCERY_TOGGLE_KEY = 'tri_shared_grocery_view';   // '1' = viewing shared, '0' or absent = viewing private
 
 
@@ -4092,7 +4093,8 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     // can name it in one motion. addList already switches the active list to the new one.
     const id = addList('New List');
     // Synthesize a TaskList for the action sheet — avoids waiting for a state round-trip.
-    setActionList({ id, name: 'New List', tasks: [], createdAt: Date.now() });
+    const now = Date.now();
+    setActionList({ id, name: 'New List', tasks: [], createdAt: now, updatedAt: now });
   }, [isPaid, addList]);
   const T = useT();
   const TIERS = TIERS_DEF(T);
@@ -6462,7 +6464,8 @@ function TriorityApp() {
   const [showGroceryUpsell, setShowGroceryUpsell] = useState(false);
   const [ready, setReady] = useState(false);
   const [screen, setScreen] = useState<Screen>('list');
-  const [lists, setListsState] = useState<TaskList[]>([{ id: DEFAULT_LIST_ID, name: DEFAULT_LIST_NAME, tasks: SAMPLE_TASKS, createdAt: Date.now() }]);
+  const [lists, setListsState] = useState<TaskList[]>([{ id: DEFAULT_LIST_ID, name: DEFAULT_LIST_NAME, tasks: SAMPLE_TASKS, createdAt: Date.now(), updatedAt: Date.now() }]);
+  const [sharedTaskOrder, setSharedTaskOrderState] = useState<string[]>([]);
   const [activeListId, setActiveListIdState] = useState<string>(DEFAULT_LIST_ID);
   const [archive, setArchiveState] = useState<ArchivedTask[]>(SAMPLE_ARCHIVE);
   const [accentLight, setAccentLightState] = useState<string | null>(null);
@@ -6572,6 +6575,15 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       setAutoClearState(data.autoClear);
       setDarkModeState(data.darkMode);
       setGroceryItemsState(data.groceryItems);
+      try {
+        const rawSharedOrder = await AsyncStorage.getItem(SHARED_TASK_ORDER_KEY);
+        if (rawSharedOrder) {
+          const parsedSharedOrder = JSON.parse(rawSharedOrder);
+          if (Array.isArray(parsedSharedOrder)) {
+            setSharedTaskOrderState(parsedSharedOrder.filter((id) => typeof id === 'string'));
+          }
+        }
+      } catch {}
       setShowOnboarding(!data.onboarded);
       setReady(true);
       // Reminders are global across lists — flatten task arrays for the sync.
@@ -6862,9 +6874,14 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     // as a follow-up.
     const sharedIds = sharedTaskIdSetRef.current;
     const privateOnly = newLists.filter(l => !sharedIds.has(l.id));
+    const sharedOnlyIds = newLists.filter(l => sharedIds.has(l.id)).map(l => l.id);
     setListsState(privateOnly);
     persistLists(privateOnly);
     AsyncStorage.setItem('tri_list_order', JSON.stringify(privateOnly.map(l => l.id))).catch(() => {});
+    if (sharedOnlyIds.length > 0) {
+      setSharedTaskOrderState(sharedOnlyIds);
+      AsyncStorage.setItem(SHARED_TASK_ORDER_KEY, JSON.stringify(sharedOnlyIds)).catch(() => {});
+    }
   }, []);
 
   const setTasks = useCallback((fn: (prev: Task[]) => Task[]) => {
@@ -6932,19 +6949,19 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
 
 
   const deleteList = useCallback((id: string) => {
+    if (id === DEFAULT_LIST_ID) return;
+    let nextActiveListId: string | null = null;
     setListsState(prev => {
       if (prev.length <= 1) return prev; // never delete the last list
       const next = prev.filter(l => l.id !== id);
+      if (next.length === prev.length || next.length === 0) return prev;
+      if (activeListId === id) {
+        nextActiveListId = (next.find(l => l.id === DEFAULT_LIST_ID) ?? next[0]).id;
+      }
       persistLists(next);
       return next;
     });
-    if (activeListId === id) {
-      setListsState(prev => {
-        if (prev.length === 0) return prev;
-        setActiveListId(prev[0].id);
-        return prev;
-      });
-    }
+    if (nextActiveListId) setActiveListId(nextActiveListId);
   }, [activeListId, setActiveListId]);
 
   const setArchive = useCallback((fn: (prev: ArchivedTask[]) => ArchivedTask[]) => {
@@ -7032,16 +7049,37 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   // declared further down the function body.
   useEffect(() => { sharedTaskIdSetRef.current = sharedTaskIdSet; }, [sharedTaskIdSet]);
 
+  useEffect(() => {
+    const liveIds = sharedTaskLists.map(l => l.id);
+    setSharedTaskOrderState(prev => {
+      const next = [
+        ...prev.filter(id => liveIds.includes(id)),
+        ...liveIds.filter(id => !prev.includes(id)),
+      ];
+      if (next.length === prev.length && next.every((id, i) => id === prev[i])) return prev;
+      AsyncStorage.setItem(SHARED_TASK_ORDER_KEY, JSON.stringify(next)).catch(() => {});
+      return next;
+    });
+  }, [sharedTaskLists]);
+
+  const orderedSharedTaskLists = useMemo(() => {
+    const byId = new Map(sharedTaskLists.map(l => [l.id, l]));
+    return [
+      ...sharedTaskOrder.map(id => byId.get(id)).filter(Boolean) as TaskList[],
+      ...sharedTaskLists.filter(l => !sharedTaskOrder.includes(l.id)),
+    ];
+  }, [sharedTaskLists, sharedTaskOrder]);
+
   // Merged pill-row source. Private lists keep their existing order; shared
   // lists append after them. A future enhancement could weave them per the
   // user's tri_list_order — deferred until users ask for it.
-  const mergedLists: TaskList[] = useMemo(() => [...lists, ...sharedTaskLists], [lists, sharedTaskLists]);
+  const mergedLists: TaskList[] = useMemo(() => [...lists, ...orderedSharedTaskLists], [lists, orderedSharedTaskLists]);
 
   // Active list resolution: try shared first (since their IDs don't collide
   // with private list IDs), then fall back to private. If the active ID
   // points at a shared list the user just left (listener tore it down), we
   // fall back to the first private list.
-  const activeShared = sharedTaskLists.find(l => l.id === activeListId);
+  const activeShared = orderedSharedTaskLists.find(l => l.id === activeListId);
   const activeList = activeShared ?? lists.find(l => l.id === activeListId) ?? lists[0];
   const isActiveShared = !!activeShared;
 
