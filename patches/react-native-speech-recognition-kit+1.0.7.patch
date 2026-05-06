@@ -1,0 +1,104 @@
+diff --git a/node_modules/react-native-speech-recognition-kit/android/build.gradle b/node_modules/react-native-speech-recognition-kit/android/build.gradle
+index 6ee864a..118451c 100644
+--- a/node_modules/react-native-speech-recognition-kit/android/build.gradle
++++ b/node_modules/react-native-speech-recognition-kit/android/build.gradle
+@@ -50,8 +50,8 @@ android {
+   }
+ 
+   compileOptions {
+-    sourceCompatibility JavaVersion.VERSION_1_8
+-    targetCompatibility JavaVersion.VERSION_1_8
++    sourceCompatibility JavaVersion.VERSION_17
++    targetCompatibility JavaVersion.VERSION_17
+   }
+ 
+   sourceSets {
+diff --git a/node_modules/react-native-speech-recognition-kit/android/src/main/java/com/speechrecognition/SpeechRecognitionModule.kt b/node_modules/react-native-speech-recognition-kit/android/src/main/java/com/speechrecognition/SpeechRecognitionModule.kt
+index 6dbf3f7..c15f6dd 100644
+--- a/node_modules/react-native-speech-recognition-kit/android/src/main/java/com/speechrecognition/SpeechRecognitionModule.kt
++++ b/node_modules/react-native-speech-recognition-kit/android/src/main/java/com/speechrecognition/SpeechRecognitionModule.kt
+@@ -49,7 +49,7 @@ class SpeechRecognitionModule(reactContext: ReactApplicationContext) :
+ 
+   private fun initializeSpeechRecognizer() {
+     Log.d(TAG, "Initializing SpeechRecognizer")
+-    speechRecognizer?.destroy()
++    // Caller is responsible for cancel()/destroy() before calling this.
+     speechRecognizer = SpeechRecognizer.createSpeechRecognizer(reactApplicationContext)
+     recognizerIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+       putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+@@ -223,22 +223,32 @@ class SpeechRecognitionModule(reactContext: ReactApplicationContext) :
+     }
+ 
+     mainHandler.post {
+-      if (speechRecognizer == null) {
+-        promise.reject("NOT_AVAILABLE", "Speech recognition is not available on this device")
+-        return@post
+-      }
+-
+       if (isListening) {
+         Log.d(TAG, "startListening: Speech recognition already in progress")
+         promise.reject("ALREADY_LISTENING", "Speech recognition already in progress")
+         return@post
+       }
+ 
+-      initializeSpeechRecognizer()
+-      speechRecognizer?.startListening(recognizerIntent)
+-      isListening = true
+-      Log.d(TAG, "startListening: Started listening")
+-      promise.resolve("Started listening")
++      // Tear down any existing recognizer first, then delay briefly before
++      // creating a fresh one. The Google speech service needs a moment to
++      // release its server-side session or the new recognizer gets
++      // ERROR_RECOGNIZER_BUSY immediately.
++      speechRecognizer?.cancel()
++      speechRecognizer?.destroy()
++      speechRecognizer = null
++
++      mainHandler.postDelayed({
++        initializeSpeechRecognizer()
++        val sr = speechRecognizer
++        if (sr == null) {
++          promise.reject("NOT_AVAILABLE", "Speech recognition is not available on this device")
++          return@postDelayed
++        }
++        sr.startListening(recognizerIntent)
++        isListening = true
++        Log.d(TAG, "startListening: Started listening")
++        promise.resolve("Started listening")
++      }, 150)
+     }
+   }
+ 
+@@ -246,24 +256,22 @@ class SpeechRecognitionModule(reactContext: ReactApplicationContext) :
+   override fun stopListening(promise: Promise) {
+     mainHandler.post {
+       if (speechRecognizer == null) {
+-        promise.reject("NOT_AVAILABLE", "Speech recognition is not available on this device")
+-        return@post
+-      }
+-
+-      if (!isListening) {
+-        Log.d(TAG, "stopListening: Speech recognition not in progress")
+-        promise.resolve("Not listening")
++        promise.resolve("Not available")
+         return@post
+       }
+ 
+       try {
+-        speechRecognizer?.stopListening()
++        // Always cancel regardless of isListening flag — the native recognizer
++        // can be in a post-RESULTS half-finalized state that stopListening alone
++        // won't clear. cancel() is safe to call in any state.
++        speechRecognizer?.cancel()
+         isListening = false
+-        Log.d(TAG, "stopListening: Stopped listening")
++        Log.d(TAG, "stopListening: Stopped/cancelled listening")
+         promise.resolve("Stopped listening")
+       } catch (e: Exception) {
+         Log.e(TAG, "Error stopping speech recognition", e)
+-        promise.reject("ERROR", "Error stopping speech recognition: ${e.message}")
++        isListening = false
++        promise.resolve("Stopped with error: ${e.message}")
+       }
+     }
+   }

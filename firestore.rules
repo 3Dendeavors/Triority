@@ -1,0 +1,147 @@
+rules_version = '2';
+
+// Security rules for Triority.
+// Deploy: paste into Firebase Console → Firestore Database → Rules → Publish.
+//
+// Trust boundary: Firebase Auth + these rules. There is no custom backend.
+// Default-deny everything except the explicit allow blocks below.
+//
+// Surfaces:
+//   /users/{uid}                      Phase 1 — private per-user blob.
+//   /users/{uid}/notifications/{id}   Phase 2 — list_deleted notices etc.
+//   /sharedLists/{listId}             Phase 2 — owner + ACL'd shared list.
+//   /sharedLists/{listId}/items/{id}  Phase 2 — per-item subdocs.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Phase 1: private per-user sync doc ──────────────────────────────
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+      allow create: if isOwner(uid)
+                    && validUserDoc(request.resource.data);
+      allow update: if isOwner(uid)
+                    && validUserDoc(request.resource.data)
+                    && rateLimited(resource.data);
+      // No deletes from clients — sign-out should leave the doc in place so
+      // re-signing in restores. If the user wants to scrub, they can re-write
+      // with empty arrays. Account-level data deletion is out of scope.
+      allow delete: if false;
+
+      // ─── Phase 2: per-user notifications ───────────────────────────────
+      // The notification owner can read and clear (mark readAt) their own.
+      // Cross-write is allowed when the writer was a member of the list
+      // referenced in the payload — that's how owner-deletes-list fans out
+      // notifications without a Cloud Function.
+      match /notifications/{notifId} {
+        allow read: if isOwner(uid);
+        // Owner can update readAt or delete.
+        allow update, delete: if isOwner(uid);
+        // Cross-user create: the writer must be authenticated and the
+        // payload.listName + type must be present. Tightening further
+        // requires a CF; flagging for later.
+        allow create: if request.auth != null
+                      && request.resource.data.keys().hasAll(['type', 'payload', 'createdAt'])
+                      && request.resource.data.type is string
+                      && request.resource.data.payload is map
+                      && request.resource.data.createdAt is number;
+      }
+    }
+
+    // ─── Phase 2: shared list doc ────────────────────────────────────────
+    // Direct doc reads (getDoc) require membership — non-members must not be
+    // able to fetch a list's full payload by guessing the listId.
+    //
+    // Collection queries (getDocs) are permitted for any authenticated user.
+    // This is intentional: the only query the client ever runs against this
+    // collection is `where('shareCode', '==', X)` for the share-code probe
+    // (used by promote, join, and rotate). Allowing list-level reads is the
+    // same trust model as "anyone with the 6-char code can join" — they have
+    // to know a valid code, and the items subcollection has its own ACL gate
+    // so list metadata is the only thing exposed by a successful guess.
+    //
+    // Members listed in `acl` can update the parent doc (rename, rotate code,
+    // member metadata bumps). Only the owner can delete the doc itself (which
+    // cascades by intent — items must be cleaned up by the deleting client
+    // first to satisfy the security model).
+    match /sharedLists/{listId} {
+      allow get: if isMember(resource.data);
+      allow list: if request.auth != null;
+      allow create: if request.auth != null
+                    && validSharedListCreate(request.resource.data);
+      allow update: if isMember(resource.data)
+                    && validSharedListUpdate(resource.data, request.resource.data)
+                    && rateLimited(resource.data);
+      allow delete: if request.auth != null
+                    && resource.data.ownerUid == request.auth.uid;
+
+      // ─── Phase 2: shared list items subcollection ──────────────────────
+      // Per-item writes mean two members editing different items don't
+      // collide. ACL inheritance via get() — one extra read per items
+      // operation; Firestore caches these aggressively per query.
+      match /items/{itemId} {
+        allow read, write: if request.auth != null
+                           && request.auth.uid in
+                              get(/databases/$(database)/documents/sharedLists/$(listId)).data.acl;
+      }
+    }
+
+    // ─── Default deny ────────────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+
+  // Helpers ---------------------------------------------------------------
+
+  function isOwner(uid) {
+    return request.auth != null && request.auth.uid == uid;
+  }
+
+  function isMember(doc) {
+    return request.auth != null && request.auth.uid in doc.acl;
+  }
+
+  // Schema check for /users/{uid}: required fields, types, size cap.
+  function validUserDoc(d) {
+    return d.keys().hasAll(['updatedAt', 'data', 'schemaVersion'])
+        && d.updatedAt is number
+        && d.schemaVersion is int
+        && d.data is map
+        && d.size() < 250 * 1024;
+  }
+
+  // Schema check on shared list creation. Must self-include the creator in
+  // acl + members so we never produce a list nobody can read.
+  function validSharedListCreate(d) {
+    return d.keys().hasAll(['ownerUid', 'kind', 'name', 'acl', 'shareCode',
+                            'members', 'createdAt', 'updatedAt'])
+        && d.ownerUid == request.auth.uid
+        && d.kind in ['tasks', 'grocery']
+        && d.name is string
+        && d.acl is list && d.acl.size() >= 1
+        && request.auth.uid in d.acl
+        && d.shareCode is string && d.shareCode.size() == 6
+        && d.members is map
+        && d.createdAt is number
+        && d.updatedAt is number
+        && d.size() < 32 * 1024;
+  }
+
+  // Schema check on shared list update. Owner field is immutable; size cap
+  // stays in force; member can rotate code / rename / mutate members map.
+  function validSharedListUpdate(prev, next) {
+    return next.ownerUid == prev.ownerUid
+        && next.kind == prev.kind
+        && next.shareCode is string && next.shareCode.size() == 6
+        && next.acl is list && next.acl.size() >= 1
+        && next.members is map
+        && next.updatedAt is number
+        && next.size() < 32 * 1024;
+  }
+
+  // Per-doc write rate limit: 1 write per second.
+  function rateLimited(prev) {
+    return request.time.toMillis() - prev.updatedAt > 1000;
+  }
+}

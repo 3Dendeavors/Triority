@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12+ (targetSdk 31+) backup/transfer rules.
+  Cloud backup runs roughly daily on Wi-Fi + idle + charging; device-to-device
+  runs during phone-to-phone transfer.
+
+  Includes everything by default, then explicitly excludes EncryptedStorage's
+  prefs file — its keys live in Android Keystore (device-bound, not backed up),
+  so restored ciphertext can't be decrypted. Including it would surface the
+  user's encrypted blob with no way to read it.
+-->
+<data-extraction-rules>
+  <cloud-backup>
+    <include domain="database" path="RKStorage" />
+    <include domain="sharedpref" />
+    <include domain="file" />
+    <exclude domain="sharedpref" path="RN_ENCRYPTED_STORAGE_SHARED_PREF.xml" />
+  </cloud-backup>
+  <device-transfer>
+    <include domain="database" path="RKStorage" />
+    <include domain="sharedpref" />
+    <include domain="file" />
+    <exclude domain="sharedpref" path="RN_ENCRYPTED_STORAGE_SHARED_PREF.xml" />
+  </device-transfer>
+</data-extraction-rules>
