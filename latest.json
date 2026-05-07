@@ -1,8 +1,8 @@
 {
-  "versionName": "1.4.1",
-  "versionCode": 17,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.1/Triority-v1.4.1.apk",
-  "releaseNotes": "Temporarily holding updates at v1.4.1 while the v1.4.2 shared-grocery regression is investigated.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.1",
+  "versionName": "1.4.3",
+  "versionCode": 19,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.3/Triority-v1.4.3.apk",
+  "releaseNotes": "Hotfix for shared grocery recovery. If Supabase already has a grocery membership for your account but the app lost the local pointer, Triority now restores that membership instead of blocking sharing.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.3",
   "required": false
 }
