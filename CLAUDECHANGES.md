@@ -269,11 +269,32 @@ git reset --hard <old-hash>
 ```
 Or restore from `E:\Creative\Triority.zip`.
 
-### Remaining next steps
+### Remaining next steps — STATUS UPDATE 2026-05-06 ~21:00
 
-1. **Rotate Firebase API key** — treat key `AIzaSyBDewIrv...` as potentially exposed since it existed in local git history prior to rewrite. Rotate in Firebase console → Project Settings → General → Web API Key.
-2. Add GitHub remote: `git remote add origin https://github.com/3Dendeavors/Triority.git`
-3. Stage and commit all Claude changes (`.gitignore`, untracked result, `CLAUDECHANGES.md`)
-4. Push to GitHub
-5. Create GitHub Release with `E:\Creative\Triority\_exports\triority-from-ross-phone-2026-05-06.apk` as the first tester download
-6. Codex to implement `latest.json` update checker and GitHub Actions APK build workflow
+| Step | Status |
+|---|---|
+| Rotate Firebase API key | ⏳ Pending — do at next planned APK rebuild |
+| Add GitHub remote | ✅ Done — `git remote add origin https://github.com/3Dendeavors/Triority.git` |
+| Commit Claude changes | ✅ Done — commit `8f3f7bb` "Harden .gitignore and document GitHub setup changes" |
+| Push `codex/main` to GitHub | ✅ Done |
+| Force push `codex/main` → `main` | ✅ Done — `main` is now the live branch with full codebase |
+| Repo made public | ✅ Done — [github.com/3Dendeavors/Triority](https://github.com/3Dendeavors/Triority) is publicly accessible |
+| GitHub Release v1.0.0 created | ✅ Done — APK pulled from Ross's phone (`triority-from-ross-phone-2026-05-06.apk`, ~56MB) uploaded as release asset |
+| Beta testers sent link | ✅ Done by Ross |
+
+---
+
+## For Codex — Next session priorities
+
+1. **Rotate Firebase API key** — key `AIzaSyBDewIrv...` existed in local git history before rewrite. Low urgency (Firestore rules are tight, repo was private before rewrite), but should be rotated at next APK rebuild. Steps: Firebase console → Project Settings → General → Web API Key → rotate → download new `google-services.json` → rebuild APK.
+
+2. **GitHub Actions APK build automation** — set up a workflow that builds and signs a release APK automatically when a version tag is pushed (e.g. `git tag v1.1.0 && git push --tags`). Keystore password is in `android/keystore.properties` (not in repo — store as GitHub Actions secret). APK naming convention TBD.
+
+3. **`latest.json` update checker** — implement in-app version check on launch. Fetch a public JSON file from GitHub (e.g. `https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json`), compare `versionCode` to installed version, show popup if newer. See Codex's original suggestion in session screenshots for exact JSON schema.
+
+4. **Codex's unstaged working tree changes** — at time of Claude's last action, the following Codex changes were still uncommitted:
+   - `App.tsx` — modified
+   - `firestore.rules` — modified
+   - `CODEX_CHANGES.md`, `CODEX_WORKSPACE.md`, `HANDOFF.md`, `archive/HANDOFF2.md.archive` — deleted
+   - `AGENTS.md`, `ARCHITECTURE.md`, `PRD.md`, `PRODUCT.md`, `ROADMAP.md`, `WORKSPACE_STRUCTURE.md`, `docs/`, `plans/` — untracked, not yet committed
+   These need to be committed and pushed to keep GitHub in sync.
