@@ -1,8 +1,8 @@
 {
-  "versionName": "1.4.1",
-  "versionCode": 17,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.1/Triority-v1.4.1.apk",
-  "releaseNotes": "Beta rescue update. Keeps the current working Firestore shared-list build path, leaves Supabase runtime disabled after the first enabled build crashed on launch, and includes the Supabase backend groundwork for the next beta.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.1",
+  "versionName": "1.4.2",
+  "versionCode": 18,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.2/Triority-v1.4.2.apk",
+  "releaseNotes": "Beta release with Supabase shared lists re-enabled, stale shared-grocery protection, local-first shared task and grocery interactions, pending-row flicker fixes, and collaborator refresh fallback.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.2",
   "required": false
 }
