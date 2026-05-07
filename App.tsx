@@ -237,6 +237,7 @@ const SHARED_JOINED_LISTS_KEY = 'tri_shared_joined';
 const SHARED_TASK_ORDER_KEY = 'tri_shared_task_order';
 const LIST_ROW_ORDER_KEY = 'tri_list_row_order';
 const SHARED_GROCERY_TOGGLE_KEY = 'tri_shared_grocery_view';   // '1' = viewing shared, '0' or absent = viewing private
+const SUPABASE_SHARED_GROCERY_ID_KEY = 'tri_supabase_shared_grocery_id_v1';
 const SHARED_CACHE_KEY = 'tri_shared_cache_v1';
 const SHARED_STALE_RESTORE_CUTOFF_MS = new Date('2026-05-07T00:00:00-04:00').getTime();
 
@@ -301,6 +302,48 @@ function epochFromSupabase(value: unknown): number {
 
 function supabaseErrorMessage(error: any, fallback: string) {
   return error?.message ? String(error.message) : fallback;
+}
+
+// In-memory mirror of SUPABASE_SHARED_GROCERY_ID_KEY. AsyncStorage on Android
+// has occasional read-after-write ordering issues across the JNI bridge, which
+// caused freshly-created Supabase groceries to be wiped by an immediate
+// listener-attach refresh that read the stale marker. Reads in this module
+// check this set first (synchronous, race-proof) and only fall back to
+// AsyncStorage if the set is empty (pre-hydration cold start).
+const activeSupabaseGroceryIds: Set<string> = new Set();
+
+function isSupabaseGroceryMarkedActive(listId: string): boolean {
+  return activeSupabaseGroceryIds.has(listId);
+}
+
+function hasAnyActiveSupabaseGroceryMarker(): boolean {
+  return activeSupabaseGroceryIds.size > 0;
+}
+
+async function markSupabaseSharedGroceryActive(listId: string) {
+  // Set the in-memory marker FIRST so any listener-attach refresh that fires
+  // synchronously after this call sees the active id without waiting for
+  // AsyncStorage to flush.
+  activeSupabaseGroceryIds.add(listId);
+  await AsyncStorage.multiSet([
+    [SHARED_GROCERY_TOGGLE_KEY, '1'],
+    [SUPABASE_SHARED_GROCERY_ID_KEY, listId],
+  ]).catch(() => {});
+}
+
+async function clearSupabaseSharedGroceryActive(listId?: string) {
+  try {
+    if (listId) {
+      const current = await AsyncStorage.getItem(SUPABASE_SHARED_GROCERY_ID_KEY);
+      if (current && current !== listId) return;
+      activeSupabaseGroceryIds.delete(listId);
+    } else {
+      activeSupabaseGroceryIds.clear();
+    }
+    await AsyncStorage.removeItem(SUPABASE_SHARED_GROCERY_ID_KEY);
+  } catch {
+    // best-effort; membership state still drives the UI
+  }
 }
 
 function mapSupabaseMembers(rows: any[]): { acl: string[]; members: { [uid: string]: SharedListMember } } {
@@ -499,9 +542,7 @@ const WEB_CLIENT_ID = '707782512255-se0aiqqjctssub66bmoba4dtgn3lacd5.apps.google
 // in the APK; never put an sb_secret_* key in mobile source.
 const SUPABASE_URL = 'https://ivzbipfmgpulsyzsamfx.supabase.co';
 const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_eEjaYkSNMFmUVe0Sd_K_3g_JznOV7PI';
-// Disabled after the first Supabase-enabled release APK crashed on launch.
-// Next session should fix the React Native startup compatibility issue before re-enabling.
-const USE_SUPABASE_SHARED_LISTS = false;
+const USE_SUPABASE_SHARED_LISTS = true;
 const disabledSupabaseClient = {
   from: () => { throw new Error('Supabase shared lists are disabled in this build.'); },
   rpc: () => Promise.resolve({ data: null, error: new Error('Supabase shared lists are disabled in this build.') }),
@@ -522,7 +563,7 @@ const supabase = USE_SUPABASE_SHARED_LISTS
         return (await getAuth(getApp()).currentUser?.getIdToken(false)) ?? null;
       },
     })
-  : disabledSupabaseClient as ReturnType<typeof createClient>;
+  : disabledSupabaseClient as unknown as ReturnType<typeof createClient>;
 
 interface SyncContextValue {
   user: FirebaseAuthTypes.User | null;
@@ -828,6 +869,11 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const [hydrating, setHydrating] = useState(true);
   const [appActive, setAppActive] = useState(true);
   const locallyRemovedSharedIdsRef = useRef<Set<string>>(new Set());
+  // Tracks Supabase shared-item IDs that we just inserted optimistically and
+  // have not yet seen confirmed in a server fetch. Used by
+  // refreshSupabaseSharedList to avoid briefly dropping the row when a
+  // realtime callback fires before our INSERT is visible to the SELECT.
+  const pendingSharedItemIdsRef = useRef<Set<string>>(new Set());
 
   const forgetSharedList = useCallback((listId: string) => {
     setSharedLists((prev) => {
@@ -883,11 +929,16 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       const cachedLists = parsed?.lists && typeof parsed.lists === 'object' ? parsed.lists : {};
       const cachedItems = parsed?.items && typeof parsed.items === 'object' ? parsed.items : {};
       const cachedArchives = parsed?.archives && typeof parsed.archives === 'object' ? parsed.archives : {};
+      // Hydrate the in-memory marker set from disk so subsequent
+      // refreshSupabaseSharedList calls can answer synchronously.
+      const activeSupabaseGroceryId = await AsyncStorage.getItem(SUPABASE_SHARED_GROCERY_ID_KEY).catch(() => null);
+      if (activeSupabaseGroceryId) activeSupabaseGroceryIds.add(activeSupabaseGroceryId);
       const filteredLists: { [id: string]: SharedList } = {};
       const filteredItems: { [id: string]: SharedListItem[] } = {};
       const filteredArchives: { [id: string]: SharedArchiveItem[] } = {};
       for (const id of joined) {
         if (locallyRemovedSharedIdsRef.current.has(id)) continue;
+        if (isSupabaseSharedListId(id) && cachedLists[id]?.kind === 'grocery' && !isSupabaseGroceryMarkedActive(id)) continue;
         if (cachedLists[id]) filteredLists[id] = cachedLists[id];
         if (Array.isArray(cachedItems[id])) filteredItems[id] = cachedItems[id];
         if (Array.isArray(cachedArchives[id])) filteredArchives[id] = cachedArchives[id];
@@ -959,6 +1010,12 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
   const setJoinedIds = useCallback(async (ids: string[]) => {
     const next = Array.from(new Set(ids));
+    // Any listId we are now joined to should NOT be treated as locally
+    // removed — clear the quarantine ref or refreshSupabaseSharedList will
+    // silently skip the fetch and leave items empty until app restart.
+    for (const id of next) {
+      locallyRemovedSharedIdsRef.current.delete(id);
+    }
     joinedIdsRef.current = next;
     setJoinedIdsState(next);
     persistJoinedIdsForUser(next);
@@ -993,36 +1050,48 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       await removeJoinedId(listId);
       return;
     }
+    if (listRes.data.kind === 'grocery') {
+      // Check the in-memory marker first (race-proof). Only fall back to
+      // AsyncStorage if no in-memory markers exist yet — that means cache
+      // hydration has not run since process start, so trust disk on this
+      // single read and seed the set from it.
+      let isActive = isSupabaseGroceryMarkedActive(listId);
+      if (!isActive && !hasAnyActiveSupabaseGroceryMarker()) {
+        const activeSupabaseGroceryId = await AsyncStorage.getItem(SUPABASE_SHARED_GROCERY_ID_KEY).catch(() => null);
+        if (activeSupabaseGroceryId) {
+          activeSupabaseGroceryIds.add(activeSupabaseGroceryId);
+          isActive = activeSupabaseGroceryId === listId;
+        }
+      }
+      if (!isActive) {
+        forgetSharedListLocally(listId);
+        await removeJoinedId(listId);
+        return;
+      }
+    }
     if (membersRes.error) throw new Error(supabaseErrorMessage(membersRes.error, 'Could not load shared members.'));
     if (itemsRes.error) throw new Error(supabaseErrorMessage(itemsRes.error, 'Could not load shared items.'));
     if (archivesRes.error) throw new Error(supabaseErrorMessage(archivesRes.error, 'Could not load shared archive.'));
 
     setSharedLists((prev) => ({ ...prev, [listId]: mapSupabaseList(listRes.data, membersRes.data || []) }));
-    setSharedItems((prev) => ({ ...prev, [listId]: (itemsRes.data || []).map(mapSupabaseItem) }));
+    const serverItems = (itemsRes.data || []).map(mapSupabaseItem);
+    const serverItemIds = new Set(serverItems.map((it) => it.id));
+    // Drain any pending optimistic IDs that the server has now confirmed.
+    for (const id of serverItemIds) pendingSharedItemIdsRef.current.delete(id);
+    setSharedItems((prev) => {
+      const localItems = prev[listId] || [];
+      // Preserve any local rows that:
+      // (a) are still pending confirmation (we just inserted them and the
+      //     server SELECT didn't see them yet), or
+      // (b) have an ID not present in the server response AND not yet seen.
+      // Keeping (a) avoids the flash where a freshly-added row briefly
+      // disappears when realtime triggers a refresh before the INSERT has
+      // committed visibly.
+      const survivingLocal = localItems.filter((it) => !serverItemIds.has(it.id) && pendingSharedItemIdsRef.current.has(it.id));
+      return { ...prev, [listId]: [...serverItems, ...survivingLocal] };
+    });
     setSharedArchives((prev) => ({ ...prev, [listId]: (archivesRes.data || []).map(mapSupabaseArchive) }));
   }, [forgetSharedListLocally, removeJoinedId]);
-
-  useEffect(() => {
-    if (!authReady || !user || hydrating) return;
-    let cancelled = false;
-    (async () => {
-      const { data, error } = await supabase
-        .from('tri_shared_members')
-        .select('list_id')
-        .eq('uid', user.uid);
-      if (cancelled || error || !Array.isArray(data)) return;
-      const recovered = data
-        .map((row: any) => String(row.list_id || ''))
-        .filter((id) => isSupabaseSharedListId(id) && !locallyRemovedSharedIdsRef.current.has(id));
-      const missing = recovered.filter((id) => !joinedIdsRef.current.includes(id));
-      if (missing.length > 0) {
-        await setJoinedIds([...joinedIdsRef.current, ...missing]);
-      }
-    })().catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [authReady, user, hydrating, setJoinedIds]);
 
   // AppState gate: detach all listeners when backgrounded so we don't burn
   // Firestore reads while invisible. Reattach on foreground.
@@ -1037,6 +1106,40 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     if (!user || !appActive) return;
     enableNetwork(getFirestore(getApp())).catch(() => {});
   }, [user, appActive]);
+
+  useEffect(() => {
+    if (!authReady || !user || !appActive) return;
+    let cancelled = false;
+    user.getIdToken(false)
+      .then((token) => {
+        if (!cancelled && token) {
+          return supabase.realtime.setAuth(token);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [authReady, user, appActive]);
+
+  useEffect(() => {
+    if (!authReady || !user || !appActive) return;
+    const supabaseIds = joinedIds.filter((id) => isSupabaseSharedListId(id));
+    if (supabaseIds.length === 0) return;
+
+    let cancelled = false;
+    const refreshAll = () => {
+      if (cancelled) return;
+      supabaseIds.forEach((id) => {
+        refreshSupabaseSharedList(id).catch(() => {});
+      });
+    };
+    const timer = setInterval(refreshAll, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [authReady, user, appActive, joinedIds, refreshSupabaseSharedList]);
 
   // The actual listener attach/detach effect. Re-runs when the auth user,
   // the joined list IDs, or the active state changes.
@@ -1203,6 +1306,9 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       );
       if (!result.error && result.data?.id) {
         const listId = String(result.data.id);
+        if (result.data.kind === 'grocery') {
+          await markSupabaseSharedGroceryActive(listId);
+        }
         await addJoinedId(listId);
         await refreshSupabaseSharedList(listId).catch(() => {});
         return listId;
@@ -1240,6 +1346,9 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     }
     if (data.kind === 'grocery' && currentCount >= SHARED_GROCERY_LIMIT) {
       throw new Error('You’re already in a shared grocery list. Leave it first to join another.');
+    }
+    if (data.kind === 'grocery') {
+      await AsyncStorage.setItem(SHARED_GROCERY_TOGGLE_KEY, '1').catch(() => {});
     }
 
     const now = Date.now();
@@ -1282,10 +1391,14 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         .filter((it) => it.text.trim());
       if (rows.length === 0) return;
       const optimistic = rows.map(mapSupabaseItem);
+      // Mark these IDs as pending so a realtime-triggered refresh that races
+      // ahead of the INSERT cannot drop them from the list.
+      for (const row of rows) pendingSharedItemIdsRef.current.add(row.id);
       setSharedItems((prev) => ({ ...prev, [listId]: [...(prev[listId] || []), ...optimistic] }));
       const { error } = await supabase.from('tri_shared_items').insert(rows);
       if (error) {
         const ids = new Set(rows.map((row) => row.id));
+        for (const id of ids) pendingSharedItemIdsRef.current.delete(id);
         setSharedItems((prev) => ({ ...prev, [listId]: (prev[listId] || []).filter((it) => !ids.has(it.id)) }));
         throw new Error(supabaseErrorMessage(error, 'Could not add shared items.'));
       }
@@ -1359,8 +1472,22 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const deleteSharedTaskItem = useCallback(async (listId: string, itemId: string) => {
     if (!user) throw new Error('Not signed in');
     if (isSupabaseSharedListId(listId)) {
+      // Optimistic remove so the swiped row disappears immediately; rollback
+      // restores the prior items snapshot if Supabase rejects the delete.
+      let prevItems: SharedListItem[] | undefined;
+      setSharedItems((prev) => {
+        prevItems = prev[listId];
+        if (!prevItems) return prev;
+        return { ...prev, [listId]: prevItems.filter((it) => it.id !== itemId) };
+      });
       const { error } = await supabase.from('tri_shared_items').delete().eq('id', itemId).eq('list_id', listId);
-      if (error) throw new Error(supabaseErrorMessage(error, 'Could not delete shared task.'));
+      if (error) {
+        if (prevItems) {
+          const snapshot = prevItems;
+          setSharedItems((prev) => ({ ...prev, [listId]: snapshot }));
+        }
+        throw new Error(supabaseErrorMessage(error, 'Could not delete shared task.'));
+      }
       return;
     }
     const db = getFirestore(getApp());
@@ -1381,10 +1508,56 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         last_edited_by: user.uid,
         last_edited_at: new Date(now).toISOString(),
       };
+      // Optimistic local update so the swiped task disappears from the list
+      // and shows up in shared Archive immediately. Realtime / poll will
+      // reconcile with the real archive id once the insert succeeds.
+      let prevItems: SharedListItem[] | undefined;
+      let prevArchives: SharedArchiveItem[] | undefined;
+      const optimisticArchiveId = `optimistic_archive_${itemId}_${now}`;
+      const optimisticArchive: SharedArchiveItem = stripUndefined({
+        id: optimisticArchiveId,
+        text: item.text,
+        tier: item.tier,
+        completedAt: now,
+        archivedBy: user.uid,
+        createdAt: item.createdAt,
+        lastEditedBy: user.uid,
+        lastEditedAt: now,
+      }) as SharedArchiveItem;
+      setSharedItems((prev) => {
+        prevItems = prev[listId];
+        if (!prevItems) return prev;
+        return { ...prev, [listId]: prevItems.filter((it) => it.id !== itemId) };
+      });
+      setSharedArchives((prev) => {
+        prevArchives = prev[listId];
+        return { ...prev, [listId]: [...(prev[listId] || []), optimisticArchive] };
+      });
+      const rollback = () => {
+        if (prevItems) {
+          const snapshot = prevItems;
+          setSharedItems((prev) => ({ ...prev, [listId]: snapshot }));
+        }
+        setSharedArchives((prev) => {
+          if (prevArchives === undefined) {
+            const next = { ...prev };
+            delete next[listId];
+            return next;
+          }
+          const snapshot = prevArchives;
+          return { ...prev, [listId]: snapshot };
+        });
+      };
       const { error: archiveError } = await supabase.from('tri_shared_archives').insert(archiveRow);
-      if (archiveError) throw new Error(supabaseErrorMessage(archiveError, 'Could not archive shared task.'));
+      if (archiveError) {
+        rollback();
+        throw new Error(supabaseErrorMessage(archiveError, 'Could not archive shared task.'));
+      }
       const { error: deleteError } = await supabase.from('tri_shared_items').delete().eq('id', itemId).eq('list_id', listId);
-      if (deleteError) throw new Error(supabaseErrorMessage(deleteError, 'Could not remove completed shared task.'));
+      if (deleteError) {
+        rollback();
+        throw new Error(supabaseErrorMessage(deleteError, 'Could not remove completed shared task.'));
+      }
       return;
     }
     const db = getFirestore(getApp());
@@ -1444,10 +1617,14 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         .filter((it) => it.name);
       if (rows.length === 0) return;
       const optimistic = rows.map(mapSupabaseItem);
+      // Mark these IDs as pending so a realtime-triggered refresh that races
+      // ahead of the INSERT cannot drop them from the list.
+      for (const row of rows) pendingSharedItemIdsRef.current.add(row.id);
       setSharedItems((prev) => ({ ...prev, [listId]: [...(prev[listId] || []), ...optimistic] }));
       const { error } = await supabase.from('tri_shared_items').insert(rows);
       if (error) {
         const ids = new Set(rows.map((row) => row.id));
+        for (const id of ids) pendingSharedItemIdsRef.current.delete(id);
         setSharedItems((prev) => ({ ...prev, [listId]: (prev[listId] || []).filter((it) => !ids.has(it.id)) }));
         throw new Error(supabaseErrorMessage(error, 'Could not add shared grocery items.'));
       }
@@ -1477,6 +1654,27 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const updateSharedGroceryItem = useCallback(async (listId: string, itemId: string, patch: { name?: string; category?: string; checked?: boolean }) => {
     if (!user) throw new Error('Not signed in');
     if (isSupabaseSharedListId(listId)) {
+      // Optimistic patch — apply locally first so checkbox / category change
+      // is instant; rollback on error.
+      const now = Date.now();
+      let prevItems: SharedListItem[] | undefined;
+      setSharedItems((prev) => {
+        prevItems = prev[listId];
+        if (!prevItems) return prev;
+        return {
+          ...prev,
+          [listId]: prevItems.map((it) => it.id === itemId
+            ? stripUndefined({
+                ...it,
+                name: patch.name !== undefined ? patch.name : it.name,
+                category: patch.category !== undefined ? patch.category : it.category,
+                checked: patch.checked !== undefined ? patch.checked : it.checked,
+                lastEditedBy: user.uid,
+                lastEditedAt: now,
+              })
+            : it),
+        };
+      });
       const { error } = await supabase
         .from('tri_shared_items')
         .update(stripUndefined({
@@ -1484,11 +1682,17 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
           category: patch.category,
           checked: patch.checked,
           last_edited_by: user.uid,
-          last_edited_at: new Date().toISOString(),
+          last_edited_at: new Date(now).toISOString(),
         }))
         .eq('id', itemId)
         .eq('list_id', listId);
-      if (error) throw new Error(supabaseErrorMessage(error, 'Could not update shared grocery item.'));
+      if (error) {
+        if (prevItems) {
+          const snapshot = prevItems;
+          setSharedItems((prev) => ({ ...prev, [listId]: snapshot }));
+        }
+        throw new Error(supabaseErrorMessage(error, 'Could not update shared grocery item.'));
+      }
       return;
     }
     const db = getFirestore(getApp());
@@ -1502,8 +1706,21 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const deleteSharedGroceryItem = useCallback(async (listId: string, itemId: string) => {
     if (!user) throw new Error('Not signed in');
     if (isSupabaseSharedListId(listId)) {
+      // Optimistic remove so swipe trash is instant; rollback on error.
+      let prevItems: SharedListItem[] | undefined;
+      setSharedItems((prev) => {
+        prevItems = prev[listId];
+        if (!prevItems) return prev;
+        return { ...prev, [listId]: prevItems.filter((it) => it.id !== itemId) };
+      });
       const { error } = await supabase.from('tri_shared_items').delete().eq('id', itemId).eq('list_id', listId);
-      if (error) throw new Error(supabaseErrorMessage(error, 'Could not delete shared grocery item.'));
+      if (error) {
+        if (prevItems) {
+          const snapshot = prevItems;
+          setSharedItems((prev) => ({ ...prev, [listId]: snapshot }));
+        }
+        throw new Error(supabaseErrorMessage(error, 'Could not delete shared grocery item.'));
+      }
       return;
     }
     const db = getFirestore(getApp());
@@ -1514,8 +1731,22 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     if (!user) throw new Error('Not signed in');
     if (itemIds.length === 0) return;
     if (isSupabaseSharedListId(listId)) {
+      // Optimistic batch remove (Clear Checked, Clear All); rollback on error.
+      const idSet = new Set(itemIds);
+      let prevItems: SharedListItem[] | undefined;
+      setSharedItems((prev) => {
+        prevItems = prev[listId];
+        if (!prevItems) return prev;
+        return { ...prev, [listId]: prevItems.filter((it) => !idSet.has(it.id)) };
+      });
       const { error } = await supabase.from('tri_shared_items').delete().eq('list_id', listId).in('id', itemIds);
-      if (error) throw new Error(supabaseErrorMessage(error, 'Could not delete shared grocery items.'));
+      if (error) {
+        if (prevItems) {
+          const snapshot = prevItems;
+          setSharedItems((prev) => ({ ...prev, [listId]: snapshot }));
+        }
+        throw new Error(supabaseErrorMessage(error, 'Could not delete shared grocery items.'));
+      }
       return;
     }
     const db = getFirestore(getApp());
@@ -1617,13 +1848,22 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const leaveSharedList = useCallback(async (listId: string) => {
     if (!user) throw new Error('Not signed in');
     if (isSupabaseSharedListId(listId)) {
-      const cleanupLocal = async () => {
-        forgetSharedListLocally(listId);
-        await removeJoinedId(listId);
-      };
-      const { error } = await supabase.rpc('tri_leave_shared_list', { p_list_id: listId });
-      if (error && !isMissingOrPermissionError(error)) throw new Error(supabaseErrorMessage(error, 'Could not leave shared list.'));
-      await cleanupLocal();
+      const cached = sharedLists[listId];
+      // Local-first: clean up immediately so the UI returns. Server leave
+      // runs in the background; if it fails for a recoverable reason the
+      // listener / 5-second poll will repopulate the membership.
+      forgetSharedListLocally(listId);
+      if (cached?.kind === 'grocery') {
+        await clearSupabaseSharedGroceryActive(listId);
+      }
+      await removeJoinedId(listId);
+      void (async () => {
+        const { error } = await supabase.rpc('tri_leave_shared_list', { p_list_id: listId });
+        if (error && !isMissingOrPermissionError(error)) {
+          // Server still thinks we're a member; surface only on next session
+          // — see Step 14 for cross-session error surfacing.
+        }
+      })().catch(() => {});
       return;
     }
     const db = getFirestore(getApp());
@@ -1672,6 +1912,9 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         throw new Error(formatSharedListOwnerMismatch(cached, user.uid));
       }
       forgetSharedListLocally(listId);
+      if (cached?.kind === 'grocery') {
+        await clearSupabaseSharedGroceryActive(listId);
+      }
       await removeJoinedId(listId);
       const { error } = await supabase.rpc('tri_delete_shared_list', { p_list_id: listId });
       if (error && !isMissingOrPermissionError(error)) {
@@ -1897,6 +2140,11 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         updatedAt: Number(listRow.updatedAt || now),
       };
       const sharedRows = Array.isArray(result.data?.items) ? result.data.items.map(mapSupabaseItem) : [];
+      // Mark active BEFORE setSharedLists / addJoinedId. The in-memory ref
+      // inside markSupabaseSharedGroceryActive is updated synchronously, so
+      // any listener-attach refresh that fires when joinedIds changes will
+      // see the marker without needing to wait for AsyncStorage to flush.
+      await markSupabaseSharedGroceryActive(listId);
       setSharedLists((prev) => ({ ...prev, [listId]: sharedList }));
       setSharedItems((prev) => ({ ...prev, [listId]: sharedRows }));
       await addJoinedId(listId);
@@ -1940,6 +2188,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     }
 
     setSharedLists((prev) => ({ ...prev, [parentRef.id]: { id: parentRef.id, ...parentData } }));
+    await AsyncStorage.setItem(SHARED_GROCERY_TOGGLE_KEY, '1').catch(() => {});
     await addJoinedId(parentRef.id);
 
     if (optimisticItems.length > 0) {
@@ -2234,8 +2483,8 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 17;
-const CURRENT_APP_VERSION_NAME = '1.4.1';
+const CURRENT_APP_VERSION_CODE = 18;
+const CURRENT_APP_VERSION_NAME = '1.4.2';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {
@@ -8754,6 +9003,15 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     if (!sharedGroceryDoc && viewingSharedGrocery) {
       setViewingSharedGrocery(false);
     }
+  }, [sharedGroceryDoc, setViewingSharedGrocery, viewingSharedGrocery]);
+
+  useEffect(() => {
+    if (!sharedGroceryDoc || viewingSharedGrocery) return;
+    AsyncStorage.getItem(SHARED_GROCERY_TOGGLE_KEY)
+      .then((raw) => {
+        if (raw === '1') setViewingSharedGrocery(true);
+      })
+      .catch(() => {});
   }, [sharedGroceryDoc, setViewingSharedGrocery, viewingSharedGrocery]);
 
   const usingSharedGrocery = !!sharedGroceryDoc;
