@@ -35,6 +35,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import EncryptedStorage from 'react-native-encrypted-storage';
 import Purchases, { LOG_LEVEL } from 'react-native-purchases';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { createClient } from '@supabase/supabase-js';
 import { getApp } from '@react-native-firebase/app';
 import {
   getAuth,
@@ -274,6 +275,95 @@ function stableShareCode(value: string) {
   return (hash >>> 0).toString(36).toUpperCase().padStart(SHARE_CODE_LENGTH, '0').slice(-SHARE_CODE_LENGTH);
 }
 
+const SUPABASE_SHARED_LIST_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isSupabaseSharedListId(listId: string) {
+  return SUPABASE_SHARED_LIST_ID_RE.test(listId);
+}
+
+function randomUuid() {
+  // Good enough for optimistic client-side IDs; Postgres still enforces uniqueness.
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.floor(Math.random() * 16);
+    const v = c === 'x' ? r : ((r & 0x3) | 0x8);
+    return v.toString(16);
+  });
+}
+
+function epochFromSupabase(value: unknown): number {
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return Date.now();
+}
+
+function supabaseErrorMessage(error: any, fallback: string) {
+  return error?.message ? String(error.message) : fallback;
+}
+
+function mapSupabaseMembers(rows: any[]): { acl: string[]; members: { [uid: string]: SharedListMember } } {
+  const acl: string[] = [];
+  const members: { [uid: string]: SharedListMember } = {};
+  for (const row of rows || []) {
+    const uid = String(row.uid || '');
+    if (!uid) continue;
+    acl.push(uid);
+    members[uid] = {
+      avatarSlot: Number(row.avatar_slot ?? 0),
+      emailInitial: String(row.email_initial || '?').slice(0, 1).toUpperCase(),
+      joinedAt: epochFromSupabase(row.joined_at),
+      lastSeenAt: epochFromSupabase(row.last_seen_at),
+    };
+  }
+  return { acl, members };
+}
+
+function mapSupabaseList(row: any, memberRows: any[]): SharedList {
+  const mappedMembers = mapSupabaseMembers(memberRows);
+  return {
+    id: String(row.id),
+    ownerUid: String(row.owner_uid || ''),
+    kind: row.kind === 'grocery' ? 'grocery' : 'tasks',
+    name: String(row.name || (row.kind === 'grocery' ? 'Groceries' : 'Shared List')),
+    acl: mappedMembers.acl,
+    shareCode: String(row.share_code || ''),
+    members: mappedMembers.members,
+    createdAt: epochFromSupabase(row.created_at),
+    updatedAt: epochFromSupabase(row.updated_at),
+  };
+}
+
+function mapSupabaseItem(row: any): SharedListItem {
+  return stripUndefined({
+    id: String(row.id),
+    text: row.text ?? undefined,
+    tier: row.tier === 'high' || row.tier === 'medium' || row.tier === 'low' ? row.tier : undefined,
+    completed: false,
+    name: row.name ?? undefined,
+    category: row.category ?? undefined,
+    checked: !!row.checked,
+    createdBy: String(row.created_by ?? row.createdBy ?? ''),
+    createdAt: epochFromSupabase(row.created_at ?? row.createdAt),
+    lastEditedBy: String(row.last_edited_by ?? row.lastEditedBy ?? ''),
+    lastEditedAt: epochFromSupabase(row.last_edited_at ?? row.lastEditedAt),
+  });
+}
+
+function mapSupabaseArchive(row: any): SharedArchiveItem {
+  return stripUndefined({
+    id: String(row.id),
+    text: String(row.text || ''),
+    tier: row.tier === 'high' || row.tier === 'medium' || row.tier === 'low' ? row.tier : 'medium',
+    completedAt: epochFromSupabase(row.completed_at ?? row.completedAt),
+    archivedBy: String(row.archived_by ?? row.archivedBy ?? ''),
+    createdAt: row.created_at || row.createdAt ? epochFromSupabase(row.created_at ?? row.createdAt) : undefined,
+    lastEditedBy: row.last_edited_by ?? row.lastEditedBy ?? undefined,
+    lastEditedAt: row.last_edited_at || row.lastEditedAt ? epochFromSupabase(row.last_edited_at ?? row.lastEditedAt) : undefined,
+  });
+}
+
 async function commitSharedParent(db: ReturnType<typeof getFirestore>, ref: ReturnType<typeof doc>, data: Omit<SharedList, 'id'>) {
   await enableNetwork(db).catch(() => {});
   await withTimeout(setDoc(ref, data), 30000, 'Could not reach Firebase within 30 seconds. Check connection and try again.');
@@ -326,7 +416,7 @@ function getKeyboardSheetFrame(
   return { bottom, maxHeight, keyboardInset };
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+function withTimeout<T>(promise: PromiseLike<T>, ms: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error(message)), ms);
@@ -404,6 +494,22 @@ function useIAP() {
 // OAuth Web Client ID from google-services.json (oauth_client with client_type: 3).
 // Required by Google Sign-In to issue ID tokens that Firebase Auth can verify.
 const WEB_CLIENT_ID = '707782512255-se0aiqqjctssub66bmoba4dtgn3lacd5.apps.googleusercontent.com';
+
+// Supabase shared-list backend, phase 1. The publishable key is safe to ship
+// in the APK; never put an sb_secret_* key in mobile source.
+const SUPABASE_URL = 'https://ivzbipfmgpulsyzsamfx.supabase.co';
+const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_eEjaYkSNMFmUVe0Sd_K_3g_JznOV7PI';
+const USE_SUPABASE_SHARED_LISTS = true;
+const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false,
+    detectSessionInUrl: false,
+  },
+  accessToken: async () => {
+    return (await getAuth(getApp()).currentUser?.getIdToken(false)) ?? null;
+  },
+});
 
 interface SyncContextValue {
   user: FirebaseAuthTypes.User | null;
@@ -785,6 +891,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     } catch {}
   }, []);
 
+
   // Load persisted joinedIds on mount. Phase 1 sync engine will overwrite
   // this list when it restores a fresh device — by then we've already started
   // listening to whatever was on disk. The next render after restore picks
@@ -859,6 +966,51 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     await setJoinedIds(joinedIdsRef.current.filter((x) => x !== listId));
   }, [setJoinedIds]);
 
+  const refreshSupabaseSharedList = useCallback(async (listId: string) => {
+    if (!isSupabaseSharedListId(listId) || locallyRemovedSharedIdsRef.current.has(listId)) return;
+    const [listRes, membersRes, itemsRes, archivesRes] = await Promise.all([
+      supabase.from('tri_shared_lists').select('*').eq('id', listId).maybeSingle(),
+      supabase.from('tri_shared_members').select('*').eq('list_id', listId),
+      supabase.from('tri_shared_items').select('*').eq('list_id', listId),
+      supabase.from('tri_shared_archives').select('*').eq('list_id', listId),
+    ]);
+    if (listRes.error) throw new Error(supabaseErrorMessage(listRes.error, 'Could not load shared list.'));
+    if (!listRes.data) {
+      forgetSharedListLocally(listId);
+      await removeJoinedId(listId);
+      return;
+    }
+    if (membersRes.error) throw new Error(supabaseErrorMessage(membersRes.error, 'Could not load shared members.'));
+    if (itemsRes.error) throw new Error(supabaseErrorMessage(itemsRes.error, 'Could not load shared items.'));
+    if (archivesRes.error) throw new Error(supabaseErrorMessage(archivesRes.error, 'Could not load shared archive.'));
+
+    setSharedLists((prev) => ({ ...prev, [listId]: mapSupabaseList(listRes.data, membersRes.data || []) }));
+    setSharedItems((prev) => ({ ...prev, [listId]: (itemsRes.data || []).map(mapSupabaseItem) }));
+    setSharedArchives((prev) => ({ ...prev, [listId]: (archivesRes.data || []).map(mapSupabaseArchive) }));
+  }, [forgetSharedListLocally, removeJoinedId]);
+
+  useEffect(() => {
+    if (!authReady || !user || hydrating) return;
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from('tri_shared_members')
+        .select('list_id')
+        .eq('uid', user.uid);
+      if (cancelled || error || !Array.isArray(data)) return;
+      const recovered = data
+        .map((row: any) => String(row.list_id || ''))
+        .filter((id) => isSupabaseSharedListId(id) && !locallyRemovedSharedIdsRef.current.has(id));
+      const missing = recovered.filter((id) => !joinedIdsRef.current.includes(id));
+      if (missing.length > 0) {
+        await setJoinedIds([...joinedIdsRef.current, ...missing]);
+      }
+    })().catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [authReady, user, hydrating, setJoinedIds]);
+
   // AppState gate: detach all listeners when backgrounded so we don't burn
   // Firestore reads while invisible. Reattach on foreground.
   useEffect(() => {
@@ -902,6 +1054,28 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     const unsubs: Array<() => void> = [];
 
     for (const listId of joinedIds) {
+      if (isSupabaseSharedListId(listId)) {
+        refreshSupabaseSharedList(listId).catch((error) => {
+          if (isMissingOrPermissionError(error)) {
+            forgetSharedListLocally(listId);
+            removeJoinedId(listId).catch(() => {});
+          }
+        });
+        const refresh = () => {
+          refreshSupabaseSharedList(listId).catch(() => {});
+        };
+        const channel = supabase
+          .channel(`tri-shared-list-${listId}`)
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'tri_shared_lists', filter: `id=eq.${listId}` }, refresh)
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'tri_shared_members', filter: `list_id=eq.${listId}` }, refresh)
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'tri_shared_items', filter: `list_id=eq.${listId}` }, refresh)
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'tri_shared_archives', filter: `list_id=eq.${listId}` }, refresh)
+          .subscribe();
+        unsubs.push(() => {
+          supabase.removeChannel(channel).catch(() => {});
+        });
+        continue;
+      }
       // Parent doc listener — list metadata, ACL changes, member roster updates.
       const parentRef = doc(db, 'sharedLists', listId);
       const unsubParent = onSnapshot(
@@ -991,7 +1165,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         try { u(); } catch { /* noop */ }
       }
     };
-  }, [authReady, user, appActive, joinedIds, forgetSharedList, forgetSharedListLocally, removeJoinedId]);
+  }, [authReady, user, appActive, joinedIds, forgetSharedList, forgetSharedListLocally, removeJoinedId, refreshSupabaseSharedList]);
 
   // Step 8: join an existing shared list by share code. Enforces caps:
   //   - 1 shared grocery list per user
@@ -1006,6 +1180,24 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     const normalized = normalizeShareCode(rawCode);
     if (normalized.length !== SHARE_CODE_LENGTH) {
       throw new Error(`Code must be ${SHARE_CODE_LENGTH} characters.`);
+    }
+
+    if (USE_SUPABASE_SHARED_LISTS) {
+      const result = await withTimeout(
+        supabase.rpc('tri_join_shared_list', { p_share_code: normalized }),
+        10000,
+        'Could not reach shared-list service within 10 seconds. Check connection and try again.',
+      );
+      if (!result.error && result.data?.id) {
+        const listId = String(result.data.id);
+        await addJoinedId(listId);
+        await refreshSupabaseSharedList(listId).catch(() => {});
+        return listId;
+      }
+      const message = supabaseErrorMessage(result.error, 'Code not found.');
+      if (!message.toLowerCase().includes('code not found')) {
+        throw new Error(message);
+      }
     }
 
     const db = getFirestore(getApp());
@@ -1051,7 +1243,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     // Append to local joinedIds so the listener picks it up.
     await addJoinedId(listId);
     return listId;
-  }, [user, sharedLists, addJoinedId]);
+  }, [user, sharedLists, addJoinedId, refreshSupabaseSharedList]);
 
   // Step 11b: shared-list item CRUD. Each call writes one or more docs and
   // bumps lastEditedBy/At so the per-item avatar (Step 13) reflects the
@@ -1060,6 +1252,32 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const addSharedTaskItems = useCallback(async (listId: string, items: { text: string; tier: Tier }[]) => {
     if (!user) throw new Error('Not signed in');
     if (items.length === 0) return;
+    if (isSupabaseSharedListId(listId)) {
+      const now = Date.now();
+      const rows = items
+        .map((it) => ({
+          id: randomUuid(),
+          list_id: listId,
+          text: it.text,
+          tier: it.tier,
+          checked: false,
+          created_by: user.uid,
+          created_at: new Date(now).toISOString(),
+          last_edited_by: user.uid,
+          last_edited_at: new Date(now).toISOString(),
+        }))
+        .filter((it) => it.text.trim());
+      if (rows.length === 0) return;
+      const optimistic = rows.map(mapSupabaseItem);
+      setSharedItems((prev) => ({ ...prev, [listId]: [...(prev[listId] || []), ...optimistic] }));
+      const { error } = await supabase.from('tri_shared_items').insert(rows);
+      if (error) {
+        const ids = new Set(rows.map((row) => row.id));
+        setSharedItems((prev) => ({ ...prev, [listId]: (prev[listId] || []).filter((it) => !ids.has(it.id)) }));
+        throw new Error(supabaseErrorMessage(error, 'Could not add shared items.'));
+      }
+      return;
+    }
     const db = getFirestore(getApp());
     const now = Date.now();
     const batch = writeBatch(db);
@@ -1103,6 +1321,20 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
   const editSharedTaskItem = useCallback(async (listId: string, itemId: string, patch: { text?: string; tier?: Tier }) => {
     if (!user) throw new Error('Not signed in');
+    if (isSupabaseSharedListId(listId)) {
+      const { error } = await supabase
+        .from('tri_shared_items')
+        .update(stripUndefined({
+          text: patch.text,
+          tier: patch.tier,
+          last_edited_by: user.uid,
+          last_edited_at: new Date().toISOString(),
+        }))
+        .eq('id', itemId)
+        .eq('list_id', listId);
+      if (error) throw new Error(supabaseErrorMessage(error, 'Could not edit shared task.'));
+      return;
+    }
     const db = getFirestore(getApp());
     await updateDoc(doc(db, 'sharedLists', listId, 'items', itemId), stripUndefined({
       ...patch,
@@ -1113,12 +1345,35 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
   const deleteSharedTaskItem = useCallback(async (listId: string, itemId: string) => {
     if (!user) throw new Error('Not signed in');
+    if (isSupabaseSharedListId(listId)) {
+      const { error } = await supabase.from('tri_shared_items').delete().eq('id', itemId).eq('list_id', listId);
+      if (error) throw new Error(supabaseErrorMessage(error, 'Could not delete shared task.'));
+      return;
+    }
     const db = getFirestore(getApp());
     await deleteDoc(doc(db, 'sharedLists', listId, 'items', itemId));
   }, [user]);
 
   const archiveSharedTaskItem = useCallback(async (listId: string, itemId: string, item: { text: string; tier: Tier; createdAt?: number }) => {
     if (!user) throw new Error('Not signed in');
+    if (isSupabaseSharedListId(listId)) {
+      const now = Date.now();
+      const archiveRow = {
+        list_id: listId,
+        text: item.text,
+        tier: item.tier,
+        completed_at: new Date(now).toISOString(),
+        archived_by: user.uid,
+        created_at: item.createdAt ? new Date(item.createdAt).toISOString() : null,
+        last_edited_by: user.uid,
+        last_edited_at: new Date(now).toISOString(),
+      };
+      const { error: archiveError } = await supabase.from('tri_shared_archives').insert(archiveRow);
+      if (archiveError) throw new Error(supabaseErrorMessage(archiveError, 'Could not archive shared task.'));
+      const { error: deleteError } = await supabase.from('tri_shared_items').delete().eq('id', itemId).eq('list_id', listId);
+      if (deleteError) throw new Error(supabaseErrorMessage(deleteError, 'Could not remove completed shared task.'));
+      return;
+    }
     const db = getFirestore(getApp());
     const now = Date.now();
     const batch = writeBatch(db);
@@ -1147,6 +1402,11 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
   const deleteSharedArchiveItem = useCallback(async (listId: string, archiveId: string) => {
     if (!user) throw new Error('Not signed in');
+    if (isSupabaseSharedListId(listId)) {
+      const { error } = await supabase.from('tri_shared_archives').delete().eq('id', archiveId).eq('list_id', listId);
+      if (error) throw new Error(supabaseErrorMessage(error, 'Could not delete shared archive item.'));
+      return;
+    }
     const db = getFirestore(getApp());
     await deleteDoc(doc(db, 'sharedLists', listId, 'archive', archiveId));
   }, [user]);
@@ -1154,6 +1414,32 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const addSharedGroceryItems = useCallback(async (listId: string, items: { name: string; category: string }[]) => {
     if (!user) throw new Error('Not signed in');
     if (items.length === 0) return;
+    if (isSupabaseSharedListId(listId)) {
+      const now = Date.now();
+      const rows = items
+        .map((it) => ({
+          id: randomUuid(),
+          list_id: listId,
+          name: it.name.trim(),
+          category: it.category || GROCERY_UNCATEGORIZED,
+          checked: false,
+          created_by: user.uid,
+          created_at: new Date(now).toISOString(),
+          last_edited_by: user.uid,
+          last_edited_at: new Date(now).toISOString(),
+        }))
+        .filter((it) => it.name);
+      if (rows.length === 0) return;
+      const optimistic = rows.map(mapSupabaseItem);
+      setSharedItems((prev) => ({ ...prev, [listId]: [...(prev[listId] || []), ...optimistic] }));
+      const { error } = await supabase.from('tri_shared_items').insert(rows);
+      if (error) {
+        const ids = new Set(rows.map((row) => row.id));
+        setSharedItems((prev) => ({ ...prev, [listId]: (prev[listId] || []).filter((it) => !ids.has(it.id)) }));
+        throw new Error(supabaseErrorMessage(error, 'Could not add shared grocery items.'));
+      }
+      return;
+    }
     const db = getFirestore(getApp());
     const now = Date.now();
     const batch = writeBatch(db);
@@ -1177,6 +1463,21 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
   const updateSharedGroceryItem = useCallback(async (listId: string, itemId: string, patch: { name?: string; category?: string; checked?: boolean }) => {
     if (!user) throw new Error('Not signed in');
+    if (isSupabaseSharedListId(listId)) {
+      const { error } = await supabase
+        .from('tri_shared_items')
+        .update(stripUndefined({
+          name: patch.name,
+          category: patch.category,
+          checked: patch.checked,
+          last_edited_by: user.uid,
+          last_edited_at: new Date().toISOString(),
+        }))
+        .eq('id', itemId)
+        .eq('list_id', listId);
+      if (error) throw new Error(supabaseErrorMessage(error, 'Could not update shared grocery item.'));
+      return;
+    }
     const db = getFirestore(getApp());
     await updateDoc(doc(db, 'sharedLists', listId, 'items', itemId), stripUndefined({
       ...patch,
@@ -1187,6 +1488,11 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
   const deleteSharedGroceryItem = useCallback(async (listId: string, itemId: string) => {
     if (!user) throw new Error('Not signed in');
+    if (isSupabaseSharedListId(listId)) {
+      const { error } = await supabase.from('tri_shared_items').delete().eq('id', itemId).eq('list_id', listId);
+      if (error) throw new Error(supabaseErrorMessage(error, 'Could not delete shared grocery item.'));
+      return;
+    }
     const db = getFirestore(getApp());
     await deleteDoc(doc(db, 'sharedLists', listId, 'items', itemId));
   }, [user]);
@@ -1194,6 +1500,11 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const deleteSharedGroceryItems = useCallback(async (listId: string, itemIds: string[]) => {
     if (!user) throw new Error('Not signed in');
     if (itemIds.length === 0) return;
+    if (isSupabaseSharedListId(listId)) {
+      const { error } = await supabase.from('tri_shared_items').delete().eq('list_id', listId).in('id', itemIds);
+      if (error) throw new Error(supabaseErrorMessage(error, 'Could not delete shared grocery items.'));
+      return;
+    }
     const db = getFirestore(getApp());
     for (let i = 0; i < itemIds.length; i += 500) {
       const batch = writeBatch(db);
@@ -1207,6 +1518,21 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const updateSharedGroceryCategories = useCallback(async (listId: string, assignments: { id: string; category: string }[]) => {
     if (!user) throw new Error('Not signed in');
     if (assignments.length === 0) return;
+    if (isSupabaseSharedListId(listId)) {
+      const now = new Date().toISOString();
+      const results = await Promise.all(assignments.map((assignment) => supabase
+        .from('tri_shared_items')
+        .update({
+          category: assignment.category || GROCERY_UNCATEGORIZED,
+          last_edited_by: user.uid,
+          last_edited_at: now,
+        })
+        .eq('id', assignment.id)
+        .eq('list_id', listId)));
+      const failed = results.find((result) => result.error);
+      if (failed?.error) throw new Error(supabaseErrorMessage(failed.error, 'Could not update shared grocery categories.'));
+      return;
+    }
     const db = getFirestore(getApp());
     const now = Date.now();
     for (let i = 0; i < assignments.length; i += 500) {
@@ -1226,6 +1552,17 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
   const rotateShareCode = useCallback(async (listId: string): Promise<string> => {
     if (!user) throw new Error('Not signed in');
+    if (isSupabaseSharedListId(listId)) {
+      const { data, error } = await supabase.rpc('tri_rotate_share_code', { p_list_id: listId });
+      if (error) throw new Error(supabaseErrorMessage(error, 'Could not rotate share code.'));
+      const nextCode = String(data || '');
+      if (!nextCode) throw new Error('Could not rotate share code.');
+      setSharedLists((prev) => prev[listId] ? {
+        ...prev,
+        [listId]: { ...prev[listId], shareCode: nextCode, updatedAt: Date.now() },
+      } : prev);
+      return nextCode;
+    }
     const db = getFirestore(getApp());
     let nextCode = '';
     for (let attempt = 0; attempt < 5; attempt++) {
@@ -1248,6 +1585,15 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     if (!user) throw new Error('Not signed in');
     const trimmed = name.trim();
     if (!trimmed) throw new Error('Name required.');
+    if (isSupabaseSharedListId(listId)) {
+      const { error } = await supabase.rpc('tri_rename_shared_list', { p_list_id: listId, p_name: trimmed });
+      if (error) throw new Error(supabaseErrorMessage(error, 'Could not rename shared list.'));
+      setSharedLists((prev) => prev[listId] ? {
+        ...prev,
+        [listId]: { ...prev[listId], name: trimmed, updatedAt: Date.now() },
+      } : prev);
+      return;
+    }
     const db = getFirestore(getApp());
     await updateDoc(doc(db, 'sharedLists', listId), {
       name: trimmed,
@@ -1257,6 +1603,16 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
   const leaveSharedList = useCallback(async (listId: string) => {
     if (!user) throw new Error('Not signed in');
+    if (isSupabaseSharedListId(listId)) {
+      const cleanupLocal = async () => {
+        forgetSharedListLocally(listId);
+        await removeJoinedId(listId);
+      };
+      const { error } = await supabase.rpc('tri_leave_shared_list', { p_list_id: listId });
+      if (error && !isMissingOrPermissionError(error)) throw new Error(supabaseErrorMessage(error, 'Could not leave shared list.'));
+      await cleanupLocal();
+      return;
+    }
     const db = getFirestore(getApp());
     const cleanupLocal = async () => {
       forgetSharedListLocally(listId);
@@ -1297,6 +1653,19 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
   const deleteSharedList = useCallback(async (listId: string) => {
     if (!user) throw new Error('Not signed in');
+    if (isSupabaseSharedListId(listId)) {
+      const cached = sharedLists[listId];
+      if (cached && cached.ownerUid !== user.uid) {
+        throw new Error(formatSharedListOwnerMismatch(cached, user.uid));
+      }
+      forgetSharedListLocally(listId);
+      await removeJoinedId(listId);
+      const { error } = await supabase.rpc('tri_delete_shared_list', { p_list_id: listId });
+      if (error && !isMissingOrPermissionError(error)) {
+        throw new Error(supabaseErrorMessage(error, 'Could not delete shared list.'));
+      }
+      return;
+    }
     const db = getFirestore(getApp());
     const cached = sharedLists[listId];
     if (cached && cached.ownerUid === user.uid) {
@@ -1368,6 +1737,41 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   // private list from its own state once this resolves.
   const promoteTaskListToShared = useCallback(async (list: TaskList): Promise<string> => {
     if (!user) throw new Error('Not signed in');
+    if (USE_SUPABASE_SHARED_LISTS) {
+      const now = Date.now();
+      const items = list.tasks.map((t) => ({
+        text: t.text,
+        tier: t.tier,
+        checked: false,
+        createdAt: t.createdAt || now,
+      }));
+      const result = await withTimeout(
+        supabase.rpc('tri_create_shared_list', { p_kind: 'tasks', p_name: list.name, p_items: items }),
+        10000,
+        'Could not create the shared list within 10 seconds. Check connection and try again.',
+      );
+      if (result.error) throw new Error(supabaseErrorMessage(result.error, 'Could not create shared list.'));
+      const listRow = result.data?.list;
+      if (!listRow?.id) throw new Error('Could not create shared list.');
+      const listId = String(listRow.id);
+      const ownerMember = buildSharedListMember(user.email, 0, now);
+      const sharedList: SharedList = {
+        id: listId,
+        ownerUid: String(listRow.ownerUid || user.uid),
+        kind: 'tasks',
+        name: String(listRow.name || list.name),
+        acl: [user.uid],
+        shareCode: String(listRow.shareCode || ''),
+        members: { [user.uid]: ownerMember },
+        createdAt: Number(listRow.createdAt || now),
+        updatedAt: Number(listRow.updatedAt || now),
+      };
+      const sharedRows = Array.isArray(result.data?.items) ? result.data.items.map(mapSupabaseItem) : [];
+      setSharedLists((prev) => ({ ...prev, [listId]: sharedList }));
+      setSharedItems((prev) => ({ ...prev, [listId]: sharedRows }));
+      await addJoinedId(listId);
+      return listId;
+    }
     const db = getFirestore(getApp());
     const now = Date.now();
 
@@ -1447,6 +1851,43 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     if (!user) throw new Error('Not signed in');
     if (Object.values(sharedLists).some((l) => l.kind === 'grocery')) {
       throw new Error('You already have a shared grocery list.');
+    }
+    if (USE_SUPABASE_SHARED_LISTS) {
+      const now = Date.now();
+      const groceryItems = items
+        .filter((it) => it.name.trim())
+        .map((it) => ({
+          name: it.name,
+          category: it.category || GROCERY_UNCATEGORIZED,
+          checked: !!it.checked,
+          createdAt: it.createdAt || now,
+        }));
+      const result = await withTimeout(
+        supabase.rpc('tri_create_shared_list', { p_kind: 'grocery', p_name: 'Groceries', p_items: groceryItems }),
+        10000,
+        'Could not create the shared grocery list within 10 seconds. Check connection and try again.',
+      );
+      if (result.error) throw new Error(supabaseErrorMessage(result.error, 'Could not create shared grocery list.'));
+      const listRow = result.data?.list;
+      if (!listRow?.id) throw new Error('Could not create shared grocery list.');
+      const listId = String(listRow.id);
+      const ownerMember = buildSharedListMember(user.email, 0, now);
+      const sharedList: SharedList = {
+        id: listId,
+        ownerUid: String(listRow.ownerUid || user.uid),
+        kind: 'grocery',
+        name: String(listRow.name || 'Groceries'),
+        acl: [user.uid],
+        shareCode: String(listRow.shareCode || ''),
+        members: { [user.uid]: ownerMember },
+        createdAt: Number(listRow.createdAt || now),
+        updatedAt: Number(listRow.updatedAt || now),
+      };
+      const sharedRows = Array.isArray(result.data?.items) ? result.data.items.map(mapSupabaseItem) : [];
+      setSharedLists((prev) => ({ ...prev, [listId]: sharedList }));
+      setSharedItems((prev) => ({ ...prev, [listId]: sharedRows }));
+      await addJoinedId(listId);
+      return listId;
     }
     const db = getFirestore(getApp());
     const now = Date.now();
