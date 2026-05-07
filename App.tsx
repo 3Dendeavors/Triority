@@ -499,17 +499,30 @@ const WEB_CLIENT_ID = '707782512255-se0aiqqjctssub66bmoba4dtgn3lacd5.apps.google
 // in the APK; never put an sb_secret_* key in mobile source.
 const SUPABASE_URL = 'https://ivzbipfmgpulsyzsamfx.supabase.co';
 const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_eEjaYkSNMFmUVe0Sd_K_3g_JznOV7PI';
-const USE_SUPABASE_SHARED_LISTS = true;
-const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
-  auth: {
-    persistSession: false,
-    autoRefreshToken: false,
-    detectSessionInUrl: false,
-  },
-  accessToken: async () => {
-    return (await getAuth(getApp()).currentUser?.getIdToken(false)) ?? null;
-  },
-});
+// Disabled after the first Supabase-enabled release APK crashed on launch.
+// Next session should fix the React Native startup compatibility issue before re-enabling.
+const USE_SUPABASE_SHARED_LISTS = false;
+const disabledSupabaseClient = {
+  from: () => { throw new Error('Supabase shared lists are disabled in this build.'); },
+  rpc: () => Promise.resolve({ data: null, error: new Error('Supabase shared lists are disabled in this build.') }),
+  channel: () => ({
+    on: function on() { return this; },
+    subscribe: function subscribe() { return this; },
+  }),
+  removeChannel: () => Promise.resolve('ok'),
+};
+const supabase = USE_SUPABASE_SHARED_LISTS
+  ? createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+      accessToken: async () => {
+        return (await getAuth(getApp()).currentUser?.getIdToken(false)) ?? null;
+      },
+    })
+  : disabledSupabaseClient as ReturnType<typeof createClient>;
 
 interface SyncContextValue {
   user: FirebaseAuthTypes.User | null;

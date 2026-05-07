@@ -11,6 +11,7 @@ rules_version = '2';
 //   /users/{uid}/notifications/{id}   Phase 2 — list_deleted notices etc.
 //   /sharedLists/{listId}             Phase 2 — owner + ACL'd shared list.
 //   /sharedLists/{listId}/items/{id}  Phase 2 — per-item subdocs.
+//   /sharedLists/{listId}/archive/{id} Phase 2 — shared completed-task archive.
 
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -69,9 +70,11 @@ service cloud.firestore {
       allow list: if request.auth != null;
       allow create: if request.auth != null
                     && validSharedListCreate(request.resource.data);
-      allow update: if isMember(resource.data)
-                    && validSharedListUpdate(resource.data, request.resource.data)
-                    && rateLimited(resource.data);
+      allow update: if (
+                      isMember(resource.data)
+                      && validSharedListUpdate(resource.data, request.resource.data)
+                      && rateLimited(resource.data)
+                    ) || validSharedListJoin(resource.data, request.resource.data);
       allow delete: if request.auth != null
                     && resource.data.ownerUid == request.auth.uid;
 
@@ -83,6 +86,20 @@ service cloud.firestore {
         allow read, write: if request.auth != null
                            && request.auth.uid in
                               get(/databases/$(database)/documents/sharedLists/$(listId)).data.acl;
+      }
+
+      match /archive/{archiveId} {
+        allow read: if request.auth != null
+                    && request.auth.uid in
+                       get(/databases/$(database)/documents/sharedLists/$(listId)).data.acl;
+        allow create: if request.auth != null
+                      && request.auth.uid in
+                         get(/databases/$(database)/documents/sharedLists/$(listId)).data.acl
+                      && validSharedArchiveCreate(request.resource.data);
+        allow delete: if request.auth != null
+                      && get(/databases/$(database)/documents/sharedLists/$(listId)).data.ownerUid
+                         == request.auth.uid;
+        allow update: if false;
       }
     }
 
@@ -138,6 +155,46 @@ service cloud.firestore {
         && next.members is map
         && next.updatedAt is number
         && next.size() < 32 * 1024;
+  }
+
+  // Join-by-code path. Non-members can query by shareCode, then perform one
+  // narrow parent update that adds only themselves to acl + members. No other
+  // list metadata may change during that join write.
+  function validSharedListJoin(prev, next) {
+    return request.auth != null
+        && !(request.auth.uid in prev.acl)
+        && request.auth.uid in next.acl
+        && next.diff(prev).affectedKeys().hasOnly(['acl', 'members', 'updatedAt'])
+        && next.ownerUid == prev.ownerUid
+        && next.kind == prev.kind
+        && next.name == prev.name
+        && next.shareCode == prev.shareCode
+        && next.createdAt == prev.createdAt
+        && prev.acl is list
+        && next.acl is list
+        && next.acl.size() == prev.acl.size() + 1
+        && next.acl.hasAll(prev.acl)
+        && prev.members is map
+        && next.members is map
+        && next.members.diff(prev.members).addedKeys().hasAll([request.auth.uid])
+        && next.members.diff(prev.members).addedKeys().hasOnly([request.auth.uid])
+        && next.members.diff(prev.members).changedKeys().hasOnly([])
+        && next.members.diff(prev.members).removedKeys().hasOnly([])
+        && next.members[request.auth.uid] is map
+        && next.updatedAt is number
+        && next.size() < 32 * 1024;
+  }
+
+  function validSharedArchiveCreate(d) {
+    return d.keys().hasAll(['text', 'tier', 'completedAt', 'archivedBy'])
+        && d.text is string
+        && d.tier in ['high', 'medium', 'low']
+        && d.completedAt is number
+        && d.archivedBy == request.auth.uid
+        && (!('createdAt' in d) || d.createdAt is number)
+        && (!('lastEditedBy' in d) || d.lastEditedBy == request.auth.uid)
+        && (!('lastEditedAt' in d) || d.lastEditedAt is number)
+        && d.size() < 16 * 1024;
   }
 
   // Per-doc write rate limit: 1 write per second.
