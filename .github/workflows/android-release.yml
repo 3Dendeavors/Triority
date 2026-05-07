@@ -102,7 +102,7 @@ jobs:
         working-directory: android
         run: |
           chmod +x ./gradlew
-          ./gradlew assembleRelease --no-daemon
+          ./gradlew :app:createBundleReleaseJsAndAssets --rerun-tasks :app:assembleRelease --no-daemon
 
       - name: Name APK
         shell: bash
