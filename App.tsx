@@ -1230,7 +1230,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
             forgetSharedList(listId);
             return;
           }
-          if (!snap.exists) {
+          if (!snap.exists()) {
             // Owner deleted the list. Drop it from local state; notification
             // surfacing is Step 14's job.
             forgetSharedListLocally(listId);
@@ -1905,7 +1905,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     // transactional read-modify-write would be safer against concurrent
     // member changes, but for v1 the last-write-wins outcome is acceptable.
     const snap = await getDoc(doc(db, 'sharedLists', listId));
-    if (!snap.exists) {
+    if (!snap.exists()) {
       // Nothing to leave; just clean local state.
       await cleanupLocal();
       return;
@@ -1981,7 +1981,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     }
 
     const snap = await getDoc(doc(db, 'sharedLists', listId));
-    if (!snap.exists) {
+    if (!snap.exists()) {
       forgetSharedListLocally(listId);
       await removeJoinedId(listId);
       return;
