@@ -483,10 +483,10 @@ function withTimeout<T>(promise: PromiseLike<T>, ms: number, message: string): P
 // hardcoded true so all formerly-Pro features unlock for everyone.
 //
 // Settings shows a "Support Triority" row that opens DonateSheet linking to
-// these URLs. The row hides itself if BOTH URLs are empty — Ross fills these
+// these URLs. The row hides itself if BOTH URLs are empty. Fill these
 // in before the GitHub release goes out.
 //
-// TODO(ross): paste real URLs before publishing v1.5.0 to GitHub Releases.
+// TODO: paste real URLs before publishing a donation-enabled GitHub release.
 const TRIORITY_PATREON_URL = '';
 const TRIORITY_BMAC_URL = '';
 
@@ -2477,7 +2477,7 @@ const THEMES: ThemeDef[] = [
     '#B35D33', '#FF9900',
     '#5C7A92', '#88A0B8',
   ),
-  // Joker — Ross's custom: deep purple canvas, cyan surfaces, green text, magenta accent.
+  // Joker — deep purple canvas, cyan surfaces, green text, magenta accent.
   // Dark tokens are exact output of draftToThemeDef({canvas:#380057,controls:#00eeff,text:#00ff22,accent:#ff00ff,controlsOpacity:39}).
   // s2/s3 carry the 39% alpha suffix (63 in hex) matching the custom draft exactly.
   makeTheme('joker', 'Joker', '#c458c4', '#380057',
@@ -7094,7 +7094,7 @@ function draftToThemeDef(d: CustomThemeDraft): ThemeDef {
 
   // Surfaces opacity → TRUE alpha on s1/s2/s3 fills via 8-digit hex. Color
   // and brightness stay exactly as the user picked them; only see-through-ness
-  // changes. s2 (task cards) included per Ross — minor tradeoff: at low
+  // changes. s2 (task cards) included by design — minor tradeoff: at low
   // opacity the swipe-action layers under task cards (red trash, accent check)
   // will faintly show through at rest. Borders stay solid.
   const cOp = Math.max(0, Math.min(255, Math.round((d.controlsOpacity ?? 100) / 100 * 255)));
@@ -7125,7 +7125,7 @@ function draftToThemeDef(d: CustomThemeDraft): ThemeDef {
 
   // Accent → accent + secondary + borders. Borders are accent-derived now
   // (not surfaces-derived) so the rim always reads against the surface fill.
-  // Fixed strength — no opacity slider per Ross's "borders should always be
+  // Fixed strength — no opacity slider; borders should always be
   // pretty strong" call. Secondary tints active pill fill (used as
   // `${secondary}30`); same hue as accent, lower sat, brightness pulled
   // toward canvas so the 30% alpha sits well on the bg.
