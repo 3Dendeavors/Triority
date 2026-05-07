@@ -62,7 +62,6 @@ import {
   deleteDoc,
   updateDoc,
   enableNetwork,
-  waitForPendingWrites,
 } from '@react-native-firebase/firestore';
 import {
   startListening as srStart,
@@ -277,8 +276,7 @@ function stableShareCode(value: string) {
 
 async function commitSharedParent(db: ReturnType<typeof getFirestore>, ref: ReturnType<typeof doc>, data: Omit<SharedList, 'id'>) {
   await enableNetwork(db).catch(() => {});
-  await setDoc(ref, data);
-  await withTimeout(waitForPendingWrites(db), 12000, 'Could not reach Firebase yet. Check connection and try again.');
+  await withTimeout(setDoc(ref, data), 30000, 'Could not reach Firebase within 30 seconds. Check connection and try again.');
 }
 
 type KeyboardSheetState = {
@@ -1378,35 +1376,40 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     // user has an empty shared list. They can delete it and retry. The
     // alternative (widen items rule to allow create when writer is the
     // parent's ownerUid) adds a get() per item create — a worse trade.
-    setSharedLists((prev) => ({ ...prev, [parentRef.id]: { id: parentRef.id, ...parentData } }));
+    try {
+      await commitSharedParent(db, parentRef, parentData);
+    } catch (e) {
+      forgetSharedList(parentRef.id);
+      await removeJoinedId(parentRef.id);
+      throw e;
+    }
 
+    setSharedLists((prev) => ({ ...prev, [parentRef.id]: { id: parentRef.id, ...parentData } }));
     await addJoinedId(parentRef.id);
 
     void (async () => {
-      await commitSharedParent(db, parentRef, parentData);
-      if (list.tasks.length > 0) {
-        for (let i = 0; i < list.tasks.length; i += 500) {
-          const itemsBatch = writeBatch(db);
-          for (const t of list.tasks.slice(i, i + 500)) {
-            const itemRef = doc(db, 'sharedLists', parentRef.id, 'items', `task_${stableFirestoreId(String(t.id))}`);
-            const itemData: Omit<SharedListItem, 'id'> = {
-              text: t.text,
-              tier: t.tier,
-              completed: false,
-              createdBy: user.uid,
-              createdAt: t.createdAt || now,
-              lastEditedBy: user.uid,
-              lastEditedAt: now,
-            };
-            itemsBatch.set(itemRef, stripUndefined(itemData));
-          }
-          await itemsBatch.commit();
+      if (list.tasks.length === 0) return;
+      for (let i = 0; i < list.tasks.length; i += 500) {
+        const itemsBatch = writeBatch(db);
+        for (const t of list.tasks.slice(i, i + 500)) {
+          const itemRef = doc(db, 'sharedLists', parentRef.id, 'items', `task_${stableFirestoreId(String(t.id))}`);
+          const itemData: Omit<SharedListItem, 'id'> = {
+            text: t.text,
+            tier: t.tier,
+            completed: false,
+            createdBy: user.uid,
+            createdAt: t.createdAt || now,
+            lastEditedBy: user.uid,
+            lastEditedAt: now,
+          };
+          itemsBatch.set(itemRef, stripUndefined(itemData));
         }
+        await itemsBatch.commit();
       }
     })().catch(() => {});
 
     return parentRef.id;
-  }, [user, addJoinedId]);
+  }, [user, addJoinedId, forgetSharedList, removeJoinedId]);
 
   const promoteGroceryListToShared = useCallback(async (items: GroceryItem[]): Promise<string> => {
     if (!user) throw new Error('Not signed in');
@@ -1430,10 +1433,6 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       updatedAt: now,
     };
 
-    setSharedLists((prev) => ({ ...prev, [parentRef.id]: { id: parentRef.id, ...parentData } }));
-
-    await addJoinedId(parentRef.id);
-
     const initialItems = items.filter((it) => it.name.trim());
     const optimisticItems: SharedListItem[] = initialItems.map((item, index) => ({
       id: `grocery_${stableFirestoreId(String(item.id))}`,
@@ -1445,12 +1444,23 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       lastEditedBy: user.uid,
       lastEditedAt: now,
     }));
+
+    try {
+      await commitSharedParent(db, parentRef, parentData);
+    } catch (e) {
+      forgetSharedList(parentRef.id);
+      await removeJoinedId(parentRef.id);
+      throw e;
+    }
+
+    setSharedLists((prev) => ({ ...prev, [parentRef.id]: { id: parentRef.id, ...parentData } }));
+    await addJoinedId(parentRef.id);
+
     if (optimisticItems.length > 0) {
       setSharedItems((prev) => ({ ...prev, [parentRef.id]: optimisticItems }));
     }
 
     void (async () => {
-      await commitSharedParent(db, parentRef, parentData);
       if (initialItems.length > 0) {
         for (let i = 0; i < initialItems.length; i += 500) {
           const itemsBatch = writeBatch(db);
@@ -1473,7 +1483,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     })().catch(() => {});
 
     return parentRef.id;
-  }, [user, sharedLists, addJoinedId]);
+  }, [user, sharedLists, addJoinedId, forgetSharedList, removeJoinedId]);
 
   const value: SharedListsContextValue = {
     sharedLists,
@@ -7355,6 +7365,12 @@ function StandaloneGrocery({
               <Text style={[styles.taskCountInline, { color: T.textMute, fontFamily: jks('500') }]}>
                 {`${groceryItems.length} item${groceryItems.length !== 1 ? 's' : ''}`}
               </Text>
+              <Text style={[styles.metaBullet, { color: T.textMute }]}>  •  </Text>
+              <Text style={[styles.taskCountInline, { color: sharedGrocery ? accentColor : T.textMute, fontFamily: jks('700') }]}>
+                {sharedGrocery
+                  ? `Shared · ${sharedGrocery.memberCount} member${sharedGrocery.memberCount === 1 ? '' : 's'}`
+                  : 'Private'}
+              </Text>
             </Text>
           </View>
           <TouchableOpacity
@@ -8340,8 +8356,6 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
                   memberCount: Object.keys(sharedGroceryDoc.members || {}).length,
                 } : undefined}
                 onShareGrocery={() => promoteGroceryListToShared(groceryItems).then(() => {
-                  setGroceryItemsState([]);
-                  persistGrocery([]);
                   setViewingSharedGrocery(true);
                 })}
                 onRotateGroceryShareCode={() => sharedGroceryDoc ? rotateShareCode(sharedGroceryDoc.id).then(() => undefined) : Promise.reject(new Error('No shared grocery list'))}
