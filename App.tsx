@@ -700,6 +700,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const [sharedArchives, setSharedArchives] = useState<{ [id: string]: SharedArchiveItem[] }>({});
   const [hydrating, setHydrating] = useState(true);
   const [appActive, setAppActive] = useState(true);
+  const [membershipDiscoveryRetry, setMembershipDiscoveryRetry] = useState(0);
 
   const forgetSharedList = useCallback((listId: string) => {
     setSharedLists((prev) => {
@@ -783,16 +784,29 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     AsyncStorage.setItem(SHARED_CACHE_KEY, JSON.stringify(cache)).catch(() => {});
   }, [hydrating, user, sharedLists, sharedItems, sharedArchives]);
 
+  const persistJoinedIdsForUser = useCallback((ids: string[]) => {
+    if (!user) return;
+    const updatedAt = Date.now();
+    setDoc(doc(getFirestore(getApp()), 'users', user.uid), {
+      schemaVersion: SYNC_SCHEMA_VERSION,
+      updatedAt,
+      data: {
+        joinedSharedLists: ids,
+      },
+    }, { merge: true }).catch(() => {});
+  }, [user]);
+
   const setJoinedIds = useCallback(async (ids: string[]) => {
     const next = Array.from(new Set(ids));
     joinedIdsRef.current = next;
     setJoinedIdsState(next);
+    persistJoinedIdsForUser(next);
     try {
       await AsyncStorage.setItem(SHARED_JOINED_LISTS_KEY, JSON.stringify(next));
     } catch {
       // best-effort; the in-memory state still drives the UI
     }
-  }, []);
+  }, [persistJoinedIdsForUser]);
 
   const addJoinedId = useCallback(async (listId: string) => {
     if (joinedIdsRef.current.includes(listId)) return;
@@ -817,43 +831,45 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     enableNetwork(getFirestore(getApp())).catch(() => {});
   }, [user, appActive]);
 
-  const aclReconcileUidRef = useRef<string | null>(null);
   useEffect(() => {
     if (!authReady || hydrating) return;
-    if (!user) {
-      aclReconcileUidRef.current = null;
-      return;
-    }
+    if (!user) return;
     if (!appActive) return;
     const uid = user.uid;
-    if (aclReconcileUidRef.current === uid) return;
-    aclReconcileUidRef.current = uid;
-
-    let cancelled = false;
-    (async () => {
-      try {
-        const db = getFirestore(getApp());
-        await enableNetwork(db).catch(() => {});
-        const snap = await getDocs(query(
-          collection(db, 'sharedLists'),
-          where('acl', 'array-contains', uid),
-        ));
-        if (cancelled) return;
-        const remoteIds = snap.docs.map((d) => d.id);
-        if (remoteIds.length === 0) return;
-        const merged = Array.from(new Set([...joinedIdsRef.current, ...remoteIds]));
-        if (merged.length !== joinedIdsRef.current.length) {
-          await setJoinedIds(merged);
+    const db = getFirestore(getApp());
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    enableNetwork(db).catch(() => {});
+    const unsub = onSnapshot(
+      query(collection(db, 'sharedLists'), where('acl', 'array-contains', uid)),
+      (snap) => {
+        const remoteIds: string[] = [];
+        const remoteLists: { [id: string]: SharedList } = {};
+        snap.forEach((d) => {
+          const data = d.data() as Omit<SharedList, 'id'> | undefined;
+          if (!data) return;
+          remoteIds.push(d.id);
+          remoteLists[d.id] = { id: d.id, ...data };
+        });
+        if (remoteIds.length > 0) {
+          setSharedLists((prev) => ({ ...prev, ...remoteLists }));
+          const merged = Array.from(new Set([...joinedIdsRef.current, ...remoteIds]));
+          if (merged.length !== joinedIdsRef.current.length) {
+            setJoinedIds(merged).catch(() => {});
+          }
         }
-      } catch {
-        if (!cancelled) aclReconcileUidRef.current = null;
-        // Best-effort recovery. Existing joinedIds still drive listeners, and
-        // the next fresh sign-in/app launch retries this ACL discovery.
-      }
-    })();
+      },
+      () => {
+        retryTimer = setTimeout(() => {
+          setMembershipDiscoveryRetry((n) => n + 1);
+        }, 5000);
+      },
+    );
 
-    return () => { cancelled = true; };
-  }, [authReady, hydrating, user, appActive, setJoinedIds]);
+    return () => {
+      if (retryTimer) clearTimeout(retryTimer);
+      try { unsub(); } catch {}
+    };
+  }, [authReady, hydrating, user, appActive, setJoinedIds, membershipDiscoveryRetry]);
 
   // The actual listener attach/detach effect. Re-runs when the auth user,
   // the joined list IDs, or the active state changes.
