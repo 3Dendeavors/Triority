@@ -89,6 +89,7 @@ yarn-error.log
 .claude/
 .gradle-home/
 CTempmetro.log
+CLAUDECHANGES.md
 
 # Additional secrets and build artifacts (per GitHub setup review 2026-05-06)
 *.jks
