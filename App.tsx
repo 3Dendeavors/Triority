@@ -28,6 +28,7 @@ import {
   TextInput,
   TouchableOpacity,
   TouchableWithoutFeedback,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -60,6 +61,8 @@ import {
   getDocs,
   deleteDoc,
   updateDoc,
+  enableNetwork,
+  waitForPendingWrites,
 } from '@react-native-firebase/firestore';
 import {
   startListening as srStart,
@@ -112,6 +115,10 @@ interface ArchivedTask {
   completedAt: number;
   reminder?: Reminder; // preserved so restore can reinstate it
   listId?: string;     // origin list, for list-scoped archive view + restore-to-origin (v1.2+)
+  sharedListId?: string;
+  sharedListName?: string;
+  sharedCanDelete?: boolean;
+  archivedByInitial?: string;
 }
 
 interface TaskList {
@@ -185,6 +192,17 @@ interface SharedListItem {
   lastEditedAt: number;
 }
 
+interface SharedArchiveItem {
+  id: string;
+  text: string;
+  tier: Tier;
+  completedAt: number;
+  archivedBy: string;
+  createdAt?: number;
+  lastEditedBy?: string;
+  lastEditedAt?: number;
+}
+
 type NotificationKind = 'list_deleted'; // future: 'list_kicked', 'member_joined', etc.
 
 interface UserNotification {
@@ -217,7 +235,107 @@ const SHARED_GROCERY_LIMIT = 1;
 // install on another device picks them up alongside the rest of the slice.
 const SHARED_JOINED_LISTS_KEY = 'tri_shared_joined';
 const SHARED_TASK_ORDER_KEY = 'tri_shared_task_order';
+const LIST_ROW_ORDER_KEY = 'tri_list_row_order';
 const SHARED_GROCERY_TOGGLE_KEY = 'tri_shared_grocery_view';   // '1' = viewing shared, '0' or absent = viewing private
+const SHARED_CACHE_KEY = 'tri_shared_cache_v1';
+
+function isMissingOrPermissionError(e: any) {
+  const raw = String(e?.code || e?.nativeErrorCode || e?.message || '').toLowerCase();
+  return raw.includes('permission-denied') || raw.includes('not-found') || raw.includes('not_found');
+}
+
+function formatSharedListOwnerMismatch(data: Pick<SharedList, 'members' | 'ownerUid'>, uid: string) {
+  const ownerInitial = data.members?.[data.ownerUid]?.emailInitial;
+  const yourInitial = data.members?.[uid]?.emailInitial;
+  if (ownerInitial || yourInitial) {
+    return `Firestore says owner ${ownerInitial || '?'} can delete. You are ${yourInitial || '?'}.`;
+  }
+  return 'Firestore says a different signed-in account owns this list.';
+}
+
+function stableFirestoreId(value: string) {
+  return value.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 120);
+}
+
+function taskShareDocId(uid: string, listId: string) {
+  return `tasks_${stableFirestoreId(uid)}_${stableFirestoreId(listId)}`;
+}
+
+function groceryShareDocId(uid: string) {
+  return `grocery_${stableFirestoreId(uid)}`;
+}
+
+function stableShareCode(value: string) {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36).toUpperCase().padStart(SHARE_CODE_LENGTH, '0').slice(-SHARE_CODE_LENGTH);
+}
+
+async function commitSharedParent(db: ReturnType<typeof getFirestore>, ref: ReturnType<typeof doc>, data: Omit<SharedList, 'id'>) {
+  await enableNetwork(db).catch(() => {});
+  await setDoc(ref, data);
+  await withTimeout(waitForPendingWrites(db), 12000, 'Could not reach Firebase yet. Check connection and try again.');
+}
+
+type KeyboardSheetState = {
+  height: number;
+  screenY: number | null;
+};
+
+type KeyboardSheetFrame = {
+  bottom: number;
+  maxHeight: number;
+  keyboardInset: number;
+};
+
+function getKeyboardMetrics(): KeyboardSheetState {
+  const metrics = Keyboard.metrics?.();
+  const height = Math.max(0, metrics?.height ?? 0);
+  const screenY = typeof metrics?.screenY === 'number' ? metrics.screenY : null;
+  return { height, screenY };
+}
+
+function keyboardStateFromEvent(e: any): KeyboardSheetState {
+  const coords = e?.endCoordinates;
+  const height = Math.max(0, coords?.height ?? 0);
+  const screenY = typeof coords?.screenY === 'number' ? coords.screenY : null;
+  return { height, screenY };
+}
+
+function getKeyboardSheetFrame(
+  keyboard: KeyboardSheetState,
+  topInset: number,
+  bottomInset: number,
+  windowHeight: number,
+  forceKeyboardMode = false,
+): KeyboardSheetFrame {
+  const screenHeight = Dimensions.get('screen').height;
+  const fromScreenY = keyboard.screenY !== null
+    ? Math.max(0, screenHeight - keyboard.screenY)
+    : 0;
+  const reportedInset = Math.max(keyboard.height, fromScreenY);
+  const fallbackKeyboardInset = Math.min(430, Math.max(320, Math.round(screenHeight * 0.42)));
+  const keyboardInset = reportedInset > 0
+    ? reportedInset
+    : (forceKeyboardMode ? fallbackKeyboardInset : 0);
+  const bottom = keyboardInset > 0 ? keyboardInset : bottomInset;
+  const availableHeight = Math.min(windowHeight, Math.max(180, screenHeight - keyboardInset));
+  const maxHeight = Math.max(180, availableHeight - topInset - bottomInset - 12);
+  return { bottom, maxHeight, keyboardInset };
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 
 // ─── Donation links (step 15) ────────────────────────────────────────────────
@@ -290,6 +408,7 @@ const WEB_CLIENT_ID = '707782512255-se0aiqqjctssub66bmoba4dtgn3lacd5.apps.google
 
 interface SyncContextValue {
   user: FirebaseAuthTypes.User | null;
+  authReady: boolean;
   signingIn: boolean;
   signIn: () => Promise<void>;
   signOut: () => Promise<void>;
@@ -298,6 +417,7 @@ interface SyncContextValue {
 }
 const SyncContext = createContext<SyncContextValue>({
   user: null,
+  authReady: false,
   signingIn: false,
   signIn: async () => {},
   signOut: async () => {},
@@ -307,6 +427,7 @@ const SyncContext = createContext<SyncContextValue>({
 
 function SyncProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<FirebaseAuthTypes.User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -314,6 +435,7 @@ function SyncProvider({ children }: { children: React.ReactNode }) {
     GoogleSignin.configure({ webClientId: WEB_CLIENT_ID });
     const unsubscribe = onAuthStateChanged(getAuth(getApp()), (next) => {
       setUser(next);
+      setAuthReady(true);
     });
     return unsubscribe;
   }, []);
@@ -358,7 +480,7 @@ function SyncProvider({ children }: { children: React.ReactNode }) {
   const clearError = () => setError(null);
 
   return (
-    <SyncContext.Provider value={{ user, signingIn, signIn, signOut, error, clearError }}>
+    <SyncContext.Provider value={{ user, authReady, signingIn, signIn, signOut, error, clearError }}>
       {children}
     </SyncContext.Provider>
   );
@@ -491,6 +613,7 @@ function buildSharedListMember(email: string | null | undefined, slot: number, n
 interface SharedListsContextValue {
   sharedLists: { [listId: string]: SharedList };
   sharedItems: { [listId: string]: SharedListItem[] };
+  sharedArchives: { [listId: string]: SharedArchiveItem[] };
   joinedIds: string[];
   setJoinedIds: (ids: string[]) => Promise<void>;
   // Set true while we're hydrating local state from AsyncStorage on cold start.
@@ -500,6 +623,7 @@ interface SharedListsContextValue {
   // its own state once promotion succeeds. Throws if not signed in, code
   // collides repeatedly, or Firestore write fails.
   promoteTaskListToShared: (list: TaskList) => Promise<string>;
+  promoteGroceryListToShared: (items: GroceryItem[]) => Promise<string>;
   // Step 8: join an existing shared list by share code. Returns the joined
   // list's ID. Throws on: not signed in, bad code length, code not found,
   // already joined, or cap exceeded for that kind.
@@ -511,6 +635,13 @@ interface SharedListsContextValue {
   addSharedTaskItems: (listId: string, items: { text: string; tier: Tier }[]) => Promise<void>;
   editSharedTaskItem: (listId: string, itemId: string, patch: { text?: string; tier?: Tier }) => Promise<void>;
   deleteSharedTaskItem: (listId: string, itemId: string) => Promise<void>;
+  archiveSharedTaskItem: (listId: string, itemId: string, item: { text: string; tier: Tier; createdAt?: number }) => Promise<void>;
+  deleteSharedArchiveItem: (listId: string, archiveId: string) => Promise<void>;
+  addSharedGroceryItems: (listId: string, items: { name: string; category: string }[]) => Promise<void>;
+  updateSharedGroceryItem: (listId: string, itemId: string, patch: { name?: string; category?: string; checked?: boolean }) => Promise<void>;
+  deleteSharedGroceryItem: (listId: string, itemId: string) => Promise<void>;
+  deleteSharedGroceryItems: (listId: string, itemIds: string[]) => Promise<void>;
+  updateSharedGroceryCategories: (listId: string, assignments: { id: string; category: string }[]) => Promise<void>;
   // Step 10: list-level operations for the unified ListActionSheet.
   // rotateShareCode — owner-only; replaces shareCode on the parent doc.
   // renameSharedList — anyone in acl can rename (consensus model; matches
@@ -527,17 +658,33 @@ interface SharedListsContextValue {
   deleteSharedList: (listId: string) => Promise<void>;
 }
 
+interface SharedListsCache {
+  lists: { [listId: string]: SharedList };
+  items: { [listId: string]: SharedListItem[] };
+  archives: { [listId: string]: SharedArchiveItem[] };
+  savedAt: number;
+}
+
 const SharedListsContext = createContext<SharedListsContextValue>({
   sharedLists: {},
   sharedItems: {},
+  sharedArchives: {},
   joinedIds: [],
   setJoinedIds: async () => {},
   hydrating: true,
   promoteTaskListToShared: async () => { throw new Error('SharedListsProvider not mounted'); },
+  promoteGroceryListToShared: async () => { throw new Error('SharedListsProvider not mounted'); },
   joinSharedListByCode: async () => { throw new Error('SharedListsProvider not mounted'); },
   addSharedTaskItems: async () => { throw new Error('SharedListsProvider not mounted'); },
   editSharedTaskItem: async () => { throw new Error('SharedListsProvider not mounted'); },
   deleteSharedTaskItem: async () => { throw new Error('SharedListsProvider not mounted'); },
+  archiveSharedTaskItem: async () => { throw new Error('SharedListsProvider not mounted'); },
+  deleteSharedArchiveItem: async () => { throw new Error('SharedListsProvider not mounted'); },
+  addSharedGroceryItems: async () => { throw new Error('SharedListsProvider not mounted'); },
+  updateSharedGroceryItem: async () => { throw new Error('SharedListsProvider not mounted'); },
+  deleteSharedGroceryItem: async () => { throw new Error('SharedListsProvider not mounted'); },
+  deleteSharedGroceryItems: async () => { throw new Error('SharedListsProvider not mounted'); },
+  updateSharedGroceryCategories: async () => { throw new Error('SharedListsProvider not mounted'); },
   rotateShareCode: async () => { throw new Error('SharedListsProvider not mounted'); },
   renameSharedList: async () => { throw new Error('SharedListsProvider not mounted'); },
   leaveSharedList: async () => { throw new Error('SharedListsProvider not mounted'); },
@@ -545,12 +692,35 @@ const SharedListsContext = createContext<SharedListsContextValue>({
 });
 
 function SharedListsProvider({ children }: { children: React.ReactNode }) {
-  const { user } = useSync();
+  const { user, authReady } = useSync();
   const [joinedIds, setJoinedIdsState] = useState<string[]>([]);
+  const joinedIdsRef = useRef<string[]>([]);
   const [sharedLists, setSharedLists] = useState<{ [id: string]: SharedList }>({});
   const [sharedItems, setSharedItems] = useState<{ [id: string]: SharedListItem[] }>({});
+  const [sharedArchives, setSharedArchives] = useState<{ [id: string]: SharedArchiveItem[] }>({});
   const [hydrating, setHydrating] = useState(true);
   const [appActive, setAppActive] = useState(true);
+
+  const forgetSharedList = useCallback((listId: string) => {
+    setSharedLists((prev) => {
+      if (!(listId in prev)) return prev;
+      const next = { ...prev };
+      delete next[listId];
+      return next;
+    });
+    setSharedItems((prev) => {
+      if (!(listId in prev)) return prev;
+      const next = { ...prev };
+      delete next[listId];
+      return next;
+    });
+    setSharedArchives((prev) => {
+      if (!(listId in prev)) return prev;
+      const next = { ...prev };
+      delete next[listId];
+      return next;
+    });
+  }, []);
 
   // Load persisted joinedIds on mount. Phase 1 sync engine will overwrite
   // this list when it restores a fresh device — by then we've already started
@@ -562,7 +732,11 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         const raw = await AsyncStorage.getItem(SHARED_JOINED_LISTS_KEY);
         if (raw) {
           const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed)) setJoinedIdsState(parsed.filter((x) => typeof x === 'string'));
+          if (Array.isArray(parsed)) {
+            const next = Array.from(new Set(parsed.filter((x) => typeof x === 'string')));
+            joinedIdsRef.current = next;
+            setJoinedIdsState(next);
+          }
         }
       } catch {
         // bad JSON — ignore, start with empty
@@ -572,14 +746,62 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     })();
   }, []);
 
+  useEffect(() => {
+    if (hydrating) return;
+    (async () => {
+      try {
+        const rawCache = await AsyncStorage.getItem(SHARED_CACHE_KEY);
+        if (!rawCache) return;
+        const parsed = JSON.parse(rawCache) as Partial<SharedListsCache>;
+        const joined = new Set(joinedIdsRef.current);
+        const cachedLists = parsed?.lists && typeof parsed.lists === 'object' ? parsed.lists : {};
+        const cachedItems = parsed?.items && typeof parsed.items === 'object' ? parsed.items : {};
+        const cachedArchives = parsed?.archives && typeof parsed.archives === 'object' ? parsed.archives : {};
+        const filteredLists: { [id: string]: SharedList } = {};
+        const filteredItems: { [id: string]: SharedListItem[] } = {};
+        const filteredArchives: { [id: string]: SharedArchiveItem[] } = {};
+        for (const id of joined) {
+          if (cachedLists[id]) filteredLists[id] = cachedLists[id];
+          if (Array.isArray(cachedItems[id])) filteredItems[id] = cachedItems[id];
+          if (Array.isArray(cachedArchives[id])) filteredArchives[id] = cachedArchives[id];
+        }
+        setSharedLists(filteredLists);
+        setSharedItems(filteredItems);
+        setSharedArchives(filteredArchives);
+      } catch {}
+    })();
+  }, [hydrating]);
+
+  useEffect(() => {
+    if (hydrating || !user) return;
+    const cache: SharedListsCache = {
+      lists: sharedLists,
+      items: sharedItems,
+      archives: sharedArchives,
+      savedAt: Date.now(),
+    };
+    AsyncStorage.setItem(SHARED_CACHE_KEY, JSON.stringify(cache)).catch(() => {});
+  }, [hydrating, user, sharedLists, sharedItems, sharedArchives]);
+
   const setJoinedIds = useCallback(async (ids: string[]) => {
-    setJoinedIdsState(ids);
+    const next = Array.from(new Set(ids));
+    joinedIdsRef.current = next;
+    setJoinedIdsState(next);
     try {
-      await AsyncStorage.setItem(SHARED_JOINED_LISTS_KEY, JSON.stringify(ids));
+      await AsyncStorage.setItem(SHARED_JOINED_LISTS_KEY, JSON.stringify(next));
     } catch {
       // best-effort; the in-memory state still drives the UI
     }
   }, []);
+
+  const addJoinedId = useCallback(async (listId: string) => {
+    if (joinedIdsRef.current.includes(listId)) return;
+    await setJoinedIds([...joinedIdsRef.current, listId]);
+  }, [setJoinedIds]);
+
+  const removeJoinedId = useCallback(async (listId: string) => {
+    await setJoinedIds(joinedIdsRef.current.filter((x) => x !== listId));
+  }, [setJoinedIds]);
 
   // AppState gate: detach all listeners when backgrounded so we don't burn
   // Firestore reads while invisible. Reattach on foreground.
@@ -590,10 +812,55 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     return () => sub.remove();
   }, []);
 
+  useEffect(() => {
+    if (!user || !appActive) return;
+    enableNetwork(getFirestore(getApp())).catch(() => {});
+  }, [user, appActive]);
+
+  const aclReconcileUidRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!authReady || hydrating) return;
+    if (!user) {
+      aclReconcileUidRef.current = null;
+      return;
+    }
+    if (!appActive) return;
+    const uid = user.uid;
+    if (aclReconcileUidRef.current === uid) return;
+    aclReconcileUidRef.current = uid;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const db = getFirestore(getApp());
+        await enableNetwork(db).catch(() => {});
+        const snap = await getDocs(query(
+          collection(db, 'sharedLists'),
+          where('acl', 'array-contains', uid),
+        ));
+        if (cancelled) return;
+        const remoteIds = snap.docs.map((d) => d.id);
+        if (remoteIds.length === 0) return;
+        const merged = Array.from(new Set([...joinedIdsRef.current, ...remoteIds]));
+        if (merged.length !== joinedIdsRef.current.length) {
+          await setJoinedIds(merged);
+        }
+      } catch {
+        if (!cancelled) aclReconcileUidRef.current = null;
+        // Best-effort recovery. Existing joinedIds still drive listeners, and
+        // the next fresh sign-in/app launch retries this ACL discovery.
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [authReady, hydrating, user, appActive, setJoinedIds]);
+
   // The actual listener attach/detach effect. Re-runs when the auth user,
   // the joined list IDs, or the active state changes.
   useEffect(() => {
-    if (!user || !appActive || joinedIds.length === 0) {
+    if (!authReady) return;
+
+    if (!user) {
       // Nothing to listen to — clear stale state from a previous binding so
       // the UI doesn't show a list the user just left.
       setSharedLists((prev) => {
@@ -604,8 +871,14 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         if (Object.keys(prev).length === 0) return prev;
         return {};
       });
+      setSharedArchives((prev) => {
+        if (Object.keys(prev).length === 0) return prev;
+        return {};
+      });
       return;
     }
+
+    if (!appActive || joinedIds.length === 0) return;
 
     const db = getFirestore(getApp());
     const unsubs: Array<() => void> = [];
@@ -619,26 +892,19 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
           if (!snap.exists) {
             // Owner deleted the list. Drop it from local state; notification
             // surfacing is Step 14's job.
-            setSharedLists((prev) => {
-              if (!(listId in prev)) return prev;
-              const next = { ...prev };
-              delete next[listId];
-              return next;
-            });
-            setSharedItems((prev) => {
-              if (!(listId in prev)) return prev;
-              const next = { ...prev };
-              delete next[listId];
-              return next;
-            });
+            forgetSharedList(listId);
+            removeJoinedId(listId).catch(() => {});
             return;
           }
           const data = snap.data() as Omit<SharedList, 'id'> | undefined;
           if (!data) return;
           setSharedLists((prev) => ({ ...prev, [listId]: { id: listId, ...data } }));
         },
-        () => {
-          // permission-denied (rules not yet published, or user got kicked)
+        (error) => {
+          if (isMissingOrPermissionError(error)) {
+            forgetSharedList(listId);
+            removeJoinedId(listId).catch(() => {});
+          }
           // — fall silent. Step 14 surfaces user-visible removals.
         },
       );
@@ -655,11 +921,42 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
           });
           setSharedItems((prev) => ({ ...prev, [listId]: items }));
         },
-        () => {
+        (error) => {
+          if (isMissingOrPermissionError(error)) {
+            setSharedItems((prev) => {
+              if (!(listId in prev)) return prev;
+              const next = { ...prev };
+              delete next[listId];
+              return next;
+            });
+          }
           // same posture as parent: silent on errors, fail-closed UI.
         },
       );
       unsubs.push(unsubItems);
+
+      const archiveRef = collection(db, 'sharedLists', listId, 'archive');
+      const unsubArchive = onSnapshot(
+        archiveRef,
+        (snap) => {
+          const items: SharedArchiveItem[] = [];
+          snap.forEach((d) => {
+            items.push({ id: d.id, ...(d.data() as Omit<SharedArchiveItem, 'id'>) });
+          });
+          setSharedArchives((prev) => ({ ...prev, [listId]: items }));
+        },
+        (error) => {
+          if (isMissingOrPermissionError(error)) {
+            setSharedArchives((prev) => {
+              if (!(listId in prev)) return prev;
+              const next = { ...prev };
+              delete next[listId];
+              return next;
+            });
+          }
+        },
+      );
+      unsubs.push(unsubArchive);
     }
 
     return () => {
@@ -667,7 +964,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         try { u(); } catch { /* noop */ }
       }
     };
-  }, [user, appActive, joinedIds]);
+  }, [authReady, user, appActive, joinedIds, forgetSharedList, removeJoinedId]);
 
   // Step 8: join an existing shared list by share code. Enforces caps:
   //   - 1 shared grocery list per user
@@ -685,6 +982,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     }
 
     const db = getFirestore(getApp());
+    await enableNetwork(db).catch(() => {});
     const probe = await getDocs(query(
       collection(db, 'sharedLists'),
       where('shareCode', '==', normalized),
@@ -693,6 +991,11 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     const snap = probe.docs[0];
     const listId = snap.id;
     const data = snap.data() as Omit<SharedList, 'id'>;
+
+    if (data.acl.includes(user.uid) && !joinedIdsRef.current.includes(listId)) {
+      await addJoinedId(listId);
+      return listId;
+    }
 
     if (data.acl.includes(user.uid)) throw new Error('You’re already in this list.');
 
@@ -719,11 +1022,9 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     });
 
     // Append to local joinedIds so the listener picks it up.
-    if (!joinedIds.includes(listId)) {
-      await setJoinedIds([...joinedIds, listId]);
-    }
+    await addJoinedId(listId);
     return listId;
-  }, [user, sharedLists, joinedIds, setJoinedIds]);
+  }, [user, sharedLists, addJoinedId]);
 
   // Step 11b: shared-list item CRUD. Each call writes one or more docs and
   // bumps lastEditedBy/At so the per-item avatar (Step 13) reflects the
@@ -735,6 +1036,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     const db = getFirestore(getApp());
     const now = Date.now();
     const batch = writeBatch(db);
+    const optimistic: SharedListItem[] = [];
     for (const it of items) {
       const ref = doc(collection(db, 'sharedLists', listId, 'items'));
       const data: Omit<SharedListItem, 'id'> = {
@@ -747,9 +1049,30 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         lastEditedAt: now,
       };
       batch.set(ref, stripUndefined(data));
+      optimistic.push({ id: ref.id, ...data });
     }
-    await batch.commit();
-  }, [user]);
+    setSharedItems((prev) => {
+      const existing = prev[listId] || [];
+      const optimisticIds = new Set(optimistic.map((it) => it.id));
+      return {
+        ...prev,
+        [listId]: [
+          ...existing.filter((it) => !optimisticIds.has(it.id)),
+          ...optimistic,
+        ],
+      };
+    });
+    try {
+      await batch.commit();
+    } catch (e) {
+      const optimisticIds = new Set(optimistic.map((it) => it.id));
+      setSharedItems((prev) => ({
+        ...prev,
+        [listId]: (prev[listId] || []).filter((it) => !optimisticIds.has(it.id)),
+      }));
+      throw e;
+    }
+  }, [user, setSharedItems]);
 
   const editSharedTaskItem = useCallback(async (listId: string, itemId: string, patch: { text?: string; tier?: Tier }) => {
     if (!user) throw new Error('Not signed in');
@@ -765,6 +1088,111 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     if (!user) throw new Error('Not signed in');
     const db = getFirestore(getApp());
     await deleteDoc(doc(db, 'sharedLists', listId, 'items', itemId));
+  }, [user]);
+
+  const archiveSharedTaskItem = useCallback(async (listId: string, itemId: string, item: { text: string; tier: Tier; createdAt?: number }) => {
+    if (!user) throw new Error('Not signed in');
+    const db = getFirestore(getApp());
+    const now = Date.now();
+    const batch = writeBatch(db);
+    const archiveRef = doc(collection(db, 'sharedLists', listId, 'archive'));
+    const itemRef = doc(db, 'sharedLists', listId, 'items', itemId);
+    const archiveData: Omit<SharedArchiveItem, 'id'> = {
+      text: item.text,
+      tier: item.tier,
+      completedAt: now,
+      archivedBy: user.uid,
+      createdAt: item.createdAt,
+      lastEditedBy: user.uid,
+      lastEditedAt: now,
+    };
+    batch.set(archiveRef, stripUndefined(archiveData));
+    batch.delete(itemRef);
+    try {
+      await batch.commit();
+    } catch (e) {
+      if (!isMissingOrPermissionError(e)) throw e;
+      // If deployed rules are still missing shared-archive create access, let
+      // completion remove the live task instead of failing the whole action.
+      await deleteDoc(itemRef);
+    }
+  }, [user]);
+
+  const deleteSharedArchiveItem = useCallback(async (listId: string, archiveId: string) => {
+    if (!user) throw new Error('Not signed in');
+    const db = getFirestore(getApp());
+    await deleteDoc(doc(db, 'sharedLists', listId, 'archive', archiveId));
+  }, [user]);
+
+  const addSharedGroceryItems = useCallback(async (listId: string, items: { name: string; category: string }[]) => {
+    if (!user) throw new Error('Not signed in');
+    if (items.length === 0) return;
+    const db = getFirestore(getApp());
+    const now = Date.now();
+    const batch = writeBatch(db);
+    for (const it of items) {
+      const name = it.name.trim();
+      if (!name) continue;
+      const ref = doc(collection(db, 'sharedLists', listId, 'items'));
+      const data: Omit<SharedListItem, 'id'> = {
+        name,
+        category: it.category || GROCERY_UNCATEGORIZED,
+        checked: false,
+        createdBy: user.uid,
+        createdAt: now,
+        lastEditedBy: user.uid,
+        lastEditedAt: now,
+      };
+      batch.set(ref, stripUndefined(data));
+    }
+    await batch.commit();
+  }, [user]);
+
+  const updateSharedGroceryItem = useCallback(async (listId: string, itemId: string, patch: { name?: string; category?: string; checked?: boolean }) => {
+    if (!user) throw new Error('Not signed in');
+    const db = getFirestore(getApp());
+    await updateDoc(doc(db, 'sharedLists', listId, 'items', itemId), stripUndefined({
+      ...patch,
+      lastEditedBy: user.uid,
+      lastEditedAt: Date.now(),
+    }));
+  }, [user]);
+
+  const deleteSharedGroceryItem = useCallback(async (listId: string, itemId: string) => {
+    if (!user) throw new Error('Not signed in');
+    const db = getFirestore(getApp());
+    await deleteDoc(doc(db, 'sharedLists', listId, 'items', itemId));
+  }, [user]);
+
+  const deleteSharedGroceryItems = useCallback(async (listId: string, itemIds: string[]) => {
+    if (!user) throw new Error('Not signed in');
+    if (itemIds.length === 0) return;
+    const db = getFirestore(getApp());
+    for (let i = 0; i < itemIds.length; i += 500) {
+      const batch = writeBatch(db);
+      for (const id of itemIds.slice(i, i + 500)) {
+        batch.delete(doc(db, 'sharedLists', listId, 'items', id));
+      }
+      await batch.commit();
+    }
+  }, [user]);
+
+  const updateSharedGroceryCategories = useCallback(async (listId: string, assignments: { id: string; category: string }[]) => {
+    if (!user) throw new Error('Not signed in');
+    if (assignments.length === 0) return;
+    const db = getFirestore(getApp());
+    const now = Date.now();
+    for (let i = 0; i < assignments.length; i += 500) {
+      const batch = writeBatch(db);
+      for (const assignment of assignments.slice(i, i + 500)) {
+        batch.update(doc(db, 'sharedLists', listId, 'items', assignment.id), stripUndefined({
+          category: assignment.category || GROCERY_UNCATEGORIZED,
+          lastEditedBy: user.uid,
+          lastEditedAt: now,
+        }));
+      }
+      await batch.commit();
+    }
   }, [user]);
 
   // Step 10: list-level mutations for the unified ListActionSheet.
@@ -803,14 +1231,18 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const leaveSharedList = useCallback(async (listId: string) => {
     if (!user) throw new Error('Not signed in');
     const db = getFirestore(getApp());
+    const cleanupLocal = async () => {
+      forgetSharedList(listId);
+      await removeJoinedId(listId);
+    };
+    try {
     // Read current acl/members so we can write the trimmed-down version. A
     // transactional read-modify-write would be safer against concurrent
     // member changes, but for v1 the last-write-wins outcome is acceptable.
     const snap = await getDoc(doc(db, 'sharedLists', listId));
     if (!snap.exists) {
       // Nothing to leave; just clean local state.
-      const next = joinedIds.filter((x) => x !== listId);
-      await setJoinedIds(next);
+      await cleanupLocal();
       return;
     }
     const data = snap.data() as Omit<SharedList, 'id'>;
@@ -826,96 +1258,76 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       updatedAt: Date.now(),
     });
     // Drop from local joinedIds so the listener detaches.
-    const next = joinedIds.filter((x) => x !== listId);
-    await setJoinedIds(next);
-  }, [user, joinedIds, setJoinedIds]);
+    await cleanupLocal();
+    } catch (e) {
+      if (isMissingOrPermissionError(e)) {
+        await cleanupLocal();
+        return;
+      }
+      throw e;
+    }
+  }, [user, forgetSharedList, removeJoinedId]);
 
   const deleteSharedList = useCallback(async (listId: string) => {
     if (!user) throw new Error('Not signed in');
     const db = getFirestore(getApp());
     const snap = await getDoc(doc(db, 'sharedLists', listId));
     if (!snap.exists) {
-      const next = joinedIds.filter((x) => x !== listId);
-      await setJoinedIds(next);
+      forgetSharedList(listId);
+      await removeJoinedId(listId);
       return;
     }
     const data = snap.data() as Omit<SharedList, 'id'>;
     if (data.ownerUid !== user.uid) {
-      throw new Error('Only the owner can delete this list.');
+      throw new Error(formatSharedListOwnerMismatch(data, user.uid));
     }
 
-    // Step 14: fan out 'list_deleted' notifications to all OTHER members
-    // BEFORE tearing down the parent doc. The cross-user write is allowed by
-    // /users/{uid}/notifications create rule (any auth'd user, valid shape).
-    // Best-effort — if a single notif write fails we still proceed with the
-    // delete; the affected member's listener will detach naturally and they
-    // just won't see the toast next launch. That's acceptable for v1.
+    // Delete the parent first. This removes the list from every member's UI;
+    // notification fan-out must not block the owner's delete action.
     const ownerMember = data.members?.[user.uid];
     const ownerInitial = ownerMember?.emailInitial ?? '?';
     const otherUids = (data.acl || []).filter((u) => u !== user.uid);
     const now = Date.now();
-    if (otherUids.length > 0) {
-      const notifBatch = writeBatch(db);
-      for (const memberUid of otherUids) {
-        const notifRef = doc(collection(db, 'users', memberUid, 'notifications'));
-        notifBatch.set(notifRef, {
-          type: 'list_deleted' as NotificationKind,
-          payload: { listName: data.name, ownerInitial },
-          createdAt: now,
-          readAt: null,
-        });
-      }
-      try {
-        await notifBatch.commit();
-      } catch {
-        // Swallowing intentionally — see comment above.
-      }
-    }
-
-    // Tear down items first so the parent doc isn't orphaned items behind
-    // a deleted-rules wall. Batch up to 500 per writeBatch (Firestore cap).
-    const itemsSnap = await getDocs(collection(db, 'sharedLists', listId, 'items'));
-    const itemDocs = itemsSnap.docs;
-    for (let i = 0; i < itemDocs.length; i += 500) {
-      const batch = writeBatch(db);
-      for (const d of itemDocs.slice(i, i + 500)) batch.delete(d.ref);
-      await batch.commit();
-    }
     await deleteDoc(doc(db, 'sharedLists', listId));
 
-    const next = joinedIds.filter((x) => x !== listId);
-    await setJoinedIds(next);
-  }, [user, joinedIds, setJoinedIds]);
+    forgetSharedList(listId);
+    await removeJoinedId(listId);
+
+    if (otherUids.length > 0) {
+      void (async () => {
+        const notifBatch = writeBatch(db);
+        for (const memberUid of otherUids) {
+          const notifRef = doc(collection(db, 'users', memberUid, 'notifications'));
+          notifBatch.set(notifRef, {
+            type: 'list_deleted' as NotificationKind,
+            payload: { listName: data.name, ownerInitial },
+            createdAt: now,
+            readAt: null,
+          });
+        }
+        await notifBatch.commit();
+      })().catch(() => {});
+    }
+  }, [user, forgetSharedList, removeJoinedId]);
 
   // Step 6: promote a private TaskList → new shared list. Caller deletes the
-  // private list from its own state once this resolves. Code collisions retry
-  // up to 5 times before bubbling the error up to the UI.
+  // private list from its own state once this resolves.
   const promoteTaskListToShared = useCallback(async (list: TaskList): Promise<string> => {
     if (!user) throw new Error('Not signed in');
     const db = getFirestore(getApp());
     const now = Date.now();
 
-    // Generate a non-colliding share code. With ~482M possible codes the
-    // first attempt almost always wins; the loop is paranoia insurance.
-    let shareCode = '';
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const candidate = generateShareCode();
-      const probe = await getDocs(query(
-        collection(db, 'sharedLists'),
-        where('shareCode', '==', candidate),
-      ));
-      if (probe.empty) {
-        shareCode = candidate;
-        break;
-      }
-    }
-    if (!shareCode) throw new Error('Could not generate a unique share code. Try again.');
+    // Generate locally so share creation is not blocked by a preflight
+    // Firestore query. The six-character code space is large enough for the
+    // current release, and write failure still bubbles to the caller.
+    const shareCode = stableShareCode(taskShareDocId(user.uid, String(list.id)));
 
     // The owner takes avatar slot 0 — they're the first member.
     const ownerMember = buildSharedListMember(user.email, 0, now);
 
-    // New parent doc gets a fresh ID from a doc() call against the collection.
-    const parentRef = doc(collection(db, 'sharedLists'));
+    // Stable IDs make share creation idempotent: repeated taps or late
+    // Firestore flushes update the same shared list instead of duplicating it.
+    const parentRef = doc(db, 'sharedLists', taskShareDocId(user.uid, String(list.id)));
     const parentData: Omit<SharedList, 'id'> = {
       ownerUid: user.uid,
       kind: 'tasks',
@@ -942,47 +1354,112 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     // user has an empty shared list. They can delete it and retry. The
     // alternative (widen items rule to allow create when writer is the
     // parent's ownerUid) adds a get() per item create — a worse trade.
-    await setDoc(parentRef, parentData);
+    await commitSharedParent(db, parentRef, parentData);
+    setSharedLists((prev) => ({ ...prev, [parentRef.id]: { id: parentRef.id, ...parentData } }));
 
-    if (list.tasks.length > 0) {
-      const itemsBatch = writeBatch(db);
-      for (const t of list.tasks) {
-        const itemRef = doc(collection(db, 'sharedLists', parentRef.id, 'items'));
-        const itemData: Omit<SharedListItem, 'id'> = {
-          text: t.text,
-          tier: t.tier,
-          completed: false,
-          createdBy: user.uid,
-          createdAt: t.createdAt || now,
-          lastEditedBy: user.uid,
-          lastEditedAt: now,
-          // reminder is intentionally dropped on promote — reminders fire via
-          // local Notifee schedules and don't have a sensible cross-device
-          // model yet. Annotated as v2 want.
-        };
-        itemsBatch.set(itemRef, stripUndefined(itemData));
+    // Return the code path immediately. Firestore may be slow to flush after
+    // app resumes, and timing out the UI only creates duplicate late lists.
+    await addJoinedId(parentRef.id);
+
+    void (async () => {
+      if (list.tasks.length > 0) {
+        for (let i = 0; i < list.tasks.length; i += 500) {
+          const itemsBatch = writeBatch(db);
+          for (const t of list.tasks.slice(i, i + 500)) {
+            const itemRef = doc(db, 'sharedLists', parentRef.id, 'items', `task_${stableFirestoreId(String(t.id))}`);
+            const itemData: Omit<SharedListItem, 'id'> = {
+              text: t.text,
+              tier: t.tier,
+              completed: false,
+              createdBy: user.uid,
+              createdAt: t.createdAt || now,
+              lastEditedBy: user.uid,
+              lastEditedAt: now,
+            };
+            itemsBatch.set(itemRef, stripUndefined(itemData));
+          }
+          await itemsBatch.commit();
+        }
       }
-      await itemsBatch.commit();
-    }
-
-    // Persist the new ID into joinedIds so the listener picks it up.
-    const nextJoined = [...joinedIds, parentRef.id];
-    await setJoinedIds(nextJoined);
+    })().catch(() => {});
 
     return parentRef.id;
-  }, [user, joinedIds, setJoinedIds]);
+  }, [user, addJoinedId]);
+
+  const promoteGroceryListToShared = useCallback(async (items: GroceryItem[]): Promise<string> => {
+    if (!user) throw new Error('Not signed in');
+    if (Object.values(sharedLists).some((l) => l.kind === 'grocery')) {
+      throw new Error('You already have a shared grocery list.');
+    }
+    const db = getFirestore(getApp());
+    const now = Date.now();
+
+    const shareCode = stableShareCode(groceryShareDocId(user.uid));
+
+    const ownerMember = buildSharedListMember(user.email, 0, now);
+    const parentRef = doc(db, 'sharedLists', groceryShareDocId(user.uid));
+    const parentData: Omit<SharedList, 'id'> = {
+      ownerUid: user.uid,
+      kind: 'grocery',
+      name: 'Groceries',
+      acl: [user.uid],
+      shareCode,
+      members: { [user.uid]: ownerMember },
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await commitSharedParent(db, parentRef, parentData);
+    setSharedLists((prev) => ({ ...prev, [parentRef.id]: { id: parentRef.id, ...parentData } }));
+
+    await addJoinedId(parentRef.id);
+
+    const initialItems = items.filter((it) => it.name.trim());
+    void (async () => {
+      if (initialItems.length > 0) {
+        for (let i = 0; i < initialItems.length; i += 500) {
+          const itemsBatch = writeBatch(db);
+          for (const item of initialItems.slice(i, i + 500)) {
+            const itemRef = doc(db, 'sharedLists', parentRef.id, 'items', `grocery_${stableFirestoreId(String(item.id))}`);
+            const itemData: Omit<SharedListItem, 'id'> = {
+              name: item.name,
+              category: item.category || GROCERY_UNCATEGORIZED,
+              checked: !!item.checked,
+              createdBy: user.uid,
+              createdAt: item.createdAt || now,
+              lastEditedBy: user.uid,
+              lastEditedAt: now,
+            };
+            itemsBatch.set(itemRef, stripUndefined(itemData));
+          }
+          await itemsBatch.commit();
+        }
+      }
+    })().catch(() => {});
+
+    return parentRef.id;
+  }, [user, sharedLists, addJoinedId]);
 
   const value: SharedListsContextValue = {
     sharedLists,
     sharedItems,
+    sharedArchives,
     joinedIds,
     setJoinedIds,
     hydrating,
     promoteTaskListToShared,
+    promoteGroceryListToShared,
     joinSharedListByCode,
     addSharedTaskItems,
     editSharedTaskItem,
     deleteSharedTaskItem,
+    archiveSharedTaskItem,
+    deleteSharedArchiveItem,
+    addSharedGroceryItems,
+    updateSharedGroceryItem,
+    deleteSharedGroceryItem,
+    deleteSharedGroceryItems,
+    updateSharedGroceryCategories,
     rotateShareCode,
     renameSharedList,
     leaveSharedList,
@@ -1225,6 +1702,58 @@ const TIERS_DEF = (T: ThemeTokens) => [
 ];
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
+
+const CURRENT_APP_VERSION_CODE = 16;
+const CURRENT_APP_VERSION_NAME = '1.4.0';
+const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
+
+interface UpdateManifest {
+  versionCode: number;
+  versionName?: string;
+  apkUrl: string;
+  releaseNotesUrl?: string;
+  title?: string;
+  message?: string;
+}
+
+function isUpdateManifest(value: unknown): value is UpdateManifest {
+  const data = value as Partial<UpdateManifest> | null;
+  return !!data
+    && typeof data.versionCode === 'number'
+    && Number.isFinite(data.versionCode)
+    && typeof data.apkUrl === 'string'
+    && /^https:\/\//i.test(data.apkUrl);
+}
+
+async function checkForGithubUpdate() {
+  if (Platform.OS !== 'android') return;
+  try {
+    const res = await fetch(`${UPDATE_MANIFEST_URL}?t=${Date.now()}`, {
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!isUpdateManifest(data)) return;
+    if (data.versionCode <= CURRENT_APP_VERSION_CODE) return;
+
+    const versionLabel = data.versionName ? `v${data.versionName}` : `build ${data.versionCode}`;
+    Alert.alert(
+      data.title || 'Triority update available',
+      data.message || `A newer version of Triority is ready: ${versionLabel}. You have v${CURRENT_APP_VERSION_NAME}.`,
+      [
+        { text: 'Later', style: 'cancel' },
+        {
+          text: 'Update',
+          onPress: () => {
+            Linking.openURL(data.apkUrl).catch(() => {
+              if (data.releaseNotesUrl) Linking.openURL(data.releaseNotesUrl).catch(() => {});
+            });
+          },
+        },
+      ],
+    );
+  } catch {}
+}
 
 const APP_VERSION = '2';
 
@@ -2022,6 +2551,7 @@ function EditSheet({ task, onSave, onCancel, accentColor }: EditSheetProps) {
   const T = useT();
   const TIERS = TIERS_DEF(T);
   const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
   // Uncontrolled text: native field owns the value. React-controlled `value`
   // races the Android IME's composing region — on a real S24 that produces
   // garbled text and "deletes the wrong character" on backspace mid-word.
@@ -2031,12 +2561,13 @@ function EditSheet({ task, onSave, onCancel, accentColor }: EditSheetProps) {
   const [tier, setTier] = useState<Tier>(task.tier);
   const [reminder, setReminder] = useState<Reminder | undefined>(task.reminder);
   const textInputRef = useRef<TextInput | null>(null);
+  const [inputFocused, setInputFocused] = useState(false);
   // Initialize from the current IME state instead of 0. When EditSheet opens
   // with the keyboard already up (e.g. user was typing in the InputBar and
   // tapped a row's edit pencil), keyboardDidShow won't fire because there's
   // no transition — leaving kbHeight at 0 and the panel sitting under the IME.
   // Keyboard.metrics() returns the current rect synchronously.
-  const [kbHeight, setKbHeight] = useState(() => Keyboard.metrics()?.height ?? 0);
+  const [keyboard, setKeyboard] = useState<KeyboardSheetState>(() => getKeyboardMetrics());
 
   const slideAnim = useRef(new Animated.Value(400)).current;
   const { dragY, panHandlers } = useSwipeToDismiss(onCancel);
@@ -2055,14 +2586,17 @@ function EditSheet({ task, onSave, onCancel, accentColor }: EditSheetProps) {
     // no retry is needed. Seeding kbAppeared from the synchronous metrics
     // read is what prevents a spurious blur+focus 350ms in (which would
     // bounce the IME and reproduce the first-keystroke-drop bug).
-    let kbAppeared = (Keyboard.metrics()?.height ?? 0) > 0;
+    let kbAppeared = getKeyboardMetrics().height > 0;
 
     const showSub = Keyboard.addListener('keyboardDidShow', e => {
       kbAppeared = true;
-      setKbHeight(e.endCoordinates.height);
+      setKeyboard(keyboardStateFromEvent(e));
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
     });
-    const hideSub = Keyboard.addListener('keyboardDidHide', () => setKbHeight(0));
+    const hideSub = Keyboard.addListener('keyboardDidHide', () => {
+      setKeyboard({ height: 0, screenY: null });
+      setInputFocused(false);
+    });
 
     // Focus AFTER slide completes (~280ms) — focusing during the animation can
     // silently no-op on S24's IME, leaving the user staring at a sheet with no
@@ -2109,13 +2643,9 @@ function EditSheet({ task, onSave, onCancel, accentColor }: EditSheetProps) {
     if (nonEmpty !== hasText) setHasText(nonEmpty);
   };
 
-  // Panel position: when keyboard is up, sit above the IME (no system nav showing
-  // either, since the IME covers it). When keyboard is down, lift above the system
-  // nav inset so Cancel/Save aren't hidden behind the gesture bar / nav buttons.
-  const panelBottom = kbHeight > 0 ? kbHeight : insets.bottom;
-  const visibleHeight = Dimensions.get('window').height - kbHeight - insets.top;
-  const scrollMaxHeight = kbHeight > 0
-    ? Math.max(140, Math.min(220, visibleHeight - 170))
+  const sheetFrame = getKeyboardSheetFrame(keyboard, insets.top, insets.bottom, windowHeight, inputFocused);
+  const scrollMaxHeight = sheetFrame.keyboardInset > 0
+    ? Math.max(140, Math.min(220, sheetFrame.maxHeight - 126))
     : 508;
 
   return (
@@ -2124,15 +2654,15 @@ function EditSheet({ task, onSave, onCancel, accentColor }: EditSheetProps) {
         <TouchableWithoutFeedback onPress={cancel}>
           <View style={styles.backdrop} />
         </TouchableWithoutFeedback>
-        <Animated.View style={[styles.sheetPanel, { bottom: panelBottom, backgroundColor: T.s1, borderColor: T.border, transform: [{ translateY: Animated.add(slideAnim, dragY) }] }]}>
+        <Animated.View style={[styles.sheetPanel, { bottom: sheetFrame.bottom, maxHeight: sheetFrame.maxHeight, backgroundColor: T.s1, borderColor: T.border, transform: [{ translateY: Animated.add(slideAnim, dragY) }] }]}>
           <View style={styles.sheetHandle} {...panHandlers}>
             <View style={[styles.sheetHandleBar, { backgroundColor: T.s3 }]} />
           </View>
           {/* Scrollable content. Buttons are pinned outside the ScrollView so they
               stay visible regardless of keyboard state or how much content scrolls. */}
-          <ScrollView style={{ maxHeight: scrollMaxHeight }} contentContainerStyle={styles.sheetContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+          <ScrollView style={[styles.sheetScroll, { maxHeight: scrollMaxHeight }]} contentContainerStyle={styles.sheetContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
             <Text style={[styles.sheetTitle, { color: T.textMute, fontFamily: jks('700') }]}>Edit Task</Text>
-            <TextInput ref={setTextInputRef} defaultValue={task.text} onChangeText={handleChangeText} multiline scrollEnabled
+            <TextInput ref={setTextInputRef} defaultValue={task.text} onChangeText={handleChangeText} onFocus={() => setInputFocused(true)} multiline scrollEnabled
               autoCorrect={false} autoComplete="off" spellCheck={false} importantForAutofill="no"
               selectTextOnFocus={false}
               style={[styles.sheetTextarea, { backgroundColor: T.s2, color: T.text, borderColor: `${accentColor}50`, fontFamily: jks('400') }]} />
@@ -2622,16 +3152,42 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
 interface GroceryItemRowProps {
   item: GroceryItem;
   onCheck: (id: string) => void;
-  requestDelete: (id: string, springBack: () => void) => void;
+  onDelete: (id: string) => void;
   accentColor: string;
 }
 
-function GroceryItemRow({ item, onCheck, requestDelete, accentColor }: GroceryItemRowProps) {
+function GroceryItemRow({ item, onCheck, onDelete, accentColor }: GroceryItemRowProps) {
   const T = useT();
   const translateX = useRef(new Animated.Value(0)).current;
+  const pulse = useRef(new Animated.Value(0)).current;
+  const [revealed, setRevealed] = useState(false);
+
+  useEffect(() => {
+    if (revealed) {
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulse, { toValue: 1, duration: 520, useNativeDriver: true }),
+          Animated.timing(pulse, { toValue: 0, duration: 520, useNativeDriver: true }),
+        ]),
+      ).start();
+    } else {
+      pulse.stopAnimation();
+      pulse.setValue(0);
+    }
+  }, [pulse, revealed]);
+
+  const springTo = (toValue: number, after?: () => void) => {
+    Animated.spring(translateX, { toValue, useNativeDriver: true, tension: 100, friction: 8 }).start(() => after?.());
+  };
 
   const springBack = () => {
-    Animated.spring(translateX, { toValue: 0, useNativeDriver: true, tension: 100, friction: 8 }).start();
+    setRevealed(false);
+    springTo(0);
+  };
+
+  const reveal = () => {
+    setRevealed(true);
+    springTo(REVEAL_X);
   };
 
   const panResponder = useRef(
@@ -2644,7 +3200,7 @@ function GroceryItemRow({ item, onCheck, requestDelete, accentColor }: GroceryIt
         translateX.setValue(0);
       },
       onPanResponderMove: (_, { dx }) => {
-        translateX.setValue(Math.max(-90, Math.min(90, dx)));
+        translateX.setValue(Math.max(REVEAL_X * 1.4, Math.min(90, dx)));
       },
       onPanResponderRelease: () => {
         translateX.flattenOffset();
@@ -2653,7 +3209,7 @@ function GroceryItemRow({ item, onCheck, requestDelete, accentColor }: GroceryIt
           springBack();
           onCheck(item.id);
         } else if (val < -SWIPE_THRESHOLD) {
-          requestDelete(item.id, springBack);
+          reveal();
         } else {
           springBack();
         }
@@ -2666,7 +3222,10 @@ function GroceryItemRow({ item, onCheck, requestDelete, accentColor }: GroceryIt
   ).current;
 
   const leftOpacity = translateX.interpolate({ inputRange: [0, SWIPE_THRESHOLD], outputRange: [0, 1], extrapolate: 'clamp' });
-  const rightOpacity = translateX.interpolate({ inputRange: [-SWIPE_THRESHOLD, 0], outputRange: [1, 0], extrapolate: 'clamp' });
+  const rightOpacity = translateX.interpolate({ inputRange: [REVEAL_X, 0], outputRange: [1, 0], extrapolate: 'clamp' });
+  const pulseScale = pulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.18] });
+  const pulseHaloOpacity = pulse.interpolate({ inputRange: [0, 1], outputRange: [0.25, 0.7] });
+  const pulseHaloScale = pulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.45] });
 
   return (
     <View style={styles.taskRowContainer}>
@@ -2676,15 +3235,58 @@ function GroceryItemRow({ item, onCheck, requestDelete, accentColor }: GroceryIt
         </View>
       </Animated.View>
       <Animated.View style={[styles.taskRowBgRight, { opacity: rightOpacity }]}>
-        <View style={{ paddingRight: 20 }}>
-          <Icon name="trash" size={16} color="#FF5040" />
-        </View>
+        <TouchableOpacity
+          onPress={() => { if (revealed) onDelete(item.id); }}
+          activeOpacity={0.7}
+          disabled={!revealed}
+          style={styles.trashHitArea}
+          hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}>
+          <Animated.View
+            pointerEvents="none"
+            style={[
+              styles.trashHalo,
+              {
+                backgroundColor: '#FF5040',
+                opacity: revealed ? pulseHaloOpacity : 0,
+                transform: [{ scale: pulseHaloScale }],
+              },
+            ]}
+          />
+          <Animated.View style={{ transform: [{ scale: revealed ? pulseScale : 1 }] }}>
+            <Icon name="trash" size={18} color="#FF5040" />
+          </Animated.View>
+        </TouchableOpacity>
       </Animated.View>
       <Animated.View
         {...panResponder.panHandlers}
-        style={[styles.taskRowContent, { transform: [{ translateX }], backgroundColor: T.s2, borderLeftColor: accentColor }]}>
+        style={[
+          styles.taskRowContent,
+          {
+            transform: [{ translateX }],
+            backgroundColor: T.s2,
+            borderLeftColor: item.checked ? T.borderMid : accentColor,
+            opacity: item.checked ? 0.5 : 1,
+          },
+        ]}>
+        {revealed && (
+          <TouchableOpacity
+            onPress={springBack}
+            activeOpacity={1}
+            style={StyleSheet.absoluteFill}
+          />
+        )}
         <View style={{ flex: 1 }}>
-          <Text style={[styles.taskText, { color: T.text, fontFamily: jks('400') }]}>{item.name}</Text>
+          <Text
+            style={[
+              styles.taskText,
+              {
+                color: item.checked ? T.textMute : T.text,
+                fontFamily: jks('400'),
+                textDecorationLine: item.checked ? 'line-through' : 'none',
+              },
+            ]}>
+            {item.name}
+          </Text>
         </View>
       </Animated.View>
     </View>
@@ -2714,17 +3316,6 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
   const T = useT();
   const [confirmNode, confirm] = useConfirm(accentColor);
 
-  const requestDelete = (id: string, springBack: () => void) => {
-    confirm({
-      title: 'Remove Item',
-      message: 'Remove this item from your grocery list?',
-      confirmLabel: 'Remove',
-      destructive: true,
-      onConfirm: () => onDelete(id),
-      onCancel: springBack,
-    });
-  };
-
   const activeItems = items.filter(i => !i.checked);
   const gotItItems = items.filter(i => i.checked);
   const gotItCount = gotItItems.length;
@@ -2752,14 +3343,14 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
   const isEmpty = items.length === 0;
 
   const renderFlatAlpha = () => (sortedActive as GroceryItem[]).map(item => (
-    <GroceryItemRow key={item.id} item={item} onCheck={onCheck} requestDelete={requestDelete} accentColor={accentColor} />
+    <GroceryItemRow key={item.id} item={item} onCheck={onCheck} onDelete={onDelete} accentColor={accentColor} />
   ));
 
   const renderGrouped = () => (sortedActive as { category: string; items: GroceryItem[] }[]).map(group => (
     <View key={group.category}>
       <Text style={[styles.groceryCategoryHeader, { color: T.textSub, fontFamily: jks('700') }]}>{group.category}</Text>
       {group.items.map(item => (
-        <GroceryItemRow key={item.id} item={item} onCheck={onCheck} requestDelete={requestDelete} accentColor={accentColor} />
+        <GroceryItemRow key={item.id} item={item} onCheck={onCheck} onDelete={onDelete} accentColor={accentColor} />
       ))}
     </View>
   ));
@@ -2820,9 +3411,7 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
               <View style={{ marginTop: 20 }}>
                 <Text style={[styles.groceryCategoryHeader, { color: T.textMute, fontFamily: jks('700') }]}>Got it</Text>
                 {gotItItems.map(item => (
-                  <View key={item.id} style={[styles.taskRowContent, { backgroundColor: T.s2, borderLeftColor: T.borderMid, opacity: 0.5 }]}>
-                    <Text style={[styles.taskText, { color: T.textMute, fontFamily: jks('400'), textDecorationLine: 'line-through' }]}>{item.name}</Text>
-                  </View>
+                  <GroceryItemRow key={item.id} item={item} onCheck={onCheck} onDelete={onDelete} accentColor={accentColor} />
                 ))}
               </View>
             )}
@@ -2839,7 +3428,7 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
 interface InputBarProps {
   onAddMany: (items: { text: string; tier: Tier; reminder?: Reminder }[]) => void;
   onAddManyToList: (listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => void;
-  onAddGroceryItems: (items: { name: string; category: string }[]) => void;
+  onAddGroceryItems: (items: { name: string; category: string }[]) => void | Promise<void>;
   hasApiKey: boolean;
   accentColor: string;
   defaultTier: Tier;
@@ -2858,6 +3447,11 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
   const [aiLoading, setAiLoading] = useState(false);
   const [listening, setListening] = useState(false);
   const spinAnim = useRef(new Animated.Value(0)).current;
+  const addGroceryItemsSafely = useCallback((items: { name: string; category: string }[]) => {
+    Promise.resolve(onAddGroceryItems(items)).catch((e) => {
+      showToast('Could not add groceries', e?.message || 'Check connection');
+    });
+  }, [onAddGroceryItems, showToast]);
 
   useEffect(() => {
     if (aiLoading) {
@@ -3001,7 +3595,7 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
 
     // Grocery mode + no AI: add item directly, no triage modal
     if (groceryMode && !(aiMode && hasApiKey)) {
-      onAddGroceryItems([{ name: raw, category: GROCERY_UNCATEGORIZED }]);
+      addGroceryItemsSafely([{ name: raw, category: GROCERY_UNCATEGORIZED }]);
       setValue('');
       Keyboard.dismiss();
       return;
@@ -3043,7 +3637,7 @@ Format: [{"name":"eggs","category":"Dairy"},{"name":"bread","category":"Bakery"}
               category: validCats.has(item.category) ? item.category : GROCERY_UNCATEGORIZED,
             }))
             .filter((item: any) => item.name);
-          onAddGroceryItems(grocItems);
+          addGroceryItemsSafely(grocItems);
           showToast(`${grocItems.length} item${grocItems.length !== 1 ? 's' : ''} added`);
         } else {
           // Task view + AI: route tasks to named lists, grocery items to grocery list (paid only)
@@ -3150,7 +3744,7 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
             }
           }
           if (grocItems.length > 0) {
-            onAddGroceryItems(grocItems);
+            addGroceryItemsSafely(grocItems);
             if (totalTasks === 0) showToast(`${grocItems.length} grocery item${grocItems.length !== 1 ? 's' : ''} added`);
           }
           if (totalTasks === 0 && grocItems.length === 0) {
@@ -3160,7 +3754,7 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
       } catch {
         showToast('AI failed — check your API key');
         if (groceryMode) {
-          onAddGroceryItems([{ name: raw, category: GROCERY_UNCATEGORIZED }]);
+          addGroceryItemsSafely([{ name: raw, category: GROCERY_UNCATEGORIZED }]);
         } else {
           onAddMany([{ text: raw, tier: defaultTier }]);
         }
@@ -3248,6 +3842,7 @@ interface ConfirmOpts {
 
 function ConfirmDialog({ opts, onClose, accentColor }: { opts: ConfirmOpts; onClose: () => void; accentColor: string }) {
   const T = useT();
+  const insets = useSafeAreaInsets();
   const slideAnim = useRef(new Animated.Value(400)).current;
   const { dragY, panHandlers } = useSwipeToDismiss(() => { opts.onCancel?.(); onClose(); });
 
@@ -3259,32 +3854,35 @@ function ConfirmDialog({ opts, onClose, accentColor }: { opts: ConfirmOpts; onCl
   const confirm = () => { opts.onConfirm(); onClose(); };
 
   return (
-    <Modal transparent visible animationType="none" onRequestClose={cancel}>
-      <TouchableWithoutFeedback onPress={cancel}>
-        <View style={styles.backdrop} />
-      </TouchableWithoutFeedback>
-      <Animated.View style={[styles.sheetPanel, { backgroundColor: T.s1, borderColor: T.border, transform: [{ translateY: Animated.add(slideAnim, dragY) }] }]}>
-        <View style={styles.sheetHandle} {...panHandlers}>
-          <View style={[styles.sheetHandleBar, { backgroundColor: T.s3 }]} />
-        </View>
-        <View style={styles.sheetContent}>
-          <Text style={[styles.confirmTitle, { color: T.text, fontFamily: jks('700') }]}>{opts.title}</Text>
-          {opts.message ? (
-            <Text style={[styles.confirmMessage, { color: T.textSub, fontFamily: jks('400') }]}>{opts.message}</Text>
-          ) : null}
-          <View style={styles.sheetActions}>
-            <TouchableOpacity onPress={cancel} style={[styles.sheetCancelBtn, { backgroundColor: T.s2, borderColor: T.border }]}>
-              <Text style={[styles.sheetCancelLabel, { color: T.textSub, fontFamily: jks('600') }]}>{opts.cancelLabel ?? 'Cancel'}</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              onPress={confirm}
-              style={[styles.sheetSaveBtn, { backgroundColor: opts.destructive ? '#FF5040' : accentColor }]}>
-              <Text style={[styles.sheetSaveLabel, { fontFamily: jks('700') }]}>{opts.confirmLabel ?? 'Confirm'}</Text>
-            </TouchableOpacity>
+    <RootPortal onBack={cancel}>
+      <View style={styles.portalRoot}>
+        <TouchableWithoutFeedback onPress={cancel}>
+          <View style={styles.backdrop} />
+        </TouchableWithoutFeedback>
+        <Animated.View
+          style={[styles.sheetPanel, { bottom: insets.bottom, backgroundColor: T.s1, borderColor: T.border, transform: [{ translateY: Animated.add(slideAnim, dragY) }] }]}>
+          <View style={styles.sheetHandle} {...panHandlers}>
+            <View style={[styles.sheetHandleBar, { backgroundColor: T.s3 }]} />
           </View>
-        </View>
-      </Animated.View>
-    </Modal>
+          <View style={styles.sheetContent}>
+            <Text style={[styles.confirmTitle, { color: T.text, fontFamily: jks('700') }]}>{opts.title}</Text>
+            {opts.message ? (
+              <Text style={[styles.confirmMessage, { color: T.textSub, fontFamily: jks('400') }]}>{opts.message}</Text>
+            ) : null}
+            <View style={styles.sheetActions}>
+              <TouchableOpacity onPress={cancel} style={[styles.sheetCancelBtn, { backgroundColor: T.s2, borderColor: T.border }]}>
+                <Text numberOfLines={2} adjustsFontSizeToFit minimumFontScale={0.78} style={[styles.sheetCancelLabel, { color: T.textSub, fontFamily: jks('600') }]}>{opts.cancelLabel ?? 'Cancel'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={confirm}
+                style={[styles.sheetSaveBtn, { backgroundColor: opts.destructive ? '#FF5040' : accentColor }]}>
+                <Text numberOfLines={2} adjustsFontSizeToFit minimumFontScale={0.72} style={[styles.sheetSaveLabel, { fontFamily: jks('700'), textAlign: 'center' }]}>{opts.confirmLabel ?? 'Confirm'}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Animated.View>
+      </View>
+    </RootPortal>
   );
 }
 
@@ -3592,6 +4190,7 @@ interface ListActionSheetProps {
     onRotateCode: () => Promise<void>;
     onLeave: () => Promise<void>;     // member-only path
     onDelete: () => Promise<void>;    // owner-only path
+    onMakePrivate?: (pendingName?: string) => void; // owner-only path
   };
   // Step 10: 'Share this list' action, only present for non-shared private
   // lists. Triggers promote-to-shared. Caller handles confirm dialog.
@@ -3604,11 +4203,13 @@ interface ListActionSheetProps {
 function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAskDelete, onClose, sharedMode, onShareList }: ListActionSheetProps) {
   const T = useT();
   const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
   // Uncontrolled — see EditSheet for the IME-vs-controlled-value rationale.
   const nameRef = useRef(list.name);
   const nameInputRef = useRef<TextInput | null>(null);
   const slide = useRef(new Animated.Value(0)).current;
-  const [kbHeight, setKbHeight] = useState(0);
+  const [keyboard, setKeyboard] = useState<KeyboardSheetState>(() => getKeyboardMetrics());
+  const [inputFocused, setInputFocused] = useState(false);
   const { dragY, panHandlers } = useSwipeToDismiss(onClose);
 
   // Focus is driven by the effect below (after slide completes) — see EditSheet
@@ -3619,14 +4220,17 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
 
   useEffect(() => {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    let kbAppeared = false;
+    let kbAppeared = getKeyboardMetrics().height > 0;
 
     const showSub = Keyboard.addListener('keyboardDidShow', e => {
       kbAppeared = true;
-      setKbHeight(e.endCoordinates.height);
+      setKeyboard(keyboardStateFromEvent(e));
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
     });
-    const hideSub = Keyboard.addListener('keyboardDidHide', () => setKbHeight(0));
+    const hideSub = Keyboard.addListener('keyboardDidHide', () => {
+      setKeyboard({ height: 0, screenY: null });
+      setInputFocused(false);
+    });
 
     Animated.timing(slide, { toValue: 1, duration: 180, useNativeDriver: true }).start(() => {
       const node = nameInputRef.current;
@@ -3652,6 +4256,8 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
     };
   }, [slide]);
 
+  const sheetFrame = getKeyboardSheetFrame(keyboard, insets.top, insets.bottom, windowHeight, inputFocused);
+
   const save = () => {
     Keyboard.dismiss();
     const trimmed = nameRef.current.trim();
@@ -3667,34 +4273,39 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
           <View style={styles.backdrop} />
         </TouchableWithoutFeedback>
         <Animated.View
-          onStartShouldSetResponder={() => true}
-          style={[styles.sheetPanel, styles.sheetCompact, { bottom: kbHeight > 0 ? kbHeight : insets.bottom, backgroundColor: T.s1, borderColor: T.border, transform: [{ translateY: Animated.add(slide.interpolate({ inputRange: [0, 1], outputRange: [400, 0] }), dragY) }] }]}>
+          style={[styles.sheetPanel, styles.sheetCompact, { bottom: sheetFrame.bottom, maxHeight: sheetFrame.maxHeight, backgroundColor: T.s1, borderColor: T.border, transform: [{ translateY: Animated.add(slide.interpolate({ inputRange: [0, 1], outputRange: [400, 0] }), dragY) }] }]}>
           <View style={styles.sheetHandle} {...panHandlers}>
             <View style={[styles.sheetHandleBar, { backgroundColor: T.s3 }]} />
           </View>
-          <Text style={[styles.sheetTitle, { color: T.text, fontFamily: jks('700') }]}>List Settings</Text>
+          <ScrollView
+            style={styles.sheetScroll}
+            keyboardShouldPersistTaps="always"
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={styles.sheetCompactContent}>
+            <Text style={[styles.sheetTitle, { color: T.text, fontFamily: jks('700') }]}>List Settings</Text>
 
-          <Text style={[styles.sheetSectionLabel, { color: T.textSub, fontFamily: jks('600') }]}>Name</Text>
-          <View style={[styles.listRenameRow, { backgroundColor: T.s2, borderColor: `${accentColor}55` }]}>
-            <TextInput
-              ref={setNameInputRef}
-              defaultValue={list.name}
-              onChangeText={(t) => { nameRef.current = t; }}
-              maxLength={40}
-              onSubmitEditing={save}
-              returnKeyType="done"
-              selectTextOnFocus={false}
-              autoCorrect={false}
-              autoComplete="off"
-              spellCheck={false}
-              importantForAutofill="no"
-              style={[styles.listRenameInput, { color: T.text, fontFamily: jks('500') }]}
-              placeholderTextColor={T.textMute}
-            />
-          </View>
+            <Text style={[styles.sheetSectionLabel, { color: T.textSub, fontFamily: jks('600') }]}>Name</Text>
+            <View style={[styles.listRenameRow, { backgroundColor: T.s2, borderColor: `${accentColor}55` }]}>
+              <TextInput
+                ref={setNameInputRef}
+                defaultValue={list.name}
+                onChangeText={(t) => { nameRef.current = t; }}
+                onFocus={() => setInputFocused(true)}
+                maxLength={40}
+                onSubmitEditing={save}
+                returnKeyType="done"
+                selectTextOnFocus={false}
+                autoCorrect={false}
+                autoComplete="off"
+                spellCheck={false}
+                importantForAutofill="no"
+                style={[styles.listRenameInput, { color: T.text, fontFamily: jks('500') }]}
+                placeholderTextColor={T.textMute}
+              />
+            </View>
 
-          {sharedMode ? (
-            <>
+            {sharedMode ? (
+              <>
               <Text style={[styles.sheetSectionLabel, { color: T.textSub, fontFamily: jks('600'), marginTop: 14 }]}>Share code</Text>
               <View style={[styles.listRenameRow, { backgroundColor: T.s2, borderColor: T.border, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14 }]}>
                 <Text selectable style={{ color: T.text, fontFamily: jks('700'), fontSize: 18, letterSpacing: 3 }}>
@@ -3712,6 +4323,19 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
                 {sharedMode.memberCount} member{sharedMode.memberCount === 1 ? '' : 's'}{sharedMode.isOwner ? ' • You’re the owner' : ''}
               </Text>
               {sharedMode.isOwner ? (
+                <>
+                {sharedMode.onMakePrivate ? (
+                  <TouchableOpacity
+                    onPress={() => {
+                      const trimmed = nameRef.current.trim();
+                      const pending = trimmed && trimmed !== list.name ? trimmed : undefined;
+                      sharedMode.onMakePrivate?.(pending);
+                    }}
+                    style={[styles.listSheetActionBtn, { backgroundColor: `${accentColor}18`, borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
+                    <Icon name="home" size={14} color={accentColor} />
+                    <Text style={[styles.listSheetActionLabel, { color: accentColor, fontFamily: jks('700') }]}>Make Private</Text>
+                  </TouchableOpacity>
+                ) : null}
                 <View style={styles.listSheetActionsRow}>
                   <TouchableOpacity
                     onPress={() => sharedMode.onDelete().catch(() => {})}
@@ -3722,6 +4346,7 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
                     <Text style={[styles.listSheetActionLabel, { color: '#fff', fontFamily: jks('700') }]}>Save</Text>
                   </TouchableOpacity>
                 </View>
+                </>
               ) : (
                 <TouchableOpacity
                   onPress={() => sharedMode.onLeave().catch(() => {})}
@@ -3729,9 +4354,9 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
                   <Text style={[styles.listSheetActionLabel, { color: T.high, fontFamily: jks('700') }]}>Leave List</Text>
                 </TouchableOpacity>
               )}
-            </>
-          ) : (
-            <>
+              </>
+            ) : (
+              <>
               {onShareList ? (
                 <TouchableOpacity
                   onPress={() => {
@@ -3768,8 +4393,9 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
                   {isPaid ? 'You always have at least one list.' : 'Triority Pro unlocks unlimited lists.'}
                 </Text>
               )}
-            </>
-          )}
+              </>
+            )}
+          </ScrollView>
         </Animated.View>
       </View>
     </RootPortal>
@@ -3782,6 +4408,105 @@ interface JoinSharedListSheetProps {
   onSubmit: (rawCode: string) => Promise<void>;   // resolves on success, throws on failure
 }
 
+interface GroceryShareSheetProps {
+  accentColor: string;
+  shareCode: string;
+  memberCount: number;
+  isOwner: boolean;
+  onClose: () => void;
+  onRotateCode: () => Promise<void>;
+  onMakePrivate?: () => void;
+  onLeave: () => void;
+  onDelete: () => void;
+}
+
+function GroceryShareSheet({ accentColor, shareCode, memberCount, isOwner, onClose, onRotateCode, onMakePrivate, onLeave, onDelete }: GroceryShareSheetProps) {
+  const T = useT();
+  const insets = useSafeAreaInsets();
+  const slide = useRef(new Animated.Value(0)).current;
+  const { dragY, panHandlers } = useSwipeToDismiss(onClose);
+
+  useEffect(() => {
+    Animated.timing(slide, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+  }, [slide]);
+
+  return (
+    <RootPortal onBack={onClose}>
+      <View style={styles.portalRoot}>
+        <TouchableWithoutFeedback onPress={onClose}>
+          <View style={styles.backdrop} />
+        </TouchableWithoutFeedback>
+        <Animated.View
+          style={[
+            styles.sheetPanel,
+            styles.sheetCompact,
+            {
+              bottom: insets.bottom,
+              backgroundColor: T.s1,
+              borderColor: T.border,
+              transform: [{ translateY: Animated.add(slide.interpolate({ inputRange: [0, 1], outputRange: [400, 0] }), dragY) }],
+            },
+          ]}>
+          <View style={styles.sheetHandle} {...panHandlers}>
+            <View style={[styles.sheetHandleBar, { backgroundColor: T.s3 }]} />
+          </View>
+          <View style={styles.sheetCompactContent}>
+            <View style={[styles.upsellBadge, { backgroundColor: `${accentColor}20`, borderColor: `${accentColor}55`, alignSelf: 'flex-start' }]}>
+              <Icon name="users" size={12} color={accentColor} />
+              <Text style={[styles.upsellBadgeLabel, { color: accentColor, fontFamily: jks('700') }]}>Shared Groceries</Text>
+            </View>
+            <Text style={[styles.sheetTitle, { color: T.text, fontFamily: jks('700'), marginTop: 14 }]}>Share code</Text>
+            <View style={[styles.listRenameRow, { backgroundColor: T.s2, borderColor: T.border, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14 }]}>
+              <Text selectable style={{ color: T.text, fontFamily: jks('700'), fontSize: 18, letterSpacing: 3 }}>
+                {shareCode}
+              </Text>
+              {isOwner ? (
+                <TouchableOpacity
+                  onPress={() => onRotateCode().catch(() => {})}
+                  style={{ paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, borderWidth: 1, borderColor: T.borderMid, backgroundColor: T.s3 }}>
+                  <Text style={{ color: T.textSub, fontFamily: jks('600'), fontSize: 12 }}>Rotate</Text>
+                </TouchableOpacity>
+              ) : null}
+            </View>
+            <Text style={{ color: T.textMute, fontSize: 12, fontFamily: jks('400'), marginTop: 8 }}>
+              {memberCount} member{memberCount === 1 ? '' : 's'}{isOwner ? ' - You are the owner' : ''}
+            </Text>
+            {isOwner ? (
+              <>
+                {onMakePrivate ? (
+                  <TouchableOpacity
+                    onPress={onMakePrivate}
+                    style={[styles.listSheetActionBtn, { backgroundColor: `${accentColor}18`, borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
+                    <Icon name="home" size={14} color={accentColor} />
+                    <Text
+                      numberOfLines={2}
+                      adjustsFontSizeToFit
+                      minimumFontScale={0.78}
+                      style={[styles.listSheetActionLabel, { color: accentColor, fontFamily: jks('700'), textAlign: 'center', flexShrink: 1 }]}>
+                      Move items to personal list and delete
+                    </Text>
+                  </TouchableOpacity>
+                ) : null}
+                <TouchableOpacity
+                  onPress={onDelete}
+                  style={[styles.listSheetActionBtn, { backgroundColor: 'transparent', borderColor: `${T.high}80`, alignSelf: 'stretch', marginTop: 10 }]}>
+                  <Text style={[styles.listSheetActionLabel, { color: T.high, fontFamily: jks('700') }]}>Delete</Text>
+                </TouchableOpacity>
+              </>
+            ) : (
+              <TouchableOpacity
+                onPress={onLeave}
+                style={[styles.listSheetActionBtn, { backgroundColor: 'transparent', borderColor: `${T.high}80`, alignSelf: 'stretch', marginTop: 16 }]}>
+                <Text style={[styles.listSheetActionLabel, { color: T.high, fontFamily: jks('700') }]}>Leave Shared Groceries</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </Animated.View>
+      </View>
+    </RootPortal>
+  );
+}
+
 // Step 8 UI: small modal sheet with one TextInput for the share code. Posture
 // matches ListActionSheet (uncontrolled value, focus-after-slide, IME race
 // fallback). Validation + caps are enforced by the caller via onSubmit
@@ -3789,10 +4514,12 @@ interface JoinSharedListSheetProps {
 function JoinSharedListSheet({ accentColor, onClose, onSubmit }: JoinSharedListSheetProps) {
   const T = useT();
   const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
   const codeRef = useRef('');
   const inputRef = useRef<TextInput | null>(null);
   const slide = useRef(new Animated.Value(0)).current;
-  const [kbHeight, setKbHeight] = useState(0);
+  const [keyboard, setKeyboard] = useState<KeyboardSheetState>(() => getKeyboardMetrics());
+  const [inputFocused, setInputFocused] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const { dragY, panHandlers } = useSwipeToDismiss(onClose);
@@ -3803,13 +4530,16 @@ function JoinSharedListSheet({ accentColor, onClose, onSubmit }: JoinSharedListS
 
   useEffect(() => {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    let kbAppeared = false;
+    let kbAppeared = getKeyboardMetrics().height > 0;
     const showSub = Keyboard.addListener('keyboardDidShow', e => {
       kbAppeared = true;
-      setKbHeight(e.endCoordinates.height);
+      setKeyboard(keyboardStateFromEvent(e));
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
     });
-    const hideSub = Keyboard.addListener('keyboardDidHide', () => setKbHeight(0));
+    const hideSub = Keyboard.addListener('keyboardDidHide', () => {
+      setKeyboard({ height: 0, screenY: null });
+      setInputFocused(false);
+    });
     Animated.timing(slide, { toValue: 1, duration: 180, useNativeDriver: true }).start(() => {
       const node = inputRef.current;
       if (!node) return;
@@ -3844,6 +4574,8 @@ function JoinSharedListSheet({ accentColor, onClose, onSubmit }: JoinSharedListS
   };
   const cancel = () => { Keyboard.dismiss(); onClose(); };
 
+  const sheetFrame = getKeyboardSheetFrame(keyboard, insets.top, insets.bottom, windowHeight, inputFocused);
+
   return (
     <RootPortal onBack={cancel}>
       <View style={styles.portalRoot}>
@@ -3852,10 +4584,15 @@ function JoinSharedListSheet({ accentColor, onClose, onSubmit }: JoinSharedListS
         </TouchableWithoutFeedback>
         <Animated.View
           onStartShouldSetResponder={() => true}
-          style={[styles.sheetPanel, styles.sheetCompact, { bottom: kbHeight > 0 ? kbHeight : insets.bottom, backgroundColor: T.s1, borderColor: T.border, transform: [{ translateY: Animated.add(slide.interpolate({ inputRange: [0, 1], outputRange: [400, 0] }), dragY) }] }]}>
+          style={[styles.sheetPanel, styles.sheetCompact, { bottom: sheetFrame.bottom, maxHeight: sheetFrame.maxHeight, backgroundColor: T.s1, borderColor: T.border, transform: [{ translateY: Animated.add(slide.interpolate({ inputRange: [0, 1], outputRange: [400, 0] }), dragY) }] }]}>
           <View style={styles.sheetHandle} {...panHandlers}>
             <View style={[styles.sheetHandleBar, { backgroundColor: T.s3 }]} />
           </View>
+          <ScrollView
+            style={styles.sheetScroll}
+            keyboardShouldPersistTaps="always"
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={styles.sheetCompactContent}>
           <Text style={[styles.sheetTitle, { color: T.text, fontFamily: jks('700') }]}>Join Shared List</Text>
           <Text style={[styles.sheetSectionLabel, { color: T.textSub, fontFamily: jks('600') }]}>Share code</Text>
           <View style={[styles.listRenameRow, { backgroundColor: T.s2, borderColor: `${accentColor}55` }]}>
@@ -3863,6 +4600,7 @@ function JoinSharedListSheet({ accentColor, onClose, onSubmit }: JoinSharedListS
               ref={setInputRef}
               defaultValue=""
               onChangeText={(t) => { codeRef.current = t; }}
+              onFocus={() => setInputFocused(true)}
               maxLength={12}
               onSubmitEditing={submit}
               returnKeyType="done"
@@ -3884,6 +4622,7 @@ function JoinSharedListSheet({ accentColor, onClose, onSubmit }: JoinSharedListS
           <TouchableOpacity onPress={submit} disabled={busy} style={[styles.listSheetActionBtn, { backgroundColor: accentColor, borderColor: accentColor, alignSelf: 'stretch', marginTop: 14, opacity: busy ? 0.6 : 1 }]}>
             <Text style={[styles.listSheetActionLabel, { color: '#fff', fontFamily: jks('700') }]}>{busy ? 'Joining…' : 'Join'}</Text>
           </TouchableOpacity>
+          </ScrollView>
         </Animated.View>
       </View>
     </RootPortal>
@@ -4065,6 +4804,7 @@ interface ActiveListProps {
     addItems: (items: { text: string; tier: Tier }[]) => Promise<void>;
     editItem: (itemId: TaskId, patch: { text?: string; tier?: Tier }) => Promise<void>;
     deleteItem: (itemId: TaskId) => Promise<void>;
+    archiveItem: (itemId: TaskId, item: { text: string; tier: Tier; createdAt?: number }) => Promise<void>;
     // Restore: shared items are deleted from the subcollection and a local
     // ArchivedTask is recorded so the user still sees it in the archive view.
   };
@@ -4131,11 +4871,8 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
       // Find the task in the rendered list (which is shared-items-mapped).
       const t = tasks.find(x => x.id === id);
       if (!t) return;
-      // Archive locally so the user keeps a record in their own archive view.
-      // Other members of the shared list won't see this archive entry — that
-      // matches the "completion is per-user" intent. Then drop the item.
-      setArchive(a => [{ id: t.id, text: t.text, tier: t.tier, completedAt: Date.now(), listId: activeListId }, ...a]);
-      sharedActions.deleteItem(id).catch(() => showToast('Could not complete', 'Check connection'));
+      sharedActions.archiveItem(id, { text: t.text, tier: t.tier, createdAt: t.createdAt })
+        .catch(() => showToast('Could not complete', 'Check connection'));
       return;
     }
     setTasks(ts => {
@@ -4437,6 +5174,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
               // Private-only path. Shared deletes go through sharedMode.onDelete.
               const target = actionList;
               if (!target) return;
+              Keyboard.dismiss();
               setActionList(null);
               confirm({
                 title: 'Delete List',
@@ -4455,22 +5193,22 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
               const baseTarget = actionList;
               if (!baseTarget) return;
               const target = pendingName ? { ...baseTarget, name: pendingName } : baseTarget;
+              Keyboard.dismiss();
               setActionList(null);
               setTimeout(() => {
                 confirm({
-                  title: 'Share This List',
-                  message: `Turn "${target.name}" into a shared list? You'll get a 6-character code to share with friends or family. Either of you can leave or delete it anytime.`,
+                  title: 'Share List',
+                  message: `Share "${target.name}" with a code? This moves it out of your private lists and makes it available to anyone you give the code to.`,
                   confirmLabel: 'Share',
                   destructive: false,
                   onConfirm: () => {
+                    showToast('Sharing list...', 'Creating share code', true);
                     promoteTaskListToShared(target)
                       .then((newId) => {
-                        // Once promoted, the original private list is no longer
-                        // the source of truth — drop it locally and switch
-                        // active to the new shared list.
                         deleteList(target.id);
                         setActiveListId(newId);
-                        showToast('Shared list created', 'Tap pencil to see the share code');
+                        setActionList({ ...target, id: newId, updatedAt: Date.now() });
+                        showToast('Shared list created');
                       })
                       .catch((e) => showToast('Could not share', e?.message || 'Check connection'));
                   },
@@ -4490,18 +5228,24 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
                 }
               },
               onLeave: async () => {
+                const targetId = actionList.id;
+                const targetName = liveList.name;
+                Keyboard.dismiss();
                 setActionList(null);
-                confirm({
-                  title: 'Leave Shared List',
-                  message: `Leave "${liveList.name}"? You'll lose access to its items.`,
-                  confirmLabel: 'Leave',
-                  destructive: true,
-                  onConfirm: () => {
-                    leaveSharedList(actionList.id)
-                      .then(() => showToast('Left shared list'))
-                      .catch((e) => showToast('Could not leave', e?.message || 'Check connection'));
-                  },
-                });
+                setTimeout(() => {
+                  confirm({
+                    title: 'Leave Shared List',
+                    message: `Leave "${targetName}"? You'll lose access to its items.`,
+                    confirmLabel: 'Leave',
+                    destructive: true,
+                    onConfirm: () => {
+                      showToast('Leaving shared list...', 'Updating access', true);
+                      withTimeout(leaveSharedList(targetId), 15000, 'Leave timed out. Check connection and try again.')
+                        .then(() => showToast('Left shared list'))
+                        .catch((e) => showToast('Could not leave', e?.message || 'Check connection'));
+                    },
+                  });
+                }, 0);
               },
               onDelete: async () => {
                 // Snapshot the ID + name BEFORE setActionList(null). Reading
@@ -4512,6 +5256,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
                 // we'll delete the wrong one. Snapshot freezes the right id.
                 const targetId = actionList.id;
                 const targetName = liveList.name;
+                Keyboard.dismiss();
                 setActionList(null);
                 setTimeout(() => {
                   confirm({
@@ -4520,9 +5265,43 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
                     confirmLabel: 'Delete',
                     destructive: true,
                     onConfirm: () => {
-                      deleteSharedList(targetId)
+                      showToast('Deleting shared list...', 'Removing it for everyone', true);
+                      withTimeout(deleteSharedList(targetId), 15000, 'Delete timed out. Check connection and try again.')
                         .then(() => showToast('Shared list deleted'))
                         .catch((e) => showToast('Could not delete', e?.message || 'Check connection'));
+                    },
+                  });
+                }, 0);
+              },
+              onMakePrivate: (pendingName?: string) => {
+                const targetId = actionList.id;
+                const targetName = (pendingName || liveList.name).trim() || liveList.name;
+                const now = Date.now();
+                const privateTasks = liveList.tasks.map((task, index): Task => ({
+                  id: `private_${now}_${index}`,
+                  text: task.text,
+                  tier: task.tier,
+                  createdAt: task.createdAt || now + index,
+                  reminder: task.reminder,
+                }));
+                Keyboard.dismiss();
+                setActionList(null);
+                setTimeout(() => {
+                  confirm({
+                    title: 'Make List Private',
+                    message: `Make "${targetName}" private again? Shared members will lose access, and your copy will stay on this device.`,
+                    confirmLabel: 'Make Private',
+                    destructive: false,
+                    onConfirm: () => {
+                      showToast('Making list private...', 'Copying your items', true);
+                      withTimeout(deleteSharedList(targetId), 15000, 'Make private timed out. Check connection and try again.')
+                        .then(() => {
+                          const privateId = addList(targetName);
+                          setListTasks(privateId, () => privateTasks);
+                          setActiveListId(privateId);
+                          showToast('List is private again');
+                        })
+                        .catch((e) => showToast('Could not make private', e?.message || 'Check connection'));
                     },
                   });
                 }, 0);
@@ -4733,6 +5512,7 @@ interface ArchiveProps {
   lists: TaskList[];
   activeListId: string;
   setListTasks: (listId: string, fn: (prev: Task[]) => Task[]) => void;
+  onDeleteSharedArchiveItem?: (listId: string, archiveId: string) => Promise<void>;
 }
 
 const ARCHIVE_ALL_FILTER = '__all__';
@@ -4747,7 +5527,7 @@ function weekLabel(weekStart: number): string {
   return `${fmt(new Date(weekStart))} – ${fmt(end)}`;
 }
 
-function Archive({ archive, setArchive, accentColor, lists, activeListId, setListTasks }: ArchiveProps) {
+function Archive({ archive, setArchive, accentColor, lists, activeListId, setListTasks, onDeleteSharedArchiveItem }: ArchiveProps) {
   const T = useT();
   const TIERS = TIERS_DEF(T);
   const insets = useSafeAreaInsets();
@@ -4757,6 +5537,7 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
   const [calOpen, setCalOpen] = useState(false);
   const [listFilter, setListFilter] = useState<string>(activeListId);
   const [confirmNode, confirm] = useConfirm(accentColor);
+  const privateArchiveCount = useMemo(() => archive.filter(item => !item.sharedListId).length, [archive]);
 
   const thisWeekStart = startOfWeekMonday(Date.now());
   const lastWeekStart = thisWeekStart - ONE_WEEK_MS;
@@ -4768,13 +5549,26 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
 
   const handleRestore = useCallback((id: TaskId) => {
     const item = archive.find(a => a.id === id);
-    if (!item) return;
+    if (!item || item.sharedListId) return;
     const targetListId = (item.listId && lists.some(l => l.id === item.listId)) ? item.listId : activeListId;
     const restored: Task = { id: Date.now(), text: item.text, tier: item.tier, createdAt: Date.now(), reminder: item.reminder };
     setListTasks(targetListId, ts => [restored, ...ts]);
     setArchive(a => a.filter(a => a.id !== id));
     if (restored.reminder) scheduleRemindersBatch([restored], () => {});
   }, [archive, lists, activeListId, setListTasks, setArchive]);
+
+  const handleDeleteShared = useCallback((item: ArchivedTask) => {
+    if (!item.sharedListId || !onDeleteSharedArchiveItem) return;
+    confirm({
+      title: 'Delete Archived Task',
+      message: `Delete "${item.text}" from the shared archive?`,
+      confirmLabel: 'Delete',
+      destructive: true,
+      onConfirm: () => {
+        onDeleteSharedArchiveItem(item.sharedListId!, String(item.id)).catch(() => {});
+      },
+    });
+  }, [confirm, onDeleteSharedArchiveItem]);
 
   const listScoped = useMemo(() => {
     if (listFilter === ARCHIVE_ALL_FILTER) return archive;
@@ -4869,7 +5663,7 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
             </View>
           </TouchableOpacity>
           {open && items.map(item => (
-            <ArchiveItem key={item.id} item={item} tiers={TIERS} accentColor={accentColor} onRestore={handleRestore} />
+            <ArchiveItem key={`${item.sharedListId || 'private'}_${item.id}`} item={item} tiers={TIERS} accentColor={accentColor} onRestore={handleRestore} onDeleteShared={handleDeleteShared} />
           ))}
         </View>
       );
@@ -4920,7 +5714,7 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
           {sortBtn('week', 'Week')}
           {sortBtn('range', rangeLabel)}
           <View style={{ flex: 1 }} />
-          {archive.length > 0 && (
+          {privateArchiveCount > 0 && (
             <TouchableOpacity
               onPress={() => confirm({
                 title: 'Clear All Archive',
@@ -4968,12 +5762,16 @@ interface ArchiveItemProps {
   tiers: { id: Tier; label: string; color: string; bg: string }[];
   accentColor: string;
   onRestore: (id: TaskId) => void;
+  onDeleteShared: (item: ArchivedTask) => void;
 }
 
-function ArchiveItem({ item, tiers, accentColor, onRestore }: ArchiveItemProps) {
+function ArchiveItem({ item, tiers, accentColor, onRestore, onDeleteShared }: ArchiveItemProps) {
   const T = useT();
   const tier = tiers.find(t => t.id === item.tier)!;
   const dayLabel = new Date(item.completedAt).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+  const metaLabel = item.sharedListName
+    ? `${dayLabel} - ${item.sharedListName}${item.archivedByInitial ? ` - ${item.archivedByInitial}` : ''}`
+    : dayLabel;
   return (
     <View style={[styles.archiveItem, { backgroundColor: T.s1, borderLeftColor: `${tier.color}40` }]}>
       <View style={[styles.archiveItemCheck, { backgroundColor: `${tier.color}20`, borderColor: `${tier.color}60` }]}>
@@ -4981,11 +5779,19 @@ function ArchiveItem({ item, tiers, accentColor, onRestore }: ArchiveItemProps) 
       </View>
       <View style={{ flex: 1 }}>
         <Text style={[styles.archiveItemText, { color: T.textSub, fontFamily: jks('400') }]}>{item.text}</Text>
-        <Text style={[styles.archiveItemDay, { color: T.textMute, fontFamily: jks('400') }]}>{dayLabel}</Text>
+        <Text style={[styles.archiveItemDay, { color: T.textMute, fontFamily: jks('400') }]}>{metaLabel}</Text>
       </View>
-      <TouchableOpacity onPress={() => onRestore(item.id)} style={styles.restoreBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-        <Icon name="restore" size={15} color={accentColor} />
-      </TouchableOpacity>
+      {item.sharedListId ? (
+        item.sharedCanDelete ? (
+          <TouchableOpacity onPress={() => onDeleteShared(item)} style={styles.restoreBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+            <Icon name="trash" size={15} color={accentColor} />
+          </TouchableOpacity>
+        ) : null
+      ) : (
+        <TouchableOpacity onPress={() => onRestore(item.id)} style={styles.restoreBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+          <Icon name="restore" size={15} color={accentColor} />
+        </TouchableOpacity>
+      )}
     </View>
   );
 }
@@ -5818,6 +6624,9 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
   const [editingCustomSlot, setEditingCustomSlot] = useState<number | null>(null);
   const [settingsToast, setSettingsToast] = useState<string | null>(null);
   const settingsToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const settingsScrollRef = useRef<ScrollView | null>(null);
+  const [settingsKbHeight, setSettingsKbHeight] = useState(0);
+  const [contextFocused, setContextFocused] = useState(false);
   const showSettingsToast = (msg: string) => {
     if (settingsToastTimer.current) clearTimeout(settingsToastTimer.current);
     setSettingsToast(msg);
@@ -5830,6 +6639,23 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
       clearSyncError();
     }
   }, [syncError]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const showSub = Keyboard.addListener('keyboardDidShow', (e) => {
+      setSettingsKbHeight(e.endCoordinates.height);
+      if (contextFocused) {
+        setTimeout(() => settingsScrollRef.current?.scrollToEnd({ animated: true }), 80);
+      }
+    });
+    const hideSub = Keyboard.addListener('keyboardDidHide', () => {
+      setSettingsKbHeight(0);
+      setContextFocused(false);
+    });
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, [contextFocused]);
 
   const AUTO_CLEAR_OPTIONS: AutoClear[] = ['Never', '7 days', '30 days', '90 days'];
   const keyIsValid = isValidKey(keyDraft);
@@ -5860,7 +6686,15 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
 
   return (
     <>
-    <ScrollView style={[styles.screen, { backgroundColor: T.bg }]} showsVerticalScrollIndicator={false}>
+    <ScrollView
+      ref={settingsScrollRef}
+      style={[styles.screen, { backgroundColor: T.bg }]}
+      contentContainerStyle={{ paddingBottom: contextFocused && settingsKbHeight > 0 ? settingsKbHeight + 120 : 0 }}
+      showsVerticalScrollIndicator={false}
+      keyboardShouldPersistTaps="handled"
+      onContentSizeChange={() => {
+        if (contextFocused) settingsScrollRef.current?.scrollToEnd({ animated: true });
+      }}>
       <View style={[styles.settingsHeader, { paddingTop: Math.max(18, 18 + insets.top) }]}>
         <Text style={[styles.screenHeading, { color: T.text, fontFamily: jks('800') }]}>Settings</Text>
         <View style={[styles.divider, { backgroundColor: T.border }]} />
@@ -6130,6 +6964,11 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
         <View style={styles.settingsCardInner}>
           <Text style={[styles.contextLabel, { color: T.textSub, fontFamily: jks('400') }]}>Personal Context</Text>
           <TextInput value={personalContext} onChangeText={setPersonalContext} multiline numberOfLines={4}
+            onFocus={() => {
+              setContextFocused(true);
+              setTimeout(() => settingsScrollRef.current?.scrollToEnd({ animated: true }), 120);
+            }}
+            onBlur={() => setContextFocused(false)}
             placeholder="Describe yourself, your work, and your priorities. Example: I run a small manufacturing business, manage a gaming guild, and have a daughter on shared custody. High priority means it affects work, income, or people depending on me."
             placeholderTextColor={T.textMute}
             style={[styles.contextInput, { backgroundColor: T.s2, color: T.text, borderColor: T.border, fontFamily: jks('400') }]} />
@@ -6159,7 +6998,11 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
         accentColor={accent}
         onClose={() => setShowJoinSheet(false)}
         onSubmit={async (rawCode) => {
-          const id = await joinSharedListByCode(rawCode);
+          const id = await withTimeout(
+            joinSharedListByCode(rawCode),
+            15000,
+            'Join timed out. Check connection and make sure the latest Firestore rules are published.',
+          );
           const joined = sharedLists[id];
           showSettingsToast(joined ? `Joined ${joined.name}` : 'Joined shared list');
         }}
@@ -6355,12 +7198,24 @@ function Onboarding({ onDone, accentColor }: { onDone: () => void; accentColor: 
 
 interface StandaloneGroceryProps {
   groceryItems: GroceryItem[];
-  onAddGroceryItems: (items: { name: string; category: string }[]) => void;
+  onAddGroceryItems: (items: { name: string; category: string }[]) => void | Promise<void>;
   onCheckGrocery: (id: string) => void;
   onDeleteGrocery: (id: string) => void;
   onClearCheckedGrocery: () => void;
   onClearAllGrocery: () => void;
   onAiSortGrocery: (onDone?: () => void) => void;
+  sharedGrocery?: {
+    isOwner: boolean;
+    shareCode: string;
+    memberCount: number;
+  };
+  viewingSharedGrocery: boolean;
+  onSetViewingSharedGrocery: (viewShared: boolean) => void;
+  onShareGrocery: () => Promise<void>;
+  onRotateGroceryShareCode: () => Promise<void>;
+  onMakePrivateSharedGrocery: () => Promise<void>;
+  onLeaveSharedGrocery: () => Promise<void>;
+  onDeleteSharedGrocery: () => Promise<void>;
   hasApiKey: boolean;
   accentColor: string;
   defaultTier: Tier;
@@ -6373,14 +7228,21 @@ interface StandaloneGroceryProps {
 function StandaloneGrocery({
   groceryItems, onAddGroceryItems, onCheckGrocery, onDeleteGrocery,
   onClearCheckedGrocery, onClearAllGrocery, onAiSortGrocery,
+  sharedGrocery, viewingSharedGrocery, onSetViewingSharedGrocery,
+  onShareGrocery, onRotateGroceryShareCode, onMakePrivateSharedGrocery, onLeaveSharedGrocery, onDeleteSharedGrocery,
   hasApiKey, accentColor, defaultTier, lists, activeListId,
   onAddMany, onAddManyToList,
 }: StandaloneGroceryProps) {
   const T = useT();
   const insets = useSafeAreaInsets();
+  const isPaid = useIsPaid();
+  const { user: syncUser } = useSync();
   const [grocerySortMode, setGrocerySortMode] = useState<'category' | 'alpha'>('category');
   const [toast, setToast] = useState<ToastData | null>(null);
+  const [showUpsell, setShowUpsell] = useState(false);
+  const [shareSheetOpen, setShareSheetOpen] = useState(false);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [confirmNode, confirm] = useConfirm(accentColor);
   // AI Sort busy flag — set true while a sort request is in-flight, prevents
   // double-firing on rapid taps and signals to the user via a sticky toast that
   // the AI is working.
@@ -6395,6 +7257,11 @@ function StandaloneGrocery({
     if (toastTimer.current) { clearTimeout(toastTimer.current); toastTimer.current = null; }
     setToast(null);
   }, []);
+  const handleAddGroceryItems = useCallback((items: { name: string; category: string }[]) => {
+    return Promise.resolve(onAddGroceryItems(items)).catch((e) => {
+      showToast('Could not add groceries', e?.message || 'Check connection');
+    });
+  }, [onAddGroceryItems, showToast]);
 
   const handleAiSort = useCallback(() => {
     if (aiSorting) return;
@@ -6407,6 +7274,36 @@ function StandaloneGrocery({
     });
   }, [aiSorting, showToast, onAiSortGrocery]);
 
+  const openShare = useCallback(() => {
+    if (!syncUser) {
+      showToast('Sign in to share', 'Open Settings and sign in with Google');
+      return;
+    }
+    if (!isPaid) {
+      setShowUpsell(true);
+      return;
+    }
+    if (sharedGrocery) {
+      setShareSheetOpen(true);
+      return;
+    }
+    confirm({
+      title: 'Share Groceries',
+      message: 'Share your grocery list with a code? Anyone you give the code to can see and update this grocery list.',
+      confirmLabel: 'Share',
+      destructive: false,
+      onConfirm: () => {
+        showToast('Sharing groceries...', 'Creating share code', true);
+        onShareGrocery()
+          .then(() => {
+            showToast('Shared groceries created', 'Tap the people button for the code');
+            setShareSheetOpen(true);
+          })
+          .catch((e) => showToast('Could not share', e?.message || 'Check connection'));
+      },
+    });
+  }, [confirm, isPaid, onShareGrocery, sharedGrocery, showToast, syncUser]);
+
   return (
     <KeyboardAvoidingView
       style={[styles.screen, { backgroundColor: T.bg }]}
@@ -6414,7 +7311,9 @@ function StandaloneGrocery({
       <View style={[styles.listHeader, { paddingTop: Math.max(18, 18 + insets.top) }]}>
         <View style={styles.listHeaderTop}>
           <View style={styles.listTitleRow}>
-            <Text style={[styles.listTitleText, { color: T.text, fontFamily: jks('700') }]} numberOfLines={1}>Groceries</Text>
+            <Text style={[styles.listTitleText, { color: T.text, fontFamily: jks('700') }]} numberOfLines={1}>
+              {viewingSharedGrocery ? 'Shared Groceries' : 'Groceries'}
+            </Text>
           </View>
           <View style={styles.listMetaRow}>
             <Text style={[styles.listSubHeading, { color: T.textMute, fontFamily: jks('400') }]}>
@@ -6425,12 +7324,69 @@ function StandaloneGrocery({
               </Text>
             </Text>
           </View>
+          <TouchableOpacity
+            activeOpacity={0.7}
+            onPress={openShare}
+            style={[styles.headerActionBtnTopRight, { backgroundColor: `${accentColor}14`, borderColor: `${accentColor}55` }]}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+            <Icon name="users" size={14} color={accentColor} strokeWidth={1.6} />
+          </TouchableOpacity>
         </View>
         <View style={[styles.divider, { backgroundColor: T.border, marginTop: 10 }]} />
+        {sharedGrocery && (
+          <View style={styles.groceryViewSwitchWrap}>
+            <View style={[styles.groceryViewSwitch, { backgroundColor: T.s2, borderColor: T.border }]}>
+              <TouchableOpacity
+                activeOpacity={0.75}
+                onPress={() => onSetViewingSharedGrocery(false)}
+                style={[
+                  styles.groceryViewSwitchBtn,
+                  {
+                    backgroundColor: !viewingSharedGrocery ? accentColor : 'transparent',
+                    borderColor: !viewingSharedGrocery ? `${accentColor}AA` : 'transparent',
+                  },
+                ]}>
+                <Icon name="home" size={12} color={!viewingSharedGrocery ? readableOn(accentColor) : T.textSub} strokeWidth={1.8} />
+                <Text
+                  style={[
+                    styles.groceryViewSwitchLabel,
+                    {
+                      color: !viewingSharedGrocery ? readableOn(accentColor) : T.textSub,
+                      fontFamily: jks(!viewingSharedGrocery ? '700' : '500'),
+                    },
+                  ]}>
+                  Personal
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                activeOpacity={0.75}
+                onPress={() => onSetViewingSharedGrocery(true)}
+                style={[
+                  styles.groceryViewSwitchBtn,
+                  {
+                    backgroundColor: viewingSharedGrocery ? accentColor : 'transparent',
+                    borderColor: viewingSharedGrocery ? `${accentColor}AA` : 'transparent',
+                  },
+                ]}>
+                <Icon name="users" size={12} color={viewingSharedGrocery ? readableOn(accentColor) : T.textSub} strokeWidth={1.8} />
+                <Text
+                  style={[
+                    styles.groceryViewSwitchLabel,
+                    {
+                      color: viewingSharedGrocery ? readableOn(accentColor) : T.textSub,
+                      fontFamily: jks(viewingSharedGrocery ? '700' : '500'),
+                    },
+                  ]}>
+                  Shared
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
       </View>
       <GroceryScreen
         items={groceryItems}
-        onAddItem={(name) => onAddGroceryItems([{ name, category: GROCERY_UNCATEGORIZED }])}
+        onAddItem={(name) => handleAddGroceryItems([{ name, category: GROCERY_UNCATEGORIZED }])}
         onCheck={onCheckGrocery}
         onDelete={onDeleteGrocery}
         onClearChecked={onClearCheckedGrocery}
@@ -6447,7 +7403,7 @@ function StandaloneGrocery({
       <InputBar
         onAddMany={onAddMany}
         onAddManyToList={onAddManyToList}
-        onAddGroceryItems={onAddGroceryItems}
+        onAddGroceryItems={handleAddGroceryItems}
         hasApiKey={hasApiKey}
         accentColor={accentColor}
         defaultTier={defaultTier}
@@ -6458,6 +7414,76 @@ function StandaloneGrocery({
         activeListId={activeListId}
       />
       {toast && <View style={styles.toastContainer} pointerEvents="none"><Toast message={toast.message} sub={toast.sub} /></View>}
+      {confirmNode}
+      {showUpsell && <ProUpsellSheet accentColor={accentColor} onClose={() => setShowUpsell(false)} showToast={showToast} />}
+      {shareSheetOpen && sharedGrocery && (
+        <GroceryShareSheet
+          accentColor={accentColor}
+          shareCode={sharedGrocery.shareCode}
+          memberCount={sharedGrocery.memberCount}
+          isOwner={sharedGrocery.isOwner}
+          onClose={() => setShareSheetOpen(false)}
+          onRotateCode={async () => {
+            try {
+              await onRotateGroceryShareCode();
+              showToast('Share code rotated', 'Old code no longer works');
+            } catch (e: any) {
+              showToast('Could not rotate', e?.message || 'Check connection');
+            }
+          }}
+          onMakePrivate={sharedGrocery.isOwner ? () => {
+            setShareSheetOpen(false);
+            setTimeout(() => {
+              confirm({
+                title: 'Move items to personal list and delete',
+                message: 'Copy the current shared groceries into your personal grocery list, then delete the shared list for everyone?',
+                confirmLabel: 'Move items to personal list and delete',
+                destructive: false,
+                onConfirm: () => {
+                  showToast('Making groceries private...', 'Copying shared items', true);
+                  withTimeout(onMakePrivateSharedGrocery(), 15000, 'Make private timed out. Check connection and try again.')
+                    .then(() => showToast('Personal grocery copy saved'))
+                    .catch((e) => showToast('Could not make private', e?.message || 'Check connection'));
+                },
+              });
+            }, 0);
+          } : undefined}
+          onLeave={() => {
+            setShareSheetOpen(false);
+            setTimeout(() => {
+              confirm({
+                title: 'Leave Shared Groceries',
+                message: 'Leave this shared grocery list? You will lose access to its items.',
+                confirmLabel: 'Leave',
+                destructive: true,
+                onConfirm: () => {
+                  showToast('Leaving shared groceries...', 'Updating access', true);
+                  withTimeout(onLeaveSharedGrocery(), 15000, 'Leave timed out. Check connection and try again.')
+                    .then(() => showToast('Left shared groceries'))
+                    .catch((e) => showToast('Could not leave', e?.message || 'Check connection'));
+                },
+              });
+            }, 0);
+          }}
+          onDelete={() => {
+            setShareSheetOpen(false);
+            setTimeout(() => {
+              confirm({
+                title: 'Delete Shared Groceries',
+                message: 'Delete this shared grocery list for everyone?',
+                confirmLabel: 'Delete',
+                destructive: true,
+                onConfirm: () => {
+                  showToast('Deleting shared groceries...', 'Removing them for everyone', true);
+                  withTimeout(onDeleteSharedGrocery(), 15000, 'Delete timed out. Check connection and try again.')
+                    .then(() => showToast('Shared groceries deleted'))
+                    .catch((e) => showToast('Could not delete', e?.message || 'Check connection'));
+                },
+              });
+            }, 0);
+          }}
+        />
+      )}
     </KeyboardAvoidingView>
   );
 }
@@ -6470,6 +7496,7 @@ function TriorityApp() {
   const [screen, setScreen] = useState<Screen>('list');
   const [lists, setListsState] = useState<TaskList[]>([{ id: DEFAULT_LIST_ID, name: DEFAULT_LIST_NAME, tasks: SAMPLE_TASKS, createdAt: Date.now(), updatedAt: Date.now() }]);
   const [sharedTaskOrder, setSharedTaskOrderState] = useState<string[]>([]);
+  const [listRowOrder, setListRowOrderState] = useState<string[]>([]);
   const [activeListId, setActiveListIdState] = useState<string>(DEFAULT_LIST_ID);
   const [archive, setArchiveState] = useState<ArchivedTask[]>(SAMPLE_ARCHIVE);
   const [accentLight, setAccentLightState] = useState<string | null>(null);
@@ -6484,10 +7511,15 @@ function TriorityApp() {
   const [darkMode, setDarkModeState] = useState(true);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [groceryItems, setGroceryItemsState] = useState<GroceryItem[]>([]);
+  const [viewingSharedGrocery, setViewingSharedGroceryState] = useState(false);
 
   const persistGrocery = (items: GroceryItem[]) => {
     AsyncStorage.setItem('tri_grocery', JSON.stringify(items)).catch(() => {});
   };
+  const setViewingSharedGrocery = useCallback((viewShared: boolean) => {
+    setViewingSharedGroceryState(viewShared);
+    AsyncStorage.setItem(SHARED_GROCERY_TOGGLE_KEY, viewShared ? '1' : '0').catch(() => {});
+  }, []);
 
   const addGroceryItems = useCallback((items: { name: string; category: string }[]) => {
     const now = Date.now();
@@ -6587,6 +7619,15 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
             setSharedTaskOrderState(parsedSharedOrder.filter((id) => typeof id === 'string'));
           }
         }
+        const rawListRowOrder = await AsyncStorage.getItem(LIST_ROW_ORDER_KEY);
+        if (rawListRowOrder) {
+          const parsedListRowOrder = JSON.parse(rawListRowOrder);
+          if (Array.isArray(parsedListRowOrder)) {
+            setListRowOrderState(parsedListRowOrder.filter((id) => typeof id === 'string'));
+          }
+        }
+        const rawSharedGroceryView = await AsyncStorage.getItem(SHARED_GROCERY_TOGGLE_KEY);
+        setViewingSharedGroceryState(rawSharedGroceryView === '1');
       } catch {}
       setShowOnboarding(!data.onboarded);
       setReady(true);
@@ -6606,6 +7647,16 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   // unread entries (readAt == null), Alert each one (simple stacking UI), and
   // batch-mark them read. Runs once per app launch per signed-in session — the
   // ref guard prevents re-firing if syncUser identity churns inside a session.
+  const updateCheckedRef = useRef(false);
+  useEffect(() => {
+    if (!ready || showOnboarding || updateCheckedRef.current) return;
+    updateCheckedRef.current = true;
+    const timer = setTimeout(() => {
+      checkForGithubUpdate();
+    }, 1200);
+    return () => clearTimeout(timer);
+  }, [ready, showOnboarding]);
+
   const notifsCheckedRef = useRef<string | null>(null);
   useEffect(() => {
     const uid = syncUser?.uid;
@@ -6692,6 +7743,11 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   // Single watcher: when signed in and ready, debounce-write the synced state
   // slice to Firestore on any change. On sign-in, restore-from-remote first if
   // remote is newer than local. Local AsyncStorage stays the offline truth.
+  const {
+    joinedIds: syncedJoinedIds,
+    setJoinedIds: restoreJoinedIds,
+  } = useSharedLists();
+
   const syncedSlice: SyncedState = useMemo(() => ({
     lists,
     activeListId,
@@ -6705,9 +7761,11 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     autoClear,
     darkMode,
     groceryItems,
+    joinedSharedLists: syncedJoinedIds,
+    syncEnabledForGrocery: viewingSharedGrocery,
   }), [lists, activeListId, archive, accentLight, accentDark, themeId,
        customThemeDrafts, personalContext, defaultTier, autoClear, darkMode,
-       groceryItems]);
+       groceryItems, syncedJoinedIds, viewingSharedGrocery]);
 
   const sliceRef = useRef(syncedSlice);
   useEffect(() => { sliceRef.current = syncedSlice; }, [syncedSlice]);
@@ -6831,6 +7889,13 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     setAutoClearState(s.autoClear);
     setDarkModeState(s.darkMode);
     setGroceryItemsState(s.groceryItems);
+    if (Array.isArray(s.joinedSharedLists)) {
+      restoreJoinedIds(s.joinedSharedLists.filter((id) => typeof id === 'string')).catch(() => {});
+    }
+    if (typeof s.syncEnabledForGrocery === 'boolean') {
+      setViewingSharedGroceryState(s.syncEnabledForGrocery);
+      AsyncStorage.setItem(SHARED_GROCERY_TOGGLE_KEY, s.syncEnabledForGrocery ? '1' : '0').catch(() => {});
+    }
     AsyncStorage.multiSet([
       ['tri_lists', JSON.stringify(restoredLists)],
       ['tri_active_list_id', JSON.stringify(restoredActiveListId)],
@@ -6871,17 +7936,18 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     // re-merged on every render. Persisting them here would duplicate them
     // (once from local lists, once from the shared-lists adapter).
     //
-    // So: split the new order into private vs shared. Persist the private
-    // slice into `lists`. The shared slice's order is local-per-user and
-    // not yet wired to a separate persisted order — for now, drag among
-    // shared pills is visually-only and won't survive a remount. Tracked
-    // as a follow-up.
+    // So: split the new order into private vs shared, and persist the full
+    // row of IDs separately so shared pills can sit anywhere in the row.
+    // The shared-only order remains as a compact migration fallback.
     const sharedIds = sharedTaskIdSetRef.current;
     const privateOnly = newLists.filter(l => !sharedIds.has(l.id));
     const sharedOnlyIds = newLists.filter(l => sharedIds.has(l.id)).map(l => l.id);
+    const rowOrder = newLists.map(l => l.id);
     setListsState(privateOnly);
+    setListRowOrderState(rowOrder);
     persistLists(privateOnly);
     AsyncStorage.setItem('tri_list_order', JSON.stringify(privateOnly.map(l => l.id))).catch(() => {});
+    AsyncStorage.setItem(LIST_ROW_ORDER_KEY, JSON.stringify(rowOrder)).catch(() => {});
     if (sharedOnlyIds.length > 0) {
       setSharedTaskOrderState(sharedOnlyIds);
       AsyncStorage.setItem(SHARED_TASK_ORDER_KEY, JSON.stringify(sharedOnlyIds)).catch(() => {});
@@ -7012,7 +8078,25 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   // the live items subcollection mirror. The adapter owns no state — every
   // shared mutation goes through the provider, which echoes via the
   // listener and reflows the merged view automatically.
-  const { sharedLists: sharedListsMap, sharedItems, addSharedTaskItems, editSharedTaskItem, deleteSharedTaskItem } = useSharedLists();
+  const {
+    sharedLists: sharedListsMap,
+    sharedItems,
+    sharedArchives,
+    addSharedTaskItems,
+    editSharedTaskItem,
+    deleteSharedTaskItem,
+    archiveSharedTaskItem,
+    deleteSharedArchiveItem,
+    promoteGroceryListToShared,
+    addSharedGroceryItems,
+    updateSharedGroceryItem,
+    deleteSharedGroceryItem,
+    deleteSharedGroceryItems,
+    updateSharedGroceryCategories,
+    rotateShareCode,
+    leaveSharedList,
+    deleteSharedList,
+  } = useSharedLists();
 
   // Adapt /sharedLists/{id}/items/* into Task[] for ActiveList rendering.
   // Reminders are intentionally absent (cross-device Notifee is v2). Per-item
@@ -7048,6 +8132,41 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   }, [sharedListsMap, sharedItems]);
 
   const sharedTaskIdSet = useMemo(() => new Set(sharedTaskLists.map(l => l.id)), [sharedTaskLists]);
+  const sharedGroceryDoc = useMemo(() => {
+    return Object.values(sharedListsMap).find((l) => l.kind === 'grocery') ?? null;
+  }, [sharedListsMap]);
+  const sharedGroceryItems = useMemo(() => {
+    if (!sharedGroceryDoc) return [];
+    return (sharedItems[sharedGroceryDoc.id] || []).map((it): GroceryItem => ({
+      id: it.id,
+      name: it.name || '',
+      category: it.category || GROCERY_UNCATEGORIZED,
+      checked: !!it.checked,
+      createdAt: it.createdAt || 0,
+    }));
+  }, [sharedGroceryDoc, sharedItems]);
+  const combinedArchive = useMemo((): ArchivedTask[] => {
+    const shared: ArchivedTask[] = [];
+    for (const l of Object.values(sharedListsMap)) {
+      if (l.kind !== 'tasks') continue;
+      const canDelete = !!syncUser && l.ownerUid === syncUser.uid;
+      for (const item of sharedArchives[l.id] || []) {
+        const member = l.members?.[item.archivedBy];
+        shared.push({
+          id: item.id,
+          text: item.text || '',
+          tier: item.tier || 'medium',
+          completedAt: item.completedAt || 0,
+          listId: l.id,
+          sharedListId: l.id,
+          sharedListName: l.name,
+          sharedCanDelete: canDelete,
+          archivedByInitial: member?.emailInitial,
+        });
+      }
+    }
+    return [...archive, ...shared];
+  }, [archive, sharedArchives, sharedListsMap, syncUser]);
   // Mirror the live id set into a ref that reorderLists (declared earlier
   // in this function) reads. Avoids forward-reference into a state value
   // declared further down the function body.
@@ -7066,6 +8185,19 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     });
   }, [sharedTaskLists]);
 
+  useEffect(() => {
+    const liveIds = [...lists.map(l => l.id), ...sharedTaskLists.map(l => l.id)];
+    setListRowOrderState(prev => {
+      const next = [
+        ...prev.filter(id => liveIds.includes(id)),
+        ...liveIds.filter(id => !prev.includes(id)),
+      ];
+      if (next.length === prev.length && next.every((id, i) => id === prev[i])) return prev;
+      AsyncStorage.setItem(LIST_ROW_ORDER_KEY, JSON.stringify(next)).catch(() => {});
+      return next;
+    });
+  }, [lists, sharedTaskLists]);
+
   const orderedSharedTaskLists = useMemo(() => {
     const byId = new Map(sharedTaskLists.map(l => [l.id, l]));
     return [
@@ -7077,7 +8209,15 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   // Merged pill-row source. Private lists keep their existing order; shared
   // lists append after them. A future enhancement could weave them per the
   // user's tri_list_order — deferred until users ask for it.
-  const mergedLists: TaskList[] = useMemo(() => [...lists, ...orderedSharedTaskLists], [lists, orderedSharedTaskLists]);
+  const mergedLists: TaskList[] = useMemo(() => {
+    const base = [...lists, ...orderedSharedTaskLists];
+    if (listRowOrder.length === 0) return base;
+    const byId = new Map(base.map(l => [l.id, l]));
+    return [
+      ...listRowOrder.map(id => byId.get(id)).filter(Boolean) as TaskList[],
+      ...base.filter(l => !listRowOrder.includes(l.id)),
+    ];
+  }, [lists, orderedSharedTaskLists, listRowOrder]);
 
   // Active list resolution: try shared first (since their IDs don't collide
   // with private list IDs), then fall back to private. If the active ID
@@ -7086,6 +8226,12 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   const activeShared = orderedSharedTaskLists.find(l => l.id === activeListId);
   const activeList = activeShared ?? lists.find(l => l.id === activeListId) ?? lists[0];
   const isActiveShared = !!activeShared;
+  const activeListIdIsLive = mergedLists.some(l => l.id === activeListId);
+
+  useEffect(() => {
+    if (!ready || activeListIdIsLive || !activeList?.id) return;
+    setActiveListId(activeList.id);
+  }, [ready, activeListIdIsLive, activeList?.id, setActiveListId]);
 
   // sharedActions binds the active shared list's ID into the provider CRUD
   // helpers so ActiveList can call them without knowing the list ID.
@@ -7096,8 +8242,88 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       addItems: (items: { text: string; tier: Tier }[]) => addSharedTaskItems(listId, items),
       editItem: (itemId: TaskId, patch: { text?: string; tier?: Tier }) => editSharedTaskItem(listId, String(itemId), patch),
       deleteItem: (itemId: TaskId) => deleteSharedTaskItem(listId, String(itemId)),
+      archiveItem: (itemId: TaskId, item: { text: string; tier: Tier; createdAt?: number }) => archiveSharedTaskItem(listId, String(itemId), item),
     };
-  }, [isActiveShared, activeListId, addSharedTaskItems, editSharedTaskItem, deleteSharedTaskItem]);
+  }, [isActiveShared, activeListId, addSharedTaskItems, editSharedTaskItem, deleteSharedTaskItem, archiveSharedTaskItem]);
+
+  useEffect(() => {
+    if (!sharedGroceryDoc && viewingSharedGrocery) {
+      setViewingSharedGrocery(false);
+    }
+  }, [sharedGroceryDoc, setViewingSharedGrocery, viewingSharedGrocery]);
+
+  const usingSharedGrocery = !!sharedGroceryDoc && viewingSharedGrocery;
+  const groceryItemsForScreen = usingSharedGrocery ? sharedGroceryItems : groceryItems;
+
+  const addGroceryItemsForScreen = useCallback((items: { name: string; category: string }[]) => {
+    if (!usingSharedGrocery || !sharedGroceryDoc) {
+      addGroceryItems(items);
+      return;
+    }
+    return addSharedGroceryItems(sharedGroceryDoc.id, items);
+  }, [addGroceryItems, addSharedGroceryItems, sharedGroceryDoc, usingSharedGrocery]);
+
+  const checkGroceryForScreen = useCallback((id: string) => {
+    if (!usingSharedGrocery || !sharedGroceryDoc) {
+      checkGrocery(id);
+      return;
+    }
+    const item = sharedGroceryItems.find((it) => it.id === id);
+    updateSharedGroceryItem(sharedGroceryDoc.id, id, { checked: !(item?.checked ?? false) }).catch(() => {});
+  }, [checkGrocery, sharedGroceryDoc, sharedGroceryItems, updateSharedGroceryItem, usingSharedGrocery]);
+
+  const deleteGroceryForScreen = useCallback((id: string) => {
+    if (!usingSharedGrocery || !sharedGroceryDoc) {
+      deleteGrocery(id);
+      return;
+    }
+    deleteSharedGroceryItem(sharedGroceryDoc.id, id).catch(() => {});
+  }, [deleteGrocery, deleteSharedGroceryItem, sharedGroceryDoc, usingSharedGrocery]);
+
+  const clearCheckedGroceryForScreen = useCallback(() => {
+    if (!usingSharedGrocery || !sharedGroceryDoc) {
+      clearCheckedGrocery();
+      return;
+    }
+    const checkedIds = sharedGroceryItems.filter((it) => it.checked).map((it) => it.id);
+    deleteSharedGroceryItems(sharedGroceryDoc.id, checkedIds).catch(() => {});
+  }, [clearCheckedGrocery, deleteSharedGroceryItems, sharedGroceryDoc, sharedGroceryItems, usingSharedGrocery]);
+
+  const clearAllGroceryForScreen = useCallback(() => {
+    if (!usingSharedGrocery || !sharedGroceryDoc) {
+      clearAllGrocery();
+      return;
+    }
+    deleteSharedGroceryItems(sharedGroceryDoc.id, sharedGroceryItems.map((it) => it.id)).catch(() => {});
+  }, [clearAllGrocery, deleteSharedGroceryItems, sharedGroceryDoc, sharedGroceryItems, usingSharedGrocery]);
+
+  const aiSortGroceryForScreen = useCallback(async (onDone?: () => void) => {
+    if (!usingSharedGrocery || !sharedGroceryDoc) {
+      aiSortGrocery(onDone);
+      return;
+    }
+    let storedKey = '';
+    try { storedKey = await EncryptedStorage.getItem('triority-api-key') || ''; } catch {}
+    if (!storedKey || sharedGroceryItems.length === 0) { onDone?.(); return; }
+    const validCats = new Set([...GROCERY_CATEGORIES, GROCERY_UNCATEGORIZED]);
+    const systemPrompt = `Assign a grocery category to each item. Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
+Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
+    const userMsg = sharedGroceryItems.map(i => `{"id":"${i.id}","name":"${i.name}"}`).join('\n');
+    fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': storedKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 600, system: systemPrompt, messages: [{ role: 'user', content: userMsg }] }),
+    }).then(r => r.json()).then(data => {
+      const rawText = data.content?.[0]?.text ?? '';
+      const cleaned = rawText.replace(/```json\s*/gi, '').replace(/```/g, '').trim();
+      const parsed: { id: string; category: string }[] = JSON.parse(cleaned);
+      const assignments = parsed.map((a) => ({
+        id: a.id,
+        category: validCats.has(a.category) ? a.category : GROCERY_UNCATEGORIZED,
+      }));
+      updateSharedGroceryCategories(sharedGroceryDoc.id, assignments).finally(() => onDone?.());
+    }).catch(() => { onDone?.(); });
+  }, [aiSortGrocery, sharedGroceryDoc, sharedGroceryItems, updateSharedGroceryCategories, usingSharedGrocery]);
 
   if (!ready) {
     return (
@@ -7117,13 +8343,43 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
             {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItems} setScreen={setScreen} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} />}
             {screen === 'grocery' && (
               <StandaloneGrocery
-                groceryItems={groceryItems}
-                onAddGroceryItems={addGroceryItems}
-                onCheckGrocery={checkGrocery}
-                onDeleteGrocery={deleteGrocery}
-                onClearCheckedGrocery={clearCheckedGrocery}
-                onClearAllGrocery={clearAllGrocery}
-                onAiSortGrocery={aiSortGrocery}
+                groceryItems={groceryItemsForScreen}
+                onAddGroceryItems={addGroceryItemsForScreen}
+                onCheckGrocery={checkGroceryForScreen}
+                onDeleteGrocery={deleteGroceryForScreen}
+                onClearCheckedGrocery={clearCheckedGroceryForScreen}
+                onClearAllGrocery={clearAllGroceryForScreen}
+                onAiSortGrocery={aiSortGroceryForScreen}
+                sharedGrocery={sharedGroceryDoc && syncUser ? {
+                  isOwner: sharedGroceryDoc.ownerUid === syncUser.uid,
+                  shareCode: sharedGroceryDoc.shareCode,
+                  memberCount: Object.keys(sharedGroceryDoc.members || {}).length,
+                } : undefined}
+                viewingSharedGrocery={usingSharedGrocery}
+                onSetViewingSharedGrocery={setViewingSharedGrocery}
+                onShareGrocery={() => promoteGroceryListToShared(groceryItems).then(() => {
+                  setViewingSharedGrocery(true);
+                })}
+                onRotateGroceryShareCode={() => sharedGroceryDoc ? rotateShareCode(sharedGroceryDoc.id).then(() => undefined) : Promise.reject(new Error('No shared grocery list'))}
+                onMakePrivateSharedGrocery={() => {
+                  if (!sharedGroceryDoc) return Promise.reject(new Error('No shared grocery list'));
+                  const listId = sharedGroceryDoc.id;
+                  const now = Date.now();
+                  const privateItems = sharedGroceryItems.map((item, index): GroceryItem => ({
+                    id: `groc_${now}_${index}`,
+                    name: item.name,
+                    category: item.category || GROCERY_UNCATEGORIZED,
+                    checked: !!item.checked,
+                    createdAt: item.createdAt || now + index,
+                  }));
+                  return deleteSharedList(listId).then(() => {
+                    setGroceryItemsState(privateItems);
+                    persistGrocery(privateItems);
+                    setViewingSharedGrocery(false);
+                  });
+                }}
+                onLeaveSharedGrocery={() => sharedGroceryDoc ? leaveSharedList(sharedGroceryDoc.id).then(() => setViewingSharedGrocery(false)) : Promise.reject(new Error('No shared grocery list'))}
+                onDeleteSharedGrocery={() => sharedGroceryDoc ? deleteSharedList(sharedGroceryDoc.id).then(() => setViewingSharedGrocery(false)) : Promise.reject(new Error('No shared grocery list'))}
                 hasApiKey={hasApiKey}
                 accentColor={accentColor}
                 defaultTier={defaultTier}
@@ -7133,7 +8389,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
                 onAddManyToList={addManyToList}
               />
             )}
-            {screen === 'archive' && <Archive archive={archive} setArchive={setArchive} accentColor={accentColor} lists={lists} activeListId={activeListId} setListTasks={setListTasks} />}
+            {screen === 'archive' && <Archive archive={combinedArchive} setArchive={setArchive} accentColor={accentColor} lists={mergedLists} activeListId={activeListId} setListTasks={setListTasks} onDeleteSharedArchiveItem={deleteSharedArchiveItem} />}
             {screen === 'settings' && (
               <Settings accent={accentColor} apiKey={apiKey} setApiKey={setApiKey}
                 hasApiKey={hasApiKey} setHasApiKey={setHasApiKey} personalContext={personalContext} setPersonalContext={setPersonalContext}
@@ -7186,10 +8442,11 @@ const styles = StyleSheet.create({
   // stealing focus once the sheet is open.
   portalRoot: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
   backdrop: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.55)' },
-  sheetPanel: { position: 'absolute', bottom: 0, left: 0, right: 0, borderTopLeftRadius: 20, borderTopRightRadius: 20, borderWidth: 1, borderBottomWidth: 0 },
+  sheetPanel: { position: 'absolute', bottom: 0, left: 0, right: 0, borderTopLeftRadius: 20, borderTopRightRadius: 20, borderWidth: 1, borderBottomWidth: 0, overflow: 'hidden' },
   sheetHandle: { alignItems: 'center', paddingTop: 12, paddingBottom: 8 },
   sheetHandleBar: { width: 36, height: 4, borderRadius: 2 },
   sheetContent: { paddingHorizontal: 16, paddingBottom: 24 },
+  sheetScroll: { flexShrink: 1 },
   sheetTitle: { fontSize: 13, letterSpacing: 1.2, textTransform: 'uppercase', marginBottom: 12 },
   sheetTextarea: { borderWidth: 1.5, borderRadius: 10, paddingTop: 10, paddingBottom: 10, paddingHorizontal: 10, fontSize: 15, minHeight: 80, maxHeight: 140, textAlignVertical: 'top', includeFontPadding: false, marginBottom: 14 },
   sheetPriorityLabel: { fontSize: 12, letterSpacing: 0.8, textTransform: 'uppercase', marginBottom: 8 },
@@ -7280,6 +8537,10 @@ const styles = StyleSheet.create({
   taskCountInline: { fontSize: 12 },
   listMetaRow: { alignItems: 'center', marginTop: 2, marginBottom: 2 },
   groceryActionPillRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, gap: 8 },
+  groceryViewSwitchWrap: { paddingHorizontal: 16, paddingTop: 10 },
+  groceryViewSwitch: { flexDirection: 'row', alignItems: 'center', height: 36, borderRadius: 10, borderWidth: 1, padding: 3, gap: 3 },
+  groceryViewSwitchBtn: { flex: 1, height: 28, borderRadius: 8, borderWidth: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 },
+  groceryViewSwitchLabel: { fontSize: 12 },
   groceryCategoryHeader: { fontSize: 11, letterSpacing: 0.6, textTransform: 'uppercase', marginTop: 16, marginBottom: 6, paddingLeft: 2 },
   groceryClearPill: { alignItems: 'center', paddingHorizontal: 12, paddingTop: 5, paddingBottom: 4, borderRadius: 16, borderWidth: 1 },
   groceryClearHint: { fontSize: 8, marginTop: 1 },
@@ -7314,7 +8575,8 @@ const styles = StyleSheet.create({
   sheetFullBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.45)' },
   // Tighter padding/margins for compact sheets (upsell, list actions) so they don't
   // reach the screen edges on smaller phones.
-  sheetCompact: { paddingHorizontal: 16, paddingBottom: 24, maxHeight: '85%' },
+  sheetCompact: { paddingHorizontal: 16, paddingBottom: 24, maxHeight: '85%', overflow: 'hidden' },
+  sheetCompactContent: { paddingBottom: 4 },
   tierPillCount: { fontSize: 11 },
   tierPillLabel: { fontSize: 10 },
   divider: { height: 1, marginTop: 14 },
