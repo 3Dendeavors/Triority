@@ -238,6 +238,7 @@ const SHARED_TASK_ORDER_KEY = 'tri_shared_task_order';
 const LIST_ROW_ORDER_KEY = 'tri_list_row_order';
 const SHARED_GROCERY_TOGGLE_KEY = 'tri_shared_grocery_view';   // '1' = viewing shared, '0' or absent = viewing private
 const SHARED_CACHE_KEY = 'tri_shared_cache_v1';
+const SHARED_STALE_RESTORE_CUTOFF_MS = new Date('2026-05-07T00:00:00-04:00').getTime();
 
 function isMissingOrPermissionError(e: any) {
   const raw = String(e?.code || e?.nativeErrorCode || e?.message || '').toLowerCase();
@@ -602,6 +603,13 @@ function buildSharedListMember(email: string | null | undefined, slot: number, n
   };
 }
 
+function isHistoricalAclRestore(data: Pick<SharedList, 'members' | 'updatedAt'>, uid: string): boolean {
+  const joinedAt = data.members?.[uid]?.joinedAt ?? 0;
+  return joinedAt > 0
+    && joinedAt < SHARED_STALE_RESTORE_CUTOFF_MS
+    && data.updatedAt < SHARED_STALE_RESTORE_CUTOFF_MS;
+}
+
 // ─── Shared Lists Provider (Phase 2) ──────────────────────────────────────────
 // One real-time listener per joined sharedList parent doc + one per its items
 // subcollection. Listeners attach when the user is signed in and a list ID
@@ -700,7 +708,6 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const [sharedArchives, setSharedArchives] = useState<{ [id: string]: SharedArchiveItem[] }>({});
   const [hydrating, setHydrating] = useState(true);
   const [appActive, setAppActive] = useState(true);
-  const [membershipDiscoveryRetry, setMembershipDiscoveryRetry] = useState(0);
 
   const forgetSharedList = useCallback((listId: string) => {
     setSharedLists((prev) => {
@@ -831,46 +838,6 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     enableNetwork(getFirestore(getApp())).catch(() => {});
   }, [user, appActive]);
 
-  useEffect(() => {
-    if (!authReady || hydrating) return;
-    if (!user) return;
-    if (!appActive) return;
-    const uid = user.uid;
-    const db = getFirestore(getApp());
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    enableNetwork(db).catch(() => {});
-    const unsub = onSnapshot(
-      query(collection(db, 'sharedLists'), where('acl', 'array-contains', uid)),
-      (snap) => {
-        const remoteIds: string[] = [];
-        const remoteLists: { [id: string]: SharedList } = {};
-        snap.forEach((d) => {
-          const data = d.data() as Omit<SharedList, 'id'> | undefined;
-          if (!data) return;
-          remoteIds.push(d.id);
-          remoteLists[d.id] = { id: d.id, ...data };
-        });
-        if (remoteIds.length > 0) {
-          setSharedLists((prev) => ({ ...prev, ...remoteLists }));
-          const merged = Array.from(new Set([...joinedIdsRef.current, ...remoteIds]));
-          if (merged.length !== joinedIdsRef.current.length) {
-            setJoinedIds(merged).catch(() => {});
-          }
-        }
-      },
-      () => {
-        retryTimer = setTimeout(() => {
-          setMembershipDiscoveryRetry((n) => n + 1);
-        }, 5000);
-      },
-    );
-
-    return () => {
-      if (retryTimer) clearTimeout(retryTimer);
-      try { unsub(); } catch {}
-    };
-  }, [authReady, hydrating, user, appActive, setJoinedIds, membershipDiscoveryRetry]);
-
   // The actual listener attach/detach effect. Re-runs when the auth user,
   // the joined list IDs, or the active state changes.
   useEffect(() => {
@@ -914,6 +881,11 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
           }
           const data = snap.data() as Omit<SharedList, 'id'> | undefined;
           if (!data) return;
+          if (isHistoricalAclRestore(data, user.uid)) {
+            forgetSharedList(listId);
+            removeJoinedId(listId).catch(() => {});
+            return;
+          }
           setSharedLists((prev) => ({ ...prev, [listId]: { id: listId, ...data } }));
         },
         (error) => {
@@ -1304,13 +1276,12 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     const ownerInitial = ownerMember?.emailInitial ?? '?';
     const otherUids = (data.acl || []).filter((u) => u !== user.uid);
     const now = Date.now();
-    await deleteDoc(doc(db, 'sharedLists', listId));
-
     forgetSharedList(listId);
     await removeJoinedId(listId);
 
-    if (otherUids.length > 0) {
-      void (async () => {
+    void (async () => {
+      await deleteDoc(doc(db, 'sharedLists', listId));
+      if (otherUids.length > 0) {
         const notifBatch = writeBatch(db);
         for (const memberUid of otherUids) {
           const notifRef = doc(collection(db, 'users', memberUid, 'notifications'));
@@ -1322,8 +1293,8 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
           });
         }
         await notifBatch.commit();
-      })().catch(() => {});
-    }
+      }
+    })().catch(() => {});
   }, [user, forgetSharedList, removeJoinedId]);
 
   // Step 6: promote a private TaskList → new shared list. Caller deletes the
