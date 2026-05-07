@@ -85,14 +85,31 @@ yarn-error.log
 /_screenshots/
 /Triority/
 
+# Local working docs and agent handoffs
+CODEX_CHANGES.md
+CODEX_WORKSPACE.md
+HANDOFF*.md
+archive/HANDOFF2.md.archive
+CLAUDECHANGES.md
+plans/
+AGENTS.md
+PRD.md
+PRODUCT.md
+ARCHITECTURE.md
+ROADMAP.md
+WORKSPACE_STRUCTURE.md
+docs/archive/
+C:Tempmetro.log
+CTempmetro.log
+
 # Claude Code local session data
 .claude/
 .gradle-home/
 CTempmetro.log
-CLAUDECHANGES.md
 
 # Additional secrets and build artifacts (per GitHub setup review 2026-05-06)
 *.jks
 google-services.json
 app/build/
 *.apk
+android/app/debug.keystore
