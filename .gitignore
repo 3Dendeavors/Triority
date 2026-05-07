@@ -78,3 +78,20 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# Local workspace shelves created during consolidation
+/_archive/
+/_exports/
+/_screenshots/
+/Triority/
+
+# Claude Code local session data
+.claude/
+.gradle-home/
+CTempmetro.log
+
+# Additional secrets and build artifacts (per GitHub setup review 2026-05-06)
+*.jks
+google-services.json
+app/build/
+*.apk
