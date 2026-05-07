@@ -1,7 +1,8 @@
 {
-  "versionCode": 16,
-  "versionName": "1.4.0",
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.0.0/triority-from-ross-phone-2026-05-06.apk",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.0.0",
-  "title": "Triority update available"
+  "versionName": "1.4.1",
+  "versionCode": 17,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.1/Triority-v1.4.1.apk",
+  "releaseNotes": "Beta rescue update. Keeps the current working Firestore shared-list build path, leaves Supabase runtime disabled after the first enabled build crashed on launch, and includes the Supabase backend groundwork for the next beta.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.1",
+  "required": false
 }
