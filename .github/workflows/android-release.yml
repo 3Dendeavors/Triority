@@ -1,0 +1,163 @@
+name: Android Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish signed APK
+    runs-on: ubuntu-latest
+
+    env:
+      APK_BASENAME: Triority-${{ github.ref_name }}.apk
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.11.0'
+          cache: npm
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Restore private Android files
+        shell: bash
+        env:
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+          TRIORITY_RELEASE_KEYSTORE_BASE64: ${{ secrets.TRIORITY_RELEASE_KEYSTORE_BASE64 }}
+          TRIORITY_RELEASE_STORE_PASSWORD: ${{ secrets.TRIORITY_RELEASE_STORE_PASSWORD }}
+          TRIORITY_RELEASE_KEY_ALIAS: ${{ secrets.TRIORITY_RELEASE_KEY_ALIAS }}
+          TRIORITY_RELEASE_KEY_PASSWORD: ${{ secrets.TRIORITY_RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$GOOGLE_SERVICES_JSON_BASE64"
+          test -n "$TRIORITY_RELEASE_KEYSTORE_BASE64"
+          test -n "$TRIORITY_RELEASE_STORE_PASSWORD"
+          test -n "$TRIORITY_RELEASE_KEY_ALIAS"
+          test -n "$TRIORITY_RELEASE_KEY_PASSWORD"
+
+          printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | base64 --decode > android/app/google-services.json
+          printf '%s' "$TRIORITY_RELEASE_KEYSTORE_BASE64" | base64 --decode > android/app/triority-release.keystore
+
+          {
+            printf 'TRIORITY_RELEASE_STORE_FILE=triority-release.keystore\n'
+            printf 'TRIORITY_RELEASE_STORE_PASSWORD=%s\n' "$TRIORITY_RELEASE_STORE_PASSWORD"
+            printf 'TRIORITY_RELEASE_KEY_ALIAS=%s\n' "$TRIORITY_RELEASE_KEY_ALIAS"
+            printf 'TRIORITY_RELEASE_KEY_PASSWORD=%s\n' "$TRIORITY_RELEASE_KEY_PASSWORD"
+          } > android/keystore.properties
+
+      - name: Read Android version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_code="$(node <<'NODE'
+          const fs = require('fs');
+          const gradle = fs.readFileSync('android/app/build.gradle', 'utf8');
+          const versionCode = gradle.match(/versionCode\s+(\d+)/)?.[1];
+          if (!versionCode) throw new Error('Could not read versionCode from android/app/build.gradle');
+          console.log(versionCode);
+          NODE
+          )"
+          version_name="$(node <<'NODE'
+          const fs = require('fs');
+          const gradle = fs.readFileSync('android/app/build.gradle', 'utf8');
+          const versionName = gradle.match(/versionName\s+"([^"]+)"/)?.[1];
+          if (!versionName) throw new Error('Could not read versionName from android/app/build.gradle');
+          console.log(versionName);
+          NODE
+          )"
+          echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
+          echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
+
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$version_name" != "$tag_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match android versionName $version_name" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build signed release APK
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Name APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp android/app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/$APK_BASENAME"
+          echo "apk_path=$RUNNER_TEMP/$APK_BASENAME" >> "$GITHUB_ENV"
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "Triority $GITHUB_REF_NAME"
+          else
+            gh release create "$GITHUB_REF_NAME" --title "Triority $GITHUB_REF_NAME" --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" "$apk_path#$APK_BASENAME" --clobber
+
+      - name: Update latest.json on main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}"
+          apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${APK_BASENAME}"
+          release_notes="$(gh release view "$GITHUB_REF_NAME" --json body --jq '.body')"
+
+          git fetch origin main
+          git checkout -B main origin/main
+          git pull --ff-only origin main
+
+          APK_URL="$apk_url" RELEASE_URL="$release_url" RELEASE_NOTES="$release_notes" node <<'NODE'
+          const fs = require('fs');
+          const manifest = {
+            versionName: '${{ steps.version.outputs.version_name }}',
+            versionCode: Number('${{ steps.version.outputs.version_code }}'),
+            apkUrl: process.env.APK_URL,
+            releaseNotes: process.env.RELEASE_NOTES || '',
+            releaseNotesUrl: process.env.RELEASE_URL,
+            required: false,
+          };
+          fs.writeFileSync('latest.json', `${JSON.stringify(manifest, null, 2)}\n`);
+          NODE
+
+          if git diff --quiet -- latest.json; then
+            echo "latest.json already points to $GITHUB_REF_NAME"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add latest.json
+          git commit -m "Update latest.json for $GITHUB_REF_NAME"
+          git push origin main
