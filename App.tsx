@@ -730,6 +730,36 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const hydrateSharedCache = useCallback(async () => {
+    try {
+      const rawCache = await AsyncStorage.getItem(SHARED_CACHE_KEY);
+      if (!rawCache) return;
+      const parsed = JSON.parse(rawCache) as Partial<SharedListsCache>;
+      const joined = new Set(joinedIdsRef.current);
+      if (joined.size === 0) return;
+      const cachedLists = parsed?.lists && typeof parsed.lists === 'object' ? parsed.lists : {};
+      const cachedItems = parsed?.items && typeof parsed.items === 'object' ? parsed.items : {};
+      const cachedArchives = parsed?.archives && typeof parsed.archives === 'object' ? parsed.archives : {};
+      const filteredLists: { [id: string]: SharedList } = {};
+      const filteredItems: { [id: string]: SharedListItem[] } = {};
+      const filteredArchives: { [id: string]: SharedArchiveItem[] } = {};
+      for (const id of joined) {
+        if (cachedLists[id]) filteredLists[id] = cachedLists[id];
+        if (Array.isArray(cachedItems[id])) filteredItems[id] = cachedItems[id];
+        if (Array.isArray(cachedArchives[id])) filteredArchives[id] = cachedArchives[id];
+      }
+      if (Object.keys(filteredLists).length > 0) {
+        setSharedLists((prev) => ({ ...prev, ...filteredLists }));
+      }
+      if (Object.keys(filteredItems).length > 0) {
+        setSharedItems((prev) => ({ ...prev, ...filteredItems }));
+      }
+      if (Object.keys(filteredArchives).length > 0) {
+        setSharedArchives((prev) => ({ ...prev, ...filteredArchives }));
+      }
+    } catch {}
+  }, []);
+
   // Load persisted joinedIds on mount. Phase 1 sync engine will overwrite
   // this list when it restores a fresh device — by then we've already started
   // listening to whatever was on disk. The next render after restore picks
@@ -755,30 +785,9 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   useEffect(() => {
-    if (hydrating) return;
-    (async () => {
-      try {
-        const rawCache = await AsyncStorage.getItem(SHARED_CACHE_KEY);
-        if (!rawCache) return;
-        const parsed = JSON.parse(rawCache) as Partial<SharedListsCache>;
-        const joined = new Set(joinedIdsRef.current);
-        const cachedLists = parsed?.lists && typeof parsed.lists === 'object' ? parsed.lists : {};
-        const cachedItems = parsed?.items && typeof parsed.items === 'object' ? parsed.items : {};
-        const cachedArchives = parsed?.archives && typeof parsed.archives === 'object' ? parsed.archives : {};
-        const filteredLists: { [id: string]: SharedList } = {};
-        const filteredItems: { [id: string]: SharedListItem[] } = {};
-        const filteredArchives: { [id: string]: SharedArchiveItem[] } = {};
-        for (const id of joined) {
-          if (cachedLists[id]) filteredLists[id] = cachedLists[id];
-          if (Array.isArray(cachedItems[id])) filteredItems[id] = cachedItems[id];
-          if (Array.isArray(cachedArchives[id])) filteredArchives[id] = cachedArchives[id];
-        }
-        setSharedLists(filteredLists);
-        setSharedItems(filteredItems);
-        setSharedArchives(filteredArchives);
-      } catch {}
-    })();
-  }, [hydrating]);
+    if (hydrating || !user) return;
+    hydrateSharedCache();
+  }, [hydrating, user, joinedIds, hydrateSharedCache]);
 
   useEffect(() => {
     if (hydrating || !user) return;
@@ -1259,6 +1268,34 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const deleteSharedList = useCallback(async (listId: string) => {
     if (!user) throw new Error('Not signed in');
     const db = getFirestore(getApp());
+    const cached = sharedLists[listId];
+    if (cached && cached.ownerUid === user.uid) {
+      const ownerMember = cached.members?.[user.uid];
+      const ownerInitial = ownerMember?.emailInitial ?? '?';
+      const otherUids = (cached.acl || []).filter((u) => u !== user.uid);
+      const now = Date.now();
+      forgetSharedList(listId);
+      await removeJoinedId(listId);
+
+      void (async () => {
+        await deleteDoc(doc(db, 'sharedLists', listId));
+        if (otherUids.length > 0) {
+          const notifBatch = writeBatch(db);
+          for (const memberUid of otherUids) {
+            const notifRef = doc(collection(db, 'users', memberUid, 'notifications'));
+            notifBatch.set(notifRef, {
+              type: 'list_deleted' as NotificationKind,
+              payload: { listName: cached.name, ownerInitial },
+              createdAt: now,
+              readAt: null,
+            });
+          }
+          await notifBatch.commit();
+        }
+      })().catch(() => {});
+      return;
+    }
+
     const snap = await getDoc(doc(db, 'sharedLists', listId));
     if (!snap.exists) {
       forgetSharedList(listId);
@@ -1295,7 +1332,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         await notifBatch.commit();
       }
     })().catch(() => {});
-  }, [user, forgetSharedList, removeJoinedId]);
+  }, [user, sharedLists, forgetSharedList, removeJoinedId]);
 
   // Step 6: promote a private TaskList → new shared list. Caller deletes the
   // private list from its own state once this resolves.
@@ -1341,14 +1378,12 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     // user has an empty shared list. They can delete it and retry. The
     // alternative (widen items rule to allow create when writer is the
     // parent's ownerUid) adds a get() per item create — a worse trade.
-    await commitSharedParent(db, parentRef, parentData);
     setSharedLists((prev) => ({ ...prev, [parentRef.id]: { id: parentRef.id, ...parentData } }));
 
-    // Return the code path immediately. Firestore may be slow to flush after
-    // app resumes, and timing out the UI only creates duplicate late lists.
     await addJoinedId(parentRef.id);
 
     void (async () => {
+      await commitSharedParent(db, parentRef, parentData);
       if (list.tasks.length > 0) {
         for (let i = 0; i < list.tasks.length; i += 500) {
           const itemsBatch = writeBatch(db);
@@ -1381,10 +1416,9 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     const db = getFirestore(getApp());
     const now = Date.now();
 
-    const shareCode = stableShareCode(groceryShareDocId(user.uid));
-
     const ownerMember = buildSharedListMember(user.email, 0, now);
-    const parentRef = doc(db, 'sharedLists', groceryShareDocId(user.uid));
+    const parentRef = doc(collection(db, 'sharedLists'));
+    const shareCode = stableShareCode(parentRef.id);
     const parentData: Omit<SharedList, 'id'> = {
       ownerUid: user.uid,
       kind: 'grocery',
@@ -1396,13 +1430,27 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       updatedAt: now,
     };
 
-    await commitSharedParent(db, parentRef, parentData);
     setSharedLists((prev) => ({ ...prev, [parentRef.id]: { id: parentRef.id, ...parentData } }));
 
     await addJoinedId(parentRef.id);
 
     const initialItems = items.filter((it) => it.name.trim());
+    const optimisticItems: SharedListItem[] = initialItems.map((item, index) => ({
+      id: `grocery_${stableFirestoreId(String(item.id))}`,
+      name: item.name,
+      category: item.category || GROCERY_UNCATEGORIZED,
+      checked: !!item.checked,
+      createdBy: user.uid,
+      createdAt: item.createdAt || now + index,
+      lastEditedBy: user.uid,
+      lastEditedAt: now,
+    }));
+    if (optimisticItems.length > 0) {
+      setSharedItems((prev) => ({ ...prev, [parentRef.id]: optimisticItems }));
+    }
+
     void (async () => {
+      await commitSharedParent(db, parentRef, parentData);
       if (initialItems.length > 0) {
         for (let i = 0; i < initialItems.length; i += 500) {
           const itemsBatch = writeBatch(db);
@@ -7196,8 +7244,6 @@ interface StandaloneGroceryProps {
     shareCode: string;
     memberCount: number;
   };
-  viewingSharedGrocery: boolean;
-  onSetViewingSharedGrocery: (viewShared: boolean) => void;
   onShareGrocery: () => Promise<void>;
   onRotateGroceryShareCode: () => Promise<void>;
   onMakePrivateSharedGrocery: () => Promise<void>;
@@ -7215,7 +7261,7 @@ interface StandaloneGroceryProps {
 function StandaloneGrocery({
   groceryItems, onAddGroceryItems, onCheckGrocery, onDeleteGrocery,
   onClearCheckedGrocery, onClearAllGrocery, onAiSortGrocery,
-  sharedGrocery, viewingSharedGrocery, onSetViewingSharedGrocery,
+  sharedGrocery,
   onShareGrocery, onRotateGroceryShareCode, onMakePrivateSharedGrocery, onLeaveSharedGrocery, onDeleteSharedGrocery,
   hasApiKey, accentColor, defaultTier, lists, activeListId,
   onAddMany, onAddManyToList,
@@ -7299,7 +7345,7 @@ function StandaloneGrocery({
         <View style={styles.listHeaderTop}>
           <View style={styles.listTitleRow}>
             <Text style={[styles.listTitleText, { color: T.text, fontFamily: jks('700') }]} numberOfLines={1}>
-              {viewingSharedGrocery ? 'Shared Groceries' : 'Groceries'}
+              Groceries
             </Text>
           </View>
           <View style={styles.listMetaRow}>
@@ -7320,56 +7366,6 @@ function StandaloneGrocery({
           </TouchableOpacity>
         </View>
         <View style={[styles.divider, { backgroundColor: T.border, marginTop: 10 }]} />
-        {sharedGrocery && (
-          <View style={styles.groceryViewSwitchWrap}>
-            <View style={[styles.groceryViewSwitch, { backgroundColor: T.s2, borderColor: T.border }]}>
-              <TouchableOpacity
-                activeOpacity={0.75}
-                onPress={() => onSetViewingSharedGrocery(false)}
-                style={[
-                  styles.groceryViewSwitchBtn,
-                  {
-                    backgroundColor: !viewingSharedGrocery ? accentColor : 'transparent',
-                    borderColor: !viewingSharedGrocery ? `${accentColor}AA` : 'transparent',
-                  },
-                ]}>
-                <Icon name="home" size={12} color={!viewingSharedGrocery ? readableOn(accentColor) : T.textSub} strokeWidth={1.8} />
-                <Text
-                  style={[
-                    styles.groceryViewSwitchLabel,
-                    {
-                      color: !viewingSharedGrocery ? readableOn(accentColor) : T.textSub,
-                      fontFamily: jks(!viewingSharedGrocery ? '700' : '500'),
-                    },
-                  ]}>
-                  Personal
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                activeOpacity={0.75}
-                onPress={() => onSetViewingSharedGrocery(true)}
-                style={[
-                  styles.groceryViewSwitchBtn,
-                  {
-                    backgroundColor: viewingSharedGrocery ? accentColor : 'transparent',
-                    borderColor: viewingSharedGrocery ? `${accentColor}AA` : 'transparent',
-                  },
-                ]}>
-                <Icon name="users" size={12} color={viewingSharedGrocery ? readableOn(accentColor) : T.textSub} strokeWidth={1.8} />
-                <Text
-                  style={[
-                    styles.groceryViewSwitchLabel,
-                    {
-                      color: viewingSharedGrocery ? readableOn(accentColor) : T.textSub,
-                      fontFamily: jks(viewingSharedGrocery ? '700' : '500'),
-                    },
-                  ]}>
-                  Shared
-                </Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        )}
       </View>
       <GroceryScreen
         items={groceryItems}
@@ -8174,16 +8170,17 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
 
   useEffect(() => {
     const liveIds = [...lists.map(l => l.id), ...sharedTaskLists.map(l => l.id)];
+    const retainedIds = new Set([...liveIds, ...syncedJoinedIds]);
     setListRowOrderState(prev => {
       const next = [
-        ...prev.filter(id => liveIds.includes(id)),
+        ...prev.filter(id => retainedIds.has(id)),
         ...liveIds.filter(id => !prev.includes(id)),
       ];
       if (next.length === prev.length && next.every((id, i) => id === prev[i])) return prev;
       AsyncStorage.setItem(LIST_ROW_ORDER_KEY, JSON.stringify(next)).catch(() => {});
       return next;
     });
-  }, [lists, sharedTaskLists]);
+  }, [lists, sharedTaskLists, syncedJoinedIds]);
 
   const orderedSharedTaskLists = useMemo(() => {
     const byId = new Map(sharedTaskLists.map(l => [l.id, l]));
@@ -8239,7 +8236,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     }
   }, [sharedGroceryDoc, setViewingSharedGrocery, viewingSharedGrocery]);
 
-  const usingSharedGrocery = !!sharedGroceryDoc && viewingSharedGrocery;
+  const usingSharedGrocery = !!sharedGroceryDoc;
   const groceryItemsForScreen = usingSharedGrocery ? sharedGroceryItems : groceryItems;
 
   const addGroceryItemsForScreen = useCallback((items: { name: string; category: string }[]) => {
@@ -8342,9 +8339,9 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
                   shareCode: sharedGroceryDoc.shareCode,
                   memberCount: Object.keys(sharedGroceryDoc.members || {}).length,
                 } : undefined}
-                viewingSharedGrocery={usingSharedGrocery}
-                onSetViewingSharedGrocery={setViewingSharedGrocery}
                 onShareGrocery={() => promoteGroceryListToShared(groceryItems).then(() => {
+                  setGroceryItemsState([]);
+                  persistGrocery([]);
                   setViewingSharedGrocery(true);
                 })}
                 onRotateGroceryShareCode={() => sharedGroceryDoc ? rotateShareCode(sharedGroceryDoc.id).then(() => undefined) : Promise.reject(new Error('No shared grocery list'))}
