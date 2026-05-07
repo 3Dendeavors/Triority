@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.4.1
+
+- Beta update release for the current working rescue build.
+- Keeps Supabase shared-list code and database migration in the repo, but leaves the Supabase runtime disabled after the first enabled APK crashed on launch.
+- Keeps Firestore shared lists working while Supabase startup compatibility is fixed next.
+- Adds GitHub update-manifest support so installed beta builds can prompt for newer APKs on launch.
+
 ## Unreleased
 
 - Added the Supabase shared-list backend scaffold and migration SQL for faster shared-list invite, membership, item, archive, rename, rotate-code, leave, delete, realtime, and sign-in recovery flows.
