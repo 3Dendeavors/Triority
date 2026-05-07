@@ -519,6 +519,8 @@ interface SyncedState {
   // collection; this only tracks membership + UI toggle state.
   joinedSharedLists?: string[];
   syncEnabledForGrocery?: boolean;
+  sharedTaskOrder?: string[];
+  listRowOrder?: string[];
   // Note: API key is NOT synced. EncryptedStorage is device-bound by Keystore;
   // restoring ciphertext on another device is unrecoverable. User re-enters
   // their key on each device. onboarded is also local-only — restoring data
@@ -706,6 +708,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   const [sharedArchives, setSharedArchives] = useState<{ [id: string]: SharedArchiveItem[] }>({});
   const [hydrating, setHydrating] = useState(true);
   const [appActive, setAppActive] = useState(true);
+  const locallyRemovedSharedIdsRef = useRef<Set<string>>(new Set());
 
   const forgetSharedList = useCallback((listId: string) => {
     setSharedLists((prev) => {
@@ -728,6 +731,29 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const removeSharedListFromCache = useCallback((listId: string) => {
+    AsyncStorage.getItem(SHARED_CACHE_KEY).then((raw) => {
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as SharedListsCache;
+      const next: SharedListsCache = {
+        lists: { ...(parsed.lists || {}) },
+        items: { ...(parsed.items || {}) },
+        archives: { ...(parsed.archives || {}) },
+        savedAt: Date.now(),
+      };
+      delete next.lists[listId];
+      delete next.items[listId];
+      delete next.archives[listId];
+      return AsyncStorage.setItem(SHARED_CACHE_KEY, JSON.stringify(next));
+    }).catch(() => {});
+  }, []);
+
+  const forgetSharedListLocally = useCallback((listId: string) => {
+    locallyRemovedSharedIdsRef.current.add(listId);
+    forgetSharedList(listId);
+    removeSharedListFromCache(listId);
+  }, [forgetSharedList, removeSharedListFromCache]);
+
   const hydrateSharedCache = useCallback(async () => {
     try {
       const rawCache = await AsyncStorage.getItem(SHARED_CACHE_KEY);
@@ -742,6 +768,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       const filteredItems: { [id: string]: SharedListItem[] } = {};
       const filteredArchives: { [id: string]: SharedArchiveItem[] } = {};
       for (const id of joined) {
+        if (locallyRemovedSharedIdsRef.current.has(id)) continue;
         if (cachedLists[id]) filteredLists[id] = cachedLists[id];
         if (Array.isArray(cachedItems[id])) filteredItems[id] = cachedItems[id];
         if (Array.isArray(cachedArchives[id])) filteredArchives[id] = cachedArchives[id];
@@ -823,6 +850,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   }, [persistJoinedIdsForUser]);
 
   const addJoinedId = useCallback(async (listId: string) => {
+    locallyRemovedSharedIdsRef.current.delete(listId);
     if (joinedIdsRef.current.includes(listId)) return;
     await setJoinedIds([...joinedIdsRef.current, listId]);
   }, [setJoinedIds]);
@@ -879,17 +907,21 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       const unsubParent = onSnapshot(
         parentRef,
         (snap) => {
+          if (locallyRemovedSharedIdsRef.current.has(listId)) {
+            forgetSharedList(listId);
+            return;
+          }
           if (!snap.exists) {
             // Owner deleted the list. Drop it from local state; notification
             // surfacing is Step 14's job.
-            forgetSharedList(listId);
+            forgetSharedListLocally(listId);
             removeJoinedId(listId).catch(() => {});
             return;
           }
           const data = snap.data() as Omit<SharedList, 'id'> | undefined;
           if (!data) return;
           if (isHistoricalAclRestore(data, user.uid)) {
-            forgetSharedList(listId);
+            forgetSharedListLocally(listId);
             removeJoinedId(listId).catch(() => {});
             return;
           }
@@ -897,7 +929,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         },
         (error) => {
           if (isMissingOrPermissionError(error)) {
-            forgetSharedList(listId);
+            forgetSharedListLocally(listId);
             removeJoinedId(listId).catch(() => {});
           }
           // — fall silent. Step 14 surfaces user-visible removals.
@@ -959,7 +991,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         try { u(); } catch { /* noop */ }
       }
     };
-  }, [authReady, user, appActive, joinedIds, forgetSharedList, removeJoinedId]);
+  }, [authReady, user, appActive, joinedIds, forgetSharedList, forgetSharedListLocally, removeJoinedId]);
 
   // Step 8: join an existing shared list by share code. Enforces caps:
   //   - 1 shared grocery list per user
@@ -1227,7 +1259,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     if (!user) throw new Error('Not signed in');
     const db = getFirestore(getApp());
     const cleanupLocal = async () => {
-      forgetSharedList(listId);
+      forgetSharedListLocally(listId);
       await removeJoinedId(listId);
     };
     try {
@@ -1261,7 +1293,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       }
       throw e;
     }
-  }, [user, forgetSharedList, removeJoinedId]);
+  }, [user, forgetSharedListLocally, removeJoinedId]);
 
   const deleteSharedList = useCallback(async (listId: string) => {
     if (!user) throw new Error('Not signed in');
@@ -1272,7 +1304,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       const ownerInitial = ownerMember?.emailInitial ?? '?';
       const otherUids = (cached.acl || []).filter((u) => u !== user.uid);
       const now = Date.now();
-      forgetSharedList(listId);
+      forgetSharedListLocally(listId);
       await removeJoinedId(listId);
 
       void (async () => {
@@ -1296,7 +1328,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
     const snap = await getDoc(doc(db, 'sharedLists', listId));
     if (!snap.exists) {
-      forgetSharedList(listId);
+      forgetSharedListLocally(listId);
       await removeJoinedId(listId);
       return;
     }
@@ -1311,7 +1343,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     const ownerInitial = ownerMember?.emailInitial ?? '?';
     const otherUids = (data.acl || []).filter((u) => u !== user.uid);
     const now = Date.now();
-    forgetSharedList(listId);
+    forgetSharedListLocally(listId);
     await removeJoinedId(listId);
 
     void (async () => {
@@ -1330,7 +1362,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         await notifBatch.commit();
       }
     })().catch(() => {});
-  }, [user, sharedLists, forgetSharedList, removeJoinedId]);
+  }, [user, sharedLists, forgetSharedListLocally, removeJoinedId]);
 
   // Step 6: promote a private TaskList → new shared list. Caller deletes the
   // private list from its own state once this resolves.
@@ -7762,9 +7794,11 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     groceryItems,
     joinedSharedLists: syncedJoinedIds,
     syncEnabledForGrocery: viewingSharedGrocery,
+    sharedTaskOrder,
+    listRowOrder,
   }), [lists, activeListId, archive, accentLight, accentDark, themeId,
        customThemeDrafts, personalContext, defaultTier, autoClear, darkMode,
-       groceryItems, syncedJoinedIds, viewingSharedGrocery]);
+       groceryItems, syncedJoinedIds, viewingSharedGrocery, sharedTaskOrder, listRowOrder]);
 
   const sliceRef = useRef(syncedSlice);
   useEffect(() => { sliceRef.current = syncedSlice; }, [syncedSlice]);
@@ -7895,6 +7929,18 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       setViewingSharedGroceryState(s.syncEnabledForGrocery);
       AsyncStorage.setItem(SHARED_GROCERY_TOGGLE_KEY, s.syncEnabledForGrocery ? '1' : '0').catch(() => {});
     }
+    const restoredSharedTaskOrder = Array.isArray(s.sharedTaskOrder)
+      ? s.sharedTaskOrder.filter((id) => typeof id === 'string')
+      : [];
+    const restoredListRowOrder = Array.isArray(s.listRowOrder)
+      ? s.listRowOrder.filter((id) => typeof id === 'string')
+      : [];
+    if (restoredSharedTaskOrder.length > 0) {
+      setSharedTaskOrderState(restoredSharedTaskOrder);
+    }
+    if (restoredListRowOrder.length > 0) {
+      setListRowOrderState(restoredListRowOrder);
+    }
     AsyncStorage.multiSet([
       ['tri_lists', JSON.stringify(restoredLists)],
       ['tri_active_list_id', JSON.stringify(restoredActiveListId)],
@@ -7907,6 +7953,8 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       ['tri_darkMode', JSON.stringify(s.darkMode)],
       ['tri_grocery', JSON.stringify(s.groceryItems)],
       ['tri_list_order', JSON.stringify(s.lists.map(l => l.id))],
+      [SHARED_TASK_ORDER_KEY, JSON.stringify(restoredSharedTaskOrder)],
+      [LIST_ROW_ORDER_KEY, JSON.stringify(restoredListRowOrder)],
     ]).catch(() => {});
     // accentLight/accentDark: nullable, so use removeItem when null.
     if (s.accentLight == null) AsyncStorage.removeItem('tri_accent_light').catch(() => {});
@@ -8172,6 +8220,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   useEffect(() => { sharedTaskIdSetRef.current = sharedTaskIdSet; }, [sharedTaskIdSet]);
 
   useEffect(() => {
+    if (!ready) return;
     const liveIds = sharedTaskLists.map(l => l.id);
     setSharedTaskOrderState(prev => {
       const next = [
@@ -8182,9 +8231,10 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       AsyncStorage.setItem(SHARED_TASK_ORDER_KEY, JSON.stringify(next)).catch(() => {});
       return next;
     });
-  }, [sharedTaskLists]);
+  }, [ready, sharedTaskLists]);
 
   useEffect(() => {
+    if (!ready) return;
     const liveIds = [...lists.map(l => l.id), ...sharedTaskLists.map(l => l.id)];
     const retainedIds = new Set([...liveIds, ...syncedJoinedIds]);
     setListRowOrderState(prev => {
@@ -8196,7 +8246,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       AsyncStorage.setItem(LIST_ROW_ORDER_KEY, JSON.stringify(next)).catch(() => {});
       return next;
     });
-  }, [lists, sharedTaskLists, syncedJoinedIds]);
+  }, [ready, lists, sharedTaskLists, syncedJoinedIds]);
 
   const orderedSharedTaskLists = useMemo(() => {
     const byId = new Map(sharedTaskLists.map(l => [l.id, l]));
