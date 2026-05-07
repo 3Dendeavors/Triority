@@ -2,7 +2,11 @@
 
 ## Unreleased
 
-- No unreleased changes.
+- Recover existing Supabase grocery memberships when the server says the user is already in a shared grocery list, so stale/orphaned memberships can be surfaced in-app instead of blocking sharing.
+
+## v1.4.3
+
+- Hotfix for Supabase shared grocery membership recovery after v1.4.2 exposed accounts with server-side grocery memberships that were missing from local app state.
 
 ## v1.4.2
 

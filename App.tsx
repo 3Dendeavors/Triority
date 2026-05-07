@@ -304,6 +304,12 @@ function supabaseErrorMessage(error: any, fallback: string) {
   return error?.message ? String(error.message) : fallback;
 }
 
+function isSupabaseGroceryMembershipError(message: string) {
+  const normalized = message.toLowerCase();
+  return normalized.includes('already in a shared grocery list')
+    || normalized.includes('already have a shared grocery list');
+}
+
 // In-memory mirror of SUPABASE_SHARED_GROCERY_ID_KEY. AsyncStorage on Android
 // has occasional read-after-write ordering issues across the JNI bridge, which
 // caused freshly-created Supabase groceries to be wiped by an immediate
@@ -1092,6 +1098,29 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     });
     setSharedArchives((prev) => ({ ...prev, [listId]: (archivesRes.data || []).map(mapSupabaseArchive) }));
   }, [forgetSharedListLocally, removeJoinedId]);
+
+  const recoverExistingSupabaseGroceryMembership = useCallback(async (): Promise<string | null> => {
+    if (!user) return null;
+    const { data, error } = await supabase
+      .from('tri_shared_lists')
+      .select('*')
+      .eq('kind', 'grocery')
+      .order('updated_at', { ascending: false })
+      .limit(1);
+    if (error || !Array.isArray(data) || data.length === 0) return null;
+
+    const listId = String(data[0].id || '');
+    if (!isSupabaseSharedListId(listId)) return null;
+
+    // Server-side one-grocery guard says this account is already a member.
+    // Restore that membership locally so the user can reveal the code, leave,
+    // or delete it instead of getting trapped behind the create button.
+    locallyRemovedSharedIdsRef.current.delete(listId);
+    await markSupabaseSharedGroceryActive(listId);
+    await addJoinedId(listId);
+    await refreshSupabaseSharedList(listId).catch(() => {});
+    return listId;
+  }, [addJoinedId, refreshSupabaseSharedList, user]);
 
   // AppState gate: detach all listeners when backgrounded so we don't burn
   // Firestore reads while invisible. Reattach on foreground.
@@ -2123,7 +2152,14 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         10000,
         'Could not create the shared grocery list within 10 seconds. Check connection and try again.',
       );
-      if (result.error) throw new Error(supabaseErrorMessage(result.error, 'Could not create shared grocery list.'));
+      if (result.error) {
+        const message = supabaseErrorMessage(result.error, 'Could not create shared grocery list.');
+        if (isSupabaseGroceryMembershipError(message)) {
+          const recoveredListId = await recoverExistingSupabaseGroceryMembership();
+          if (recoveredListId) return recoveredListId;
+        }
+        throw new Error(message);
+      }
       const listRow = result.data?.list;
       if (!listRow?.id) throw new Error('Could not create shared grocery list.');
       const listId = String(listRow.id);
@@ -2218,7 +2254,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     })().catch(() => {});
 
     return parentRef.id;
-  }, [user, sharedLists, addJoinedId, forgetSharedList, removeJoinedId]);
+  }, [user, sharedLists, addJoinedId, forgetSharedList, removeJoinedId, recoverExistingSupabaseGroceryMembership]);
 
   const value: SharedListsContextValue = {
     sharedLists,
@@ -2483,8 +2519,8 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 18;
-const CURRENT_APP_VERSION_NAME = '1.4.2';
+const CURRENT_APP_VERSION_CODE = 19;
+const CURRENT_APP_VERSION_NAME = '1.4.3';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {
