@@ -3303,6 +3303,53 @@ function Toast({ message, sub }: ToastData) {
 
 // ─── Edit Bottom Sheet ────────────────────────────────────────────────────────
 
+function AiActionReadout({ steps, accentColor }: { steps: string[]; accentColor: string }) {
+  const T = useT();
+  const fade = useRef(new Animated.Value(0)).current;
+  const [stepIndex, setStepIndex] = useState(0);
+  const [text, setText] = useState('');
+  const current = steps[stepIndex] || '';
+
+  useEffect(() => {
+    setStepIndex(0);
+    setText('');
+  }, [steps]);
+
+  useEffect(() => {
+    if (!current) return;
+    let charTimer: ReturnType<typeof setTimeout> | null = null;
+    let nextTimer: ReturnType<typeof setTimeout> | null = null;
+    let pos = 0;
+    setText('');
+    fade.setValue(0);
+    Animated.timing(fade, { toValue: 1, duration: 160, useNativeDriver: true }).start();
+    const tick = () => {
+      pos += 1;
+      setText(current.slice(0, pos));
+      if (pos < current.length) {
+        charTimer = setTimeout(tick, 18);
+      } else if (stepIndex < steps.length - 1) {
+        nextTimer = setTimeout(() => setStepIndex(i => i + 1), 720);
+      }
+    };
+    charTimer = setTimeout(tick, 80);
+    return () => {
+      if (charTimer) clearTimeout(charTimer);
+      if (nextTimer) clearTimeout(nextTimer);
+    };
+  }, [current, fade, stepIndex, steps.length]);
+
+  if (!steps.length) return null;
+  return (
+    <Animated.View style={[styles.aiReadout, { opacity: fade, backgroundColor: T.s2, borderColor: `${accentColor}55` }]}>
+      <Icon name="sparkles" size={13} color={accentColor} strokeWidth={1.8} />
+      <Text numberOfLines={1} style={[styles.aiReadoutText, { color: T.textSub, fontFamily: jks('600') }]}>
+        {text}
+      </Text>
+    </Animated.View>
+  );
+}
+
 interface EditSheetProps {
   task: Task;
   onSave: (t: Task) => void;
@@ -4637,6 +4684,7 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
   const [aiMode, setAiMode] = useState(false);
   const [value, setValue] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
+  const [aiReadoutSteps, setAiReadoutSteps] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
   const spinAnim = useRef(new Animated.Value(0)).current;
   const addGroceryItemsSafely = useCallback((items: GroceryDraft[]) => {
@@ -4653,6 +4701,10 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
       spinAnim.setValue(0);
     }
   }, [aiLoading, spinAnim]);
+
+  const setAiReadout = useCallback((steps: string[]) => {
+    setAiReadoutSteps(steps.filter(Boolean));
+  }, []);
 
   const listeningRef = useRef(false);
   // Wall-clock timestamp of last successful srStart(). End/error events that
@@ -4781,6 +4833,23 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
     return { remindAt, repeatHourly: !!r.repeatHourly, repeatDaily: !!r.repeatDaily };
   };
 
+  const buildAiResultSteps = (
+    totalTasks: number,
+    groceryCount: number,
+    reminderCount: number,
+    routedListNames: string[],
+  ) => {
+    const steps: string[] = [];
+    if (totalTasks > 0) steps.push(`Added ${totalTasks} task${totalTasks === 1 ? '' : 's'}`);
+    if (groceryCount > 0) steps.push(`Detected ${groceryCount} grocery item${groceryCount === 1 ? '' : 's'}`);
+    if (routedListNames.length > 0) {
+      const unique = Array.from(new Set(routedListNames)).slice(0, 2);
+      steps.push(`Routed to ${unique.join(' + ')}`);
+    }
+    if (reminderCount > 0) steps.push(`Set ${reminderCount} reminder${reminderCount === 1 ? '' : 's'}`);
+    return steps.length ? steps : ['Parsed'];
+  };
+
   const submit = async () => {
     const raw = value.trim();
     if (!raw) return;
@@ -4801,6 +4870,7 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
       const storedCtx = await AsyncStorage.getItem('triority-context').then(v => (v ? JSON.parse(v) : ''));
       if (!storedKey) { showToast('No API key set — visit Settings'); return; }
       setAiLoading(true);
+      setAiReadout(groceryMode ? ['Reading list', 'Detecting items'] : ['Reading input', 'Routing actions']);
       try {
         const nowDate = new Date();
         const nowDescr = nowDate.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
@@ -4834,6 +4904,7 @@ Format: ${groceryJsonExample}`;
             .map((item: any) => normalizeGroceryDraft(item, raw, inferGroceryQuantities))
             .filter((item: GroceryDraft | null): item is GroceryDraft => !!item);
           addGroceryItemsSafely(grocItems);
+          setAiReadout(buildAiResultSteps(0, grocItems.length, 0, []));
           showToast(`${grocItems.length} item${grocItems.length !== 1 ? 's' : ''} added`);
         } else {
           // Task view + AI: route tasks to named lists, grocery items to grocery list (paid only)
@@ -4913,13 +4984,17 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
             : [];
 
           let totalTasks = 0;
+          let reminderCount = 0;
+          const routedListNames: string[] = [];
           tasksByList.forEach((items, listId) => {
             totalTasks += items.length;
+            reminderCount += items.filter(t => t.reminder).length;
             if (listId === null) {
               onAddMany(items);
             } else {
               onAddManyToList(listId, items);
               const listName = listMap.find(l => l.id === listId)?.name ?? 'list';
+              routedListNames.push(listName);
               showToast(`${items.length} task${items.length !== 1 ? 's' : ''} added to ${listName}`);
             }
           });
@@ -4940,6 +5015,7 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
             addGroceryItemsSafely(grocItems);
             if (totalTasks === 0) showToast(`${grocItems.length} grocery item${grocItems.length !== 1 ? 's' : ''} added`);
           }
+          setAiReadout(buildAiResultSteps(totalTasks, grocItems.length, reminderCount, routedListNames));
           if (totalTasks === 0 && grocItems.length === 0) {
             showToast('Nothing parsed — try again');
           }
@@ -4988,6 +5064,9 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
           {aiMode && hasApiKey ? <Text style={[styles.aiOnLabel, { color: accentColor, fontFamily: jks('700') }]}>AI On</Text> : null}
         </TouchableOpacity>
       </View>
+      {aiMode && hasApiKey && aiReadoutSteps.length > 0 ? (
+        <AiActionReadout steps={aiReadoutSteps} accentColor={accentColor} />
+      ) : null}
       <View style={styles.inputBarBottomRow}>
         <TextInput
           value={value}
@@ -9841,6 +9920,8 @@ const styles = StyleSheet.create({
   inputBarTopRow: { flexDirection: 'row', gap: 6, marginBottom: 10 },
   inputTopBtn: { flex: 1, height: 34, borderRadius: 8, borderWidth: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 },
   aiOnLabel: { fontSize: 10 },
+  aiReadout: { minHeight: 30, borderRadius: 8, borderWidth: 1, marginBottom: 8, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  aiReadoutText: { flex: 1, fontSize: 12 },
   inputBarBottomRow: { flexDirection: 'row', gap: 8, alignItems: 'center' },
   taskInput: { flex: 1, height: 36, borderRadius: 8, borderWidth: 1, paddingHorizontal: 12, paddingVertical: 0, fontSize: 14, includeFontPadding: false },
   submitBtn: { width: 36, height: 36, borderRadius: 8, alignItems: 'center', justifyContent: 'center', overflow: 'hidden' },
