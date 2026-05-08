@@ -146,6 +146,7 @@ interface GroceryItem {
   category: string;
   quantity?: string;
   unit?: string;
+  packageSize?: string;
   checked: boolean;
   createdAt: number;
 }
@@ -161,6 +162,7 @@ interface GroceryDraft {
   category: string;
   quantity?: string;
   unit?: string;
+  packageSize?: string;
 }
 
 const GROCERY_CATEGORIES = [
@@ -178,12 +180,38 @@ function cleanOptionalGroceryPart(value: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function groceryDisplayName(item: { name?: string; quantity?: string; unit?: string }) {
-  const name = String(item.name || '').trim();
+function cleanPackageSize(value: unknown): string | undefined {
+  const cleaned = cleanOptionalGroceryPart(value);
+  if (!cleaned) return undefined;
+  return cleaned.replace(/^\((.*)\)$/u, '$1').trim() || undefined;
+}
+
+function splitPackageHintFromName(name: string) {
+  const match = name.trim().match(/^(.*?)\s*\(([^()]{2,80})\)\s*$/u);
+  if (!match) return { name: name.trim(), packageSize: undefined as string | undefined };
+  return { name: match[1].trim(), packageSize: cleanPackageSize(match[2]) };
+}
+
+function groceryDisplayParts(item: { name?: string; quantity?: string; unit?: string; packageSize?: string }) {
+  const split = splitPackageHintFromName(String(item.name || ''));
+  const name = split.name;
   const quantity = cleanOptionalGroceryPart(item.quantity);
   const unit = cleanOptionalGroceryPart(item.unit);
+  const packageSize = cleanPackageSize(item.packageSize) || split.packageSize;
   const prefix = [quantity, unit].filter(Boolean).join(' ');
-  return prefix ? `${prefix} ${name}`.trim() : name;
+  return {
+    text: prefix ? `${prefix} ${name}`.trim() : name,
+    packageSize,
+  };
+}
+
+function groceryDisplayName(item: { name?: string; quantity?: string; unit?: string; packageSize?: string }) {
+  return groceryDisplayParts(item).text;
+}
+
+function groceryStorageName(item: { name?: string; quantity?: string; unit?: string; packageSize?: string }) {
+  const parts = groceryDisplayParts(item);
+  return parts.packageSize ? `${parts.text} (${parts.packageSize})` : parts.text;
 }
 
 function shouldInferGroceryQuantities(input: string) {
@@ -212,6 +240,7 @@ function normalizeGroceryDraft(item: any, input = '', allowInferredQuantity = tr
     category,
     quantity: keepQuantity ? cleanOptionalGroceryPart(item.quantity) : undefined,
     unit: keepQuantity ? cleanOptionalGroceryPart(item.unit) : undefined,
+    packageSize: keepQuantity ? cleanPackageSize(item.packageSize ?? item.purchaseSize ?? item.package ?? item.purchaseHint) : undefined,
   });
 }
 
@@ -254,6 +283,7 @@ interface SharedListItem {
   category?: string;
   quantity?: string;
   unit?: string;
+  packageSize?: string;
   checked?: boolean;
   // Common metadata for the per-item avatar + timestamp UI
   createdBy: string;
@@ -467,6 +497,7 @@ function mapSupabaseItem(row: any): SharedListItem {
     category: row.category ?? undefined,
     quantity: row.quantity ?? undefined,
     unit: row.unit ?? undefined,
+    packageSize: row.package_size ?? row.packageSize ?? undefined,
     checked: !!row.checked,
     createdBy: String(row.created_by ?? row.createdBy ?? ''),
     createdAt: epochFromSupabase(row.created_at ?? row.createdAt),
@@ -1818,7 +1849,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         .map((it) => ({
           id: randomUuid(),
           list_id: listId,
-          name: groceryDisplayName(it),
+          name: groceryStorageName(it),
           category: it.category || GROCERY_UNCATEGORIZED,
           checked: false,
           created_by: user.uid,
@@ -1854,6 +1885,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         category: it.category || GROCERY_UNCATEGORIZED,
         quantity: it.quantity,
         unit: it.unit,
+        packageSize: it.packageSize,
         checked: false,
         createdBy: user.uid,
         createdAt: now,
@@ -2329,7 +2361,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       const groceryItems = items
         .filter((it) => it.name.trim())
         .map((it) => ({
-          name: groceryDisplayName(it),
+          name: groceryStorageName(it),
           category: it.category || GROCERY_UNCATEGORIZED,
           checked: !!it.checked,
           createdAt: it.createdAt || now,
@@ -2397,6 +2429,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       category: item.category || GROCERY_UNCATEGORIZED,
       quantity: item.quantity,
       unit: item.unit,
+      packageSize: item.packageSize,
       checked: !!item.checked,
       createdBy: user.uid,
       createdAt: item.createdAt || now + index,
@@ -2431,6 +2464,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
               category: item.category || GROCERY_UNCATEGORIZED,
               quantity: item.quantity,
               unit: item.unit,
+              packageSize: item.packageSize,
               checked: !!item.checked,
               createdBy: user.uid,
               createdAt: item.createdAt || now,
@@ -4648,17 +4682,40 @@ function GroceryItemRow({ item, onCheck, onDelete, accentColor }: GroceryItemRow
           />
         )}
         <View style={{ flex: 1 }}>
-          <Text
-            style={[
-              styles.taskText,
-              {
-                color: item.checked ? T.textMute : T.text,
-                fontFamily: jks('400'),
-                textDecorationLine: item.checked ? 'line-through' : 'none',
-              },
-            ]}>
-            {groceryDisplayName(item)}
-          </Text>
+          {(() => {
+            const display = groceryDisplayParts(item);
+            return (
+              <View style={styles.groceryItemTextRow}>
+                <Text
+                  numberOfLines={2}
+                  style={[
+                    styles.taskText,
+                    styles.groceryItemMainText,
+                    {
+                      color: item.checked ? T.textMute : T.text,
+                      fontFamily: jks('400'),
+                      textDecorationLine: item.checked ? 'line-through' : 'none',
+                    },
+                  ]}>
+                  {display.text}
+                </Text>
+                {display.packageSize ? (
+                  <Text
+                    numberOfLines={1}
+                    style={[
+                      styles.groceryPackageHint,
+                      {
+                        color: item.checked ? T.textMute : T.textSub,
+                        fontFamily: jks('500'),
+                        textDecorationLine: item.checked ? 'line-through' : 'none',
+                      },
+                    ]}>
+                    ({display.packageSize})
+                  </Text>
+                ) : null}
+              </View>
+            );
+          })()}
         </View>
       </Animated.View>
     </View>
@@ -5009,10 +5066,10 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
         const nowDescr = nowDate.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
         const inferGroceryQuantities = shouldInferGroceryQuantities(raw);
         const quantityInstruction = inferGroceryQuantities
-          ? 'Preserve any user-specified quantity and unit in separate "quantity" and "unit" fields. If the user asks for a recipe, project, bill of materials, or material list without exact quantities, infer reasonable starter quantities when practical.'
-          : 'Preserve quantity and unit only when the user explicitly wrote them. Do not infer amounts for a simple item list.';
+          ? 'Preserve any user-specified recipe/project quantity and unit in separate "quantity" and "unit" fields. Also include "packageSize" with the most common smallest purchasable package size for that item, short and brand-free, e.g. "2-pack stick butter", "3 oz box", "5 lb bag". If the user asks for a recipe, project, bill of materials, or material list without exact quantities, infer reasonable starter quantities when practical.'
+          : 'Preserve quantity and unit only when the user explicitly wrote them. Do not infer amounts or packageSize for a simple item list.';
         const groceryJsonExample = inferGroceryQuantities
-          ? '[{"name":"eggs","quantity":"12","unit":"count","category":"Dairy"},{"name":"deck screws","quantity":"1","unit":"box","category":"Fasteners"}]'
+          ? '[{"name":"butter","quantity":"2","unit":"tbsp","packageSize":"2-pack stick butter","category":"Dairy"},{"name":"baking powder","quantity":"1","unit":"tsp","packageSize":"3 oz box","category":"Canned & Dry Goods"},{"name":"deck screws","quantity":"1","unit":"box","packageSize":"1 lb box","category":"Fasteners"}]'
           : '[{"name":"eggs","category":"Dairy"},{"name":"bread","category":"Bakery"},{"name":"milk","category":"Dairy"}]';
 
         if (groceryMode) {
@@ -9070,6 +9127,7 @@ function TriorityApp() {
       category: item.category || GROCERY_UNCATEGORIZED,
       quantity: cleanOptionalGroceryPart(item.quantity),
       unit: cleanOptionalGroceryPart(item.unit),
+      packageSize: cleanPackageSize(item.packageSize),
       checked: false,
       createdAt: now + i,
     }));
@@ -9785,6 +9843,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       category: it.category || GROCERY_UNCATEGORIZED,
       quantity: it.quantity,
       unit: it.unit,
+      packageSize: it.packageSize,
       checked: !!it.checked,
       createdAt: it.createdAt || 0,
     }));
@@ -10058,6 +10117,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
                     category: item.category || GROCERY_UNCATEGORIZED,
                     quantity: item.quantity,
                     unit: item.unit,
+                    packageSize: item.packageSize,
                     checked: !!item.checked,
                     createdAt: item.createdAt || now + index,
                   }));
@@ -10242,6 +10302,9 @@ const styles = StyleSheet.create({
   groceryViewSwitchLabel: { fontSize: 12 },
   groceryCategoryHeaderRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 16, marginBottom: 6, paddingLeft: 2 },
   groceryCategoryHeader: { fontSize: 11, letterSpacing: 0.6, textTransform: 'uppercase', marginTop: 16, marginBottom: 6, paddingLeft: 2 },
+  groceryItemTextRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  groceryItemMainText: { flex: 1, minWidth: 0 },
+  groceryPackageHint: { maxWidth: 132, flexShrink: 0, fontSize: 11, lineHeight: 16 },
   groceryClearPill: { alignItems: 'center', paddingHorizontal: 12, paddingTop: 5, paddingBottom: 4, borderRadius: 16, borderWidth: 1 },
   groceryClearHint: { fontSize: 8, marginTop: 1 },
 
