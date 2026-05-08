@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.4.4
+
 - Recover existing Supabase grocery memberships when the server says the user is already in a shared grocery list, so stale/orphaned memberships can be surfaced in-app instead of blocking sharing.
 - Replaced the recent-add soft glow with a short gold shine/glint animation for newly added task and grocery rows.
 - Center the horizontal task-list pill row on the selected list when the active list changes.
