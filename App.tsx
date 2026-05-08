@@ -4884,15 +4884,17 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
 
         if (groceryMode) {
           // Grocery-only AI: parse items with category assignment
-          const systemPrompt = `You are a grocery and materials list assistant. Parse the user input into individual purchasable items. For each item, assign a category from this list: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}" if none fit.
+          const systemPrompt = `Parse purchasable grocery or material items into compact JSON.
+Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
 ${quantityInstruction}
+Rules: split obvious separate items; keep names short; no notes; no extra keys.
 
 Return ONLY valid JSON, no other text, no markdown.
 Format: ${groceryJsonExample}`;
           const resp = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': storedKey, 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 600, system: systemPrompt, messages: [{ role: 'user', content: raw }] }),
+            body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 450, temperature: 0, system: systemPrompt, messages: [{ role: 'user', content: raw }] }),
           });
           const data = await resp.json();
           if (!resp.ok) throw new Error(JSON.stringify(data));
@@ -4912,21 +4914,23 @@ Format: ${groceryJsonExample}`;
           const multiList = isPaid && listMap.length > 1;
           const groceryEnabled = isPaid;
 
-          const systemPrompt = `You are a smart assistant that routes user input to task lists${groceryEnabled ? ' or a grocery list' : ''}.
+          const systemPrompt = `Route user input into concise Triority JSON.
 
 CURRENT LOCAL TIME: ${nowDescr}
 ${multiList ? `\nAVAILABLE LISTS: ${JSON.stringify(listMap)}\nACTIVE LIST ID: ${activeListId}\n` : ''}
 ${groceryEnabled
-  ? `Classify each item as a "task" (something to do) or a "grocery" item (something to buy at a store, hardware store, or supply store).
-- Grocery/material items get a category from: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
+  ? `Classify each item as:
+- task: something to do
+- grocery: something to buy at a store, hardware store, or supply store
+Grocery/material categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
 - ${quantityInstruction}`
   : 'All items are tasks.'}
 ${multiList
   ? `For tasks: if the user mentions a specific list by name, set listId to that list's id. Otherwise use null (= active list). Match list names case-insensitively and partially (e.g. "new list 1" matches "New List 1").`
   : ''}
-Tasks get a tier (high/medium/low) and optional reminder.
+Tasks get tier high/medium/low. Use high only for urgent/important, low for optional/light, otherwise medium.
 
-For tasks: if the user wants a reminder, include reminder fields:
+If the user wants a reminder, include reminder:
 - daysFromNow: integer (0=today, 1=tomorrow, etc.)
 - hour: integer 0-23 (24-hour)
 - minute: integer 0-59 (default 0)
@@ -4938,7 +4942,7 @@ TIME INTERPRETATION:
 - "tonight" = hour 20, "this evening" = hour 19, "tomorrow morning" = daysFromNow:1 hour:9
 - "in an hour" / "in 2 hours" — calculate from CURRENT LOCAL TIME
 
-For task text and grocery/material item names: clean, short descriptions. No timing words in task text. Do not duplicate quantity/unit inside the item name.
+Output rules: valid JSON only; no prose; no markdown; no extra keys; short task text and item names; no timing words in task text; do not duplicate quantity/unit inside item name.
 
 Return ONLY valid JSON, no markdown:
 ${multiList
@@ -4950,7 +4954,7 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': storedKey, 'anthropic-version': '2023-06-01' },
             body: JSON.stringify({
-              model: 'claude-sonnet-4-20250514', max_tokens: 1200,
+              model: 'claude-sonnet-4-20250514', max_tokens: 900, temperature: 0,
               system: storedCtx ? systemPrompt + ` User context: ${storedCtx}` : systemPrompt,
               messages: [{ role: 'user', content: raw }],
             }),
