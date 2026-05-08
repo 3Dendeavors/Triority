@@ -39,6 +39,7 @@ android/keystore.properties
 # Secrets / tester artifacts (must never be committed)
 revenuecat-*.json
 promotion_codes.csv
+github-recovery-codes.txt
 
 # node.js
 #

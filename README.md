@@ -12,6 +12,8 @@ The current public beta APK is published on GitHub Releases:
 
 Install the APK on Android by downloading it from the latest release and accepting Android's sideload/install prompt. Future installed builds check this repo's `latest.json` and prompt when a newer APK is available.
 
+Use the release APK asset for installs. Source-code archives attached to GitHub tags are not Android installers.
+
 ## What It Does
 
 - Tasks organized into High, Medium, and Low tiers.
@@ -22,6 +24,7 @@ Install the APK on Android by downloading it from the latest release and accepti
 - Local reminders for tasks.
 - Optional AI triage using your own Claude API key.
 - Themes, accent colors, and personal context for AI prompting.
+- Optional support through Buy Me a Coffee: https://buymeacoffee.com/3DEndeavors
 
 ## Privacy
 
@@ -50,4 +53,4 @@ Release signing files and Firebase config are intentionally not committed. See `
 
 ## Current Status
 
-The current public beta is `v1.4.4` / `versionCode 20`, a polish release with recent-add shine feedback, cleaner list headers, contextual shared-list joining, and active shared-grocery AI routing.
+The current public beta is `v1.4.4` / `versionCode 20`, a polish release with recent-add shine feedback, cleaner list headers, contextual shared-list joining, and active shared-grocery AI routing. The `main` branch is intended to match the latest public APK source.

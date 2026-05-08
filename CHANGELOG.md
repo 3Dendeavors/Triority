@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Documentation pass: recorded v1.4.4 as the current public APK release, clarified that GitHub releases must include an APK asset, and preserved Ross's keyboard-sheet and public-repo preferences for future sessions.
+- Added the Buy Me a Coffee support link so Settings can show the Support Triority row.
+- Verified the support row/link, keyboard/list-modal polish, and active shared-grocery AI routing in local testing.
+- Updated planning docs to mark v1.4.4 field use, task-list pill centering, Make Private, and membership restore as verified, and moved collapse persistence, grocery/material flexibility, quantity handling, shared reminders, AI readouts, and late-cycle onboarding into the active next-feature list.
+- Persisted collapsed/expanded group state for task tiers, grocery categories/Got It, and archive week groups.
+- Expanded grocery categories with lightweight material-shopping groups for hardware, lumber, electrical, plumbing, automotive, office supplies, tools, paint, and fasteners.
+- Updated AI grocery/material parsing to preserve specified quantities/units and infer practical starter quantities for generated project/material lists where reasonable.
+- Added notification-permission nudges when users share or join lists, and when they enable a task reminder.
+
 ## v1.4.4
 
 - Recover existing Supabase grocery memberships when the server says the user is already in a shared grocery list, so stale/orphaned memberships can be surfaced in-app instead of blocking sharing.

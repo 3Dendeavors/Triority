@@ -83,6 +83,7 @@ type Tier = 'high' | 'medium' | 'low';
 type Screen = 'list' | 'grocery' | 'archive' | 'settings';
 type SortMode = 'week' | 'range';
 type AutoClear = 'Never' | '7 days' | '30 days' | '90 days';
+type CollapsedGroups = Record<string, boolean>;
 // Private tasks use number IDs (epoch-ms-based for monotonic ordering).
 // Shared task list items use Firestore doc IDs (strings) so writes can target
 // /sharedLists/{listId}/items/{itemId} directly. The TaskRow and handler
@@ -138,15 +139,54 @@ interface GroceryItem {
   id: string;
   name: string;
   category: string;
+  quantity?: string;
+  unit?: string;
   checked: boolean;
   createdAt: number;
 }
 
+interface GroceryDraft {
+  name: string;
+  category: string;
+  quantity?: string;
+  unit?: string;
+}
+
 const GROCERY_CATEGORIES = [
   'Produce', 'Dairy', 'Meat & Seafood', 'Bakery', 'Frozen',
-  'Canned & Dry Goods', 'Beverages', 'Snacks', 'Household', 'Personal Care', 'Other',
+  'Canned & Dry Goods', 'Beverages', 'Snacks', 'Household', 'Personal Care',
+  'Hardware', 'Lumber', 'Electrical', 'Plumbing', 'Automotive', 'Office Supplies',
+  'Tools', 'Paint', 'Fasteners', 'Other',
 ];
 const GROCERY_UNCATEGORIZED = 'Uncategorized';
+
+function cleanOptionalGroceryPart(value: unknown): string | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function groceryDisplayName(item: { name?: string; quantity?: string; unit?: string }) {
+  const name = String(item.name || '').trim();
+  const quantity = cleanOptionalGroceryPart(item.quantity);
+  const unit = cleanOptionalGroceryPart(item.unit);
+  const prefix = [quantity, unit].filter(Boolean).join(' ');
+  return prefix ? `${prefix} ${name}`.trim() : name;
+}
+
+function normalizeGroceryDraft(item: any): GroceryDraft | null {
+  const name = typeof item?.name === 'string' ? item.name.trim() : '';
+  if (!name) return null;
+  const validCats = new Set([...GROCERY_CATEGORIES, GROCERY_UNCATEGORIZED]);
+  const category = validCats.has(item.category) ? item.category : GROCERY_UNCATEGORIZED;
+  return stripUndefined({
+    name,
+    category,
+    quantity: cleanOptionalGroceryPart(item.quantity),
+    unit: cleanOptionalGroceryPart(item.unit),
+  });
+}
 
 // ─── Shared list types (Phase 2) ─────────────────────────────────────────────
 // Whole-list sharing, Pro-gated, short-code invite. Lives in its own Firestore
@@ -185,6 +225,8 @@ interface SharedListItem {
   // Grocery-shape fields (kind === 'grocery')
   name?: string;
   category?: string;
+  quantity?: string;
+  unit?: string;
   checked?: boolean;
   // Common metadata for the per-item avatar + timestamp UI
   createdBy: string;
@@ -240,6 +282,7 @@ const LIST_ROW_ORDER_KEY = 'tri_list_row_order';
 const SHARED_GROCERY_TOGGLE_KEY = 'tri_shared_grocery_view';   // '1' = viewing shared, '0' or absent = viewing private
 const SUPABASE_SHARED_GROCERY_ID_KEY = 'tri_supabase_shared_grocery_id_v1';
 const SHARED_CACHE_KEY = 'tri_shared_cache_v1';
+const COLLAPSED_GROUPS_KEY = 'tri_collapsed_groups_v1';
 const SHARED_STALE_RESTORE_CUTOFF_MS = new Date('2026-05-07T00:00:00-04:00').getTime();
 
 function isMissingOrPermissionError(e: any) {
@@ -393,6 +436,8 @@ function mapSupabaseItem(row: any): SharedListItem {
     completed: false,
     name: row.name ?? undefined,
     category: row.category ?? undefined,
+    quantity: row.quantity ?? undefined,
+    unit: row.unit ?? undefined,
     checked: !!row.checked,
     createdBy: String(row.created_by ?? row.createdBy ?? ''),
     createdAt: epochFromSupabase(row.created_at ?? row.createdAt),
@@ -484,12 +529,9 @@ function withTimeout<T>(promise: PromiseLike<T>, ms: number, message: string): P
 // hardcoded true so all formerly-Pro features unlock for everyone.
 //
 // Settings shows a "Support Triority" row that opens DonateSheet linking to
-// these URLs. The row hides itself if BOTH URLs are empty. Fill these
-// in before the GitHub release goes out.
-//
-// TODO: paste real URLs before publishing a donation-enabled GitHub release.
+// these URLs. The row hides itself if BOTH URLs are empty.
 const TRIORITY_PATREON_URL = '';
-const TRIORITY_BMAC_URL = '';
+const TRIORITY_BMAC_URL = 'https://buymeacoffee.com/3DEndeavors';
 
 // Legacy constants retained so existing references compile. The stub provider
 // below ignores RC_API_KEY_ANDROID; deleting it would just be churn for the
@@ -812,7 +854,7 @@ interface SharedListsContextValue {
   deleteSharedTaskItem: (listId: string, itemId: string) => Promise<void>;
   archiveSharedTaskItem: (listId: string, itemId: string, item: { text: string; tier: Tier; createdAt?: number }) => Promise<void>;
   deleteSharedArchiveItem: (listId: string, archiveId: string) => Promise<void>;
-  addSharedGroceryItems: (listId: string, items: { name: string; category: string }[]) => Promise<void>;
+  addSharedGroceryItems: (listId: string, items: GroceryDraft[]) => Promise<void>;
   updateSharedGroceryItem: (listId: string, itemId: string, patch: { name?: string; category?: string; checked?: boolean }) => Promise<void>;
   deleteSharedGroceryItem: (listId: string, itemId: string) => Promise<void>;
   deleteSharedGroceryItems: (listId: string, itemIds: string[]) => Promise<void>;
@@ -1627,7 +1669,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     await deleteDoc(doc(db, 'sharedLists', listId, 'archive', archiveId));
   }, [user]);
 
-  const addSharedGroceryItems = useCallback(async (listId: string, items: { name: string; category: string }[]) => {
+  const addSharedGroceryItems = useCallback(async (listId: string, items: GroceryDraft[]) => {
     if (!user) throw new Error('Not signed in');
     if (items.length === 0) return;
     if (isSupabaseSharedListId(listId)) {
@@ -1636,7 +1678,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         .map((it) => ({
           id: randomUuid(),
           list_id: listId,
-          name: it.name.trim(),
+          name: groceryDisplayName(it),
           category: it.category || GROCERY_UNCATEGORIZED,
           checked: false,
           created_by: user.uid,
@@ -1670,6 +1712,8 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       const data: Omit<SharedListItem, 'id'> = {
         name,
         category: it.category || GROCERY_UNCATEGORIZED,
+        quantity: it.quantity,
+        unit: it.unit,
         checked: false,
         createdBy: user.uid,
         createdAt: now,
@@ -2143,7 +2187,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       const groceryItems = items
         .filter((it) => it.name.trim())
         .map((it) => ({
-          name: it.name,
+          name: groceryDisplayName(it),
           category: it.category || GROCERY_UNCATEGORIZED,
           checked: !!it.checked,
           createdAt: it.createdAt || now,
@@ -2209,6 +2253,8 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       id: `grocery_${stableFirestoreId(String(item.id))}`,
       name: item.name,
       category: item.category || GROCERY_UNCATEGORIZED,
+      quantity: item.quantity,
+      unit: item.unit,
       checked: !!item.checked,
       createdBy: user.uid,
       createdAt: item.createdAt || now + index,
@@ -2241,6 +2287,8 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
             const itemData: Omit<SharedListItem, 'id'> = {
               name: item.name,
               category: item.category || GROCERY_UNCATEGORIZED,
+              quantity: item.quantity,
+              unit: item.unit,
               checked: !!item.checked,
               createdBy: user.uid,
               createdAt: item.createdAt || now,
@@ -2600,13 +2648,27 @@ function ensurePersonalListPresent(lists: TaskList[] = []): TaskList[] {
   ];
 }
 
+function parseCollapsedGroups(raw: string | null): CollapsedGroups {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.entries(parsed).reduce<CollapsedGroups>((acc, [key, value]) => {
+      if (typeof value === 'boolean') acc[key] = value;
+      return acc;
+    }, {});
+  } catch {
+    return {};
+  }
+}
+
 async function loadAll() {
   const version = await AsyncStorage.getItem('tri_version');
   if (version !== APP_VERSION) {
     await AsyncStorage.multiRemove(['tri_tasks', 'tri_archive', 'tri_lists', 'tri_active_list_id']);
     await AsyncStorage.setItem('tri_version', APP_VERSION);
   }
-  const [listsRaw, legacyTasks, archive, activeIdRaw, legacyAccent, accentLightRaw, accentDarkRaw, themeRaw, darkMode, defaultTier, autoClear, context, onboarded, listOrderRaw, customThemeRaw, customThemesRaw, groceryRaw] = await Promise.all([
+  const [listsRaw, legacyTasks, archive, activeIdRaw, legacyAccent, accentLightRaw, accentDarkRaw, themeRaw, darkMode, defaultTier, autoClear, context, onboarded, listOrderRaw, customThemeRaw, customThemesRaw, groceryRaw, collapsedGroupsRaw] = await Promise.all([
     AsyncStorage.getItem('tri_lists'),
     AsyncStorage.getItem('tri_tasks'),
     AsyncStorage.getItem('tri_archive'),
@@ -2624,6 +2686,7 @@ async function loadAll() {
     AsyncStorage.getItem('tri_custom_theme'),
     AsyncStorage.getItem('tri_custom_themes'),
     AsyncStorage.getItem('tri_grocery'),
+    AsyncStorage.getItem(COLLAPSED_GROUPS_KEY),
   ]);
   // API key is stored encrypted for security
   let apiKey = '';
@@ -2763,6 +2826,7 @@ async function loadAll() {
     onboarded: onboarded === '1',
     customThemeDrafts,
     groceryItems,
+    collapsedGroups: parseCollapsedGroups(collapsedGroupsRaw),
   };
 }
 
@@ -2981,6 +3045,14 @@ async function ensureNotifPermission(): Promise<boolean> {
       || settings.authorizationStatus === AuthorizationStatus.PROVISIONAL;
 }
 
+async function requestReminderNotifications(showToast?: (msg: string, sub?: string) => void): Promise<boolean> {
+  const ok = await ensureNotifPermission();
+  if (!ok) {
+    showToast?.('Notifications are off', 'Enable notifications if you want reminders');
+  }
+  return ok;
+}
+
 function notifIdForTask(taskId: TaskId): string {
   return `tri-task-${taskId}`;
 }
@@ -3072,7 +3144,7 @@ async function scheduleRemindersBatch(
   const remTasks = tasks.filter(t => t.reminder);
   if (remTasks.length === 0) return;
 
-  const notifOk = await ensureNotifPermission();
+  const notifOk = await requestReminderNotifications(showToast);
   if (!notifOk) {
     showToast('Reminders need notification permission', 'Enable in Settings');
     return;
@@ -3210,13 +3282,15 @@ interface EditSheetProps {
   onSave: (t: Task) => void;
   onCancel: () => void;
   accentColor: string;
+  showToast?: (msg: string, sub?: string) => void;
 }
 
 // Shared reminder picker UI used by both EditSheet and PriorityPicker
-function ReminderPicker({ reminder, onChange, accentColor }: {
+function ReminderPicker({ reminder, onChange, accentColor, showToast }: {
   reminder: Reminder | undefined;
   onChange: (r: Reminder | undefined) => void;
   accentColor: string;
+  showToast?: (msg: string, sub?: string) => void;
 }) {
   const T = useT();
   const on = !!reminder;
@@ -3292,7 +3366,7 @@ function ReminderPicker({ reminder, onChange, accentColor }: {
     } else {
       // Ask for notification permission at the moment the user expresses intent
       // so the system prompt comes inline with their action, not later
-      ensureNotifPermission().catch(() => {});
+      requestReminderNotifications(showToast).catch(() => {});
       onChange({ remindAt: buildTs(hour12, minute, isPm, daysAhead), repeatHourly, repeatDaily });
     }
   };
@@ -3370,7 +3444,7 @@ function ReminderPicker({ reminder, onChange, accentColor }: {
   );
 }
 
-function EditSheet({ task, onSave, onCancel, accentColor }: EditSheetProps) {
+function EditSheet({ task, onSave, onCancel, accentColor, showToast }: EditSheetProps) {
   const T = useT();
   const TIERS = TIERS_DEF(T);
   const insets = useSafeAreaInsets();
@@ -3499,7 +3573,7 @@ function EditSheet({ task, onSave, onCancel, accentColor }: EditSheetProps) {
                 </TouchableOpacity>
               ))}
             </View>
-            <ReminderPicker reminder={reminder} onChange={setReminder} accentColor={accentColor} />
+            <ReminderPicker reminder={reminder} onChange={setReminder} accentColor={accentColor} showToast={showToast} />
           </ScrollView>
           <View style={[styles.sheetFooter, { borderTopColor: T.border, backgroundColor: T.s1 }]}>
             <View style={styles.sheetActions}>
@@ -4000,11 +4074,12 @@ interface TierGroupProps {
   // Edge-scroll bridge: TierGroup reports the *page* Y of the dragged finger,
   // ActiveList drives the actual ScrollView scroll because it owns the ref.
   onDragMove?: (pageY: number | null) => void;
+  collapsed: boolean;
+  onCollapsedChange: (collapsed: boolean) => void;
 }
 
-function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit, accentColor, onReorderInTier, onDragMove }: TierGroupProps) {
+function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit, accentColor, onReorderInTier, onDragMove, collapsed, onCollapsedChange }: TierGroupProps) {
   const T = useT();
-  const [collapsed, setCollapsed] = useState(false);
 
   // Drag state. dragId = id of the task currently being dragged (null = no drag).
   // dragOffsetY = signed offset from the dragged row's resting Y, used to translate
@@ -4068,7 +4143,7 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
 
   return (
     <View style={{ marginBottom: 20 }}>
-      <TouchableOpacity onPress={() => setCollapsed(c => !c)} style={styles.tierHeader} activeOpacity={0.7}>
+      <TouchableOpacity onPress={() => onCollapsedChange(!collapsed)} style={styles.tierHeader} activeOpacity={0.7}>
         <View style={[styles.tierHeaderDot, { backgroundColor: tier.color }]} />
         <Text style={[styles.tierHeaderLabel, { color: tier.color, fontFamily: jks('700') }]}>{tier.label}</Text>
         <Text style={[styles.tierHeaderCount, { color: T.textMute, fontFamily: jks('600') }]}>{tasks.length}</Text>
@@ -4353,7 +4428,7 @@ function GroceryItemRow({ item, onCheck, onDelete, accentColor }: GroceryItemRow
                 textDecorationLine: item.checked ? 'line-through' : 'none',
               },
             ]}>
-            {item.name}
+            {groceryDisplayName(item)}
           </Text>
         </View>
       </Animated.View>
@@ -4378,9 +4453,12 @@ interface GroceryScreenProps {
   defaultTier: Tier;
   showToast: (msg: string, sub?: string, sticky?: boolean) => void;
   dismissToast: () => void;
+  groupCollapseScope: string;
+  collapsedGroups: CollapsedGroups;
+  setCollapsedGroup: (key: string, collapsed: boolean) => void;
 }
 
-function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, onSortAlpha, onAiSort, hasApiKey, accentColor, sortMode }: GroceryScreenProps) {
+function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, onSortAlpha, onAiSort, hasApiKey, accentColor, sortMode, groupCollapseScope, collapsedGroups, setCollapsedGroup }: GroceryScreenProps) {
   const T = useT();
   const [confirmNode, confirm] = useConfirm(accentColor);
 
@@ -4414,14 +4492,34 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
     <GroceryItemRow key={item.id} item={item} onCheck={onCheck} onDelete={onDelete} accentColor={accentColor} />
   ));
 
-  const renderGrouped = () => (sortedActive as { category: string; items: GroceryItem[] }[]).map(group => (
-    <View key={group.category}>
-      <Text style={[styles.groceryCategoryHeader, { color: T.textSub, fontFamily: jks('700') }]}>{group.category}</Text>
-      {group.items.map(item => (
-        <GroceryItemRow key={item.id} item={item} onCheck={onCheck} onDelete={onDelete} accentColor={accentColor} />
-      ))}
-    </View>
-  ));
+  const groceryGroupKey = (group: string) => `grocery:${groupCollapseScope}:${group}`;
+  const renderGroceryGroupHeader = (label: string, count: number, key: string, muted = false) => {
+    const collapsed = collapsedGroups[key] ?? false;
+    return (
+      <TouchableOpacity
+        onPress={() => setCollapsedGroup(key, !collapsed)}
+        style={styles.groceryCategoryHeaderRow}
+        activeOpacity={0.7}>
+        <Text style={[styles.groceryCategoryHeader, { color: muted ? T.textMute : T.textSub, fontFamily: jks('700'), marginTop: 0, marginBottom: 0, paddingLeft: 0 }]}>{label}</Text>
+        <View style={{ flex: 1 }} />
+        <Text style={[styles.archiveWeekCount, { color: T.textMute, fontFamily: jks('400') }]}>{count}</Text>
+        <Feather name={collapsed ? 'chevron-down' : 'chevron-up'} size={14} color={T.textMute} />
+      </TouchableOpacity>
+    );
+  };
+
+  const renderGrouped = () => (sortedActive as { category: string; items: GroceryItem[] }[]).map(group => {
+    const key = groceryGroupKey(`category:${group.category}`);
+    const collapsed = collapsedGroups[key] ?? false;
+    return (
+      <View key={group.category}>
+        {renderGroceryGroupHeader(group.category, group.items.length, key)}
+        {!collapsed && group.items.map(item => (
+          <GroceryItemRow key={item.id} item={item} onCheck={onCheck} onDelete={onDelete} accentColor={accentColor} />
+        ))}
+      </View>
+    );
+  });
 
   return (
     <View style={{ flex: 1, backgroundColor: T.bg }}>
@@ -4477,8 +4575,8 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
             {sortMode === 'alpha' ? renderFlatAlpha() : renderGrouped()}
             {gotItCount > 0 && (
               <View style={{ marginTop: 20 }}>
-                <Text style={[styles.groceryCategoryHeader, { color: T.textMute, fontFamily: jks('700') }]}>Got it</Text>
-                {gotItItems.map(item => (
+                {renderGroceryGroupHeader('Got it', gotItCount, groceryGroupKey('got-it'), true)}
+                {!(collapsedGroups[groceryGroupKey('got-it')] ?? false) && gotItItems.map(item => (
                   <GroceryItemRow key={item.id} item={item} onCheck={onCheck} onDelete={onDelete} accentColor={accentColor} />
                 ))}
               </View>
@@ -4496,7 +4594,7 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
 interface InputBarProps {
   onAddMany: (items: { text: string; tier: Tier; reminder?: Reminder }[]) => void;
   onAddManyToList: (listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => void;
-  onAddGroceryItems: (items: { name: string; category: string }[]) => void | Promise<void>;
+  onAddGroceryItems: (items: GroceryDraft[]) => void | Promise<void>;
   hasApiKey: boolean;
   accentColor: string;
   defaultTier: Tier;
@@ -4515,7 +4613,7 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
   const [aiLoading, setAiLoading] = useState(false);
   const [listening, setListening] = useState(false);
   const spinAnim = useRef(new Animated.Value(0)).current;
-  const addGroceryItemsSafely = useCallback((items: { name: string; category: string }[]) => {
+  const addGroceryItemsSafely = useCallback((items: GroceryDraft[]) => {
     Promise.resolve(onAddGroceryItems(items)).catch((e) => {
       showToast('Could not add groceries', e?.message || 'Check connection');
     });
@@ -4683,10 +4781,11 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
 
         if (groceryMode) {
           // Grocery-only AI: parse items with category assignment
-          const systemPrompt = `You are a grocery list assistant. Parse the user input into individual grocery items. For each item, assign a category from this list: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}" if none fit.
+          const systemPrompt = `You are a grocery and materials list assistant. Parse the user input into individual purchasable items. For each item, assign a category from this list: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}" if none fit.
+Preserve any user-specified quantity and unit in separate "quantity" and "unit" fields. If the user asks for a project/material list without exact quantities, infer reasonable starter quantities when practical.
 
 Return ONLY valid JSON, no other text, no markdown.
-Format: [{"name":"eggs","category":"Dairy"},{"name":"bread","category":"Bakery"}]`;
+Format: [{"name":"eggs","quantity":"12","unit":"count","category":"Dairy"},{"name":"deck screws","quantity":"1","unit":"box","category":"Fasteners"}]`;
           const resp = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': storedKey, 'anthropic-version': '2023-06-01' },
@@ -4698,13 +4797,9 @@ Format: [{"name":"eggs","category":"Dairy"},{"name":"bread","category":"Bakery"}
           const cleaned = rawText.replace(/```json\s*/gi, '').replace(/```/g, '').trim();
           const parsed = JSON.parse(cleaned);
           if (!Array.isArray(parsed)) throw new Error('Not an array');
-          const validCats = new Set([...GROCERY_CATEGORIES, GROCERY_UNCATEGORIZED]);
           const grocItems = parsed
-            .map((item: any) => ({
-              name: String(item.name ?? '').trim(),
-              category: validCats.has(item.category) ? item.category : GROCERY_UNCATEGORIZED,
-            }))
-            .filter((item: any) => item.name);
+            .map(normalizeGroceryDraft)
+            .filter((item: GroceryDraft | null): item is GroceryDraft => !!item);
           addGroceryItemsSafely(grocItems);
           showToast(`${grocItems.length} item${grocItems.length !== 1 ? 's' : ''} added`);
         } else {
@@ -4718,8 +4813,9 @@ Format: [{"name":"eggs","category":"Dairy"},{"name":"bread","category":"Bakery"}
 CURRENT LOCAL TIME: ${nowDescr}
 ${multiList ? `\nAVAILABLE LISTS: ${JSON.stringify(listMap)}\nACTIVE LIST ID: ${activeListId}\n` : ''}
 ${groceryEnabled
-  ? `Classify each item as a "task" (something to do) or a "grocery" item (something to buy at a store).
-- Grocery items get a category from: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".`
+  ? `Classify each item as a "task" (something to do) or a "grocery" item (something to buy at a store, hardware store, or supply store).
+- Grocery/material items get a category from: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
+- Preserve specified quantity and unit separately. For generated project/material lists, infer reasonable starter quantities when practical.`
   : 'All items are tasks.'}
 ${multiList
   ? `For tasks: if the user mentions a specific list by name, set listId to that list's id. Otherwise use null (= active list). Match list names case-insensitively and partially (e.g. "new list 1" matches "New List 1").`
@@ -4738,11 +4834,11 @@ TIME INTERPRETATION:
 - "tonight" = hour 20, "this evening" = hour 19, "tomorrow morning" = daysFromNow:1 hour:9
 - "in an hour" / "in 2 hours" — calculate from CURRENT LOCAL TIME
 
-For task text and grocery item names: clean, short descriptions. No timing words in task text.
+For task text and grocery/material item names: clean, short descriptions. No timing words in task text. Do not duplicate quantity/unit inside the item name.
 
 Return ONLY valid JSON, no markdown:
 ${multiList
-  ? '{"tasks":[{"text":"call dentist","tier":"medium","listId":null,"reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":[{"name":"eggs","category":"Dairy"}]}'
+  ? '{"tasks":[{"text":"call dentist","tier":"medium","listId":null,"reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":[{"name":"eggs","quantity":"12","unit":"count","category":"Dairy"}]}'
   : '{"tasks":[{"text":"call dentist","tier":"medium","reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":[]}'}
 Omit reminder field if no reminder. Either array can be empty. listId must be a valid id from AVAILABLE LISTS or null.`;
 
@@ -4762,7 +4858,6 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
           const parsed = JSON.parse(cleaned);
 
           const VALID_TIER = new Set<string>(['high', 'medium', 'low']);
-          const validCats = new Set([...GROCERY_CATEGORIES, GROCERY_UNCATEGORIZED]);
           const validListIds = new Set(listMap.map(l => l.id));
 
           // Group tasks by target list
@@ -4780,11 +4875,8 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
 
           const grocItems = groceryEnabled
             ? (Array.isArray(parsed.grocery) ? parsed.grocery : [])
-                .map((item: any) => ({
-                  name: String(item.name ?? '').trim(),
-                  category: validCats.has(item.category) ? item.category : GROCERY_UNCATEGORIZED,
-                }))
-                .filter((item: any) => item.name)
+                .map(normalizeGroceryDraft)
+                .filter((item: GroceryDraft | null): item is GroceryDraft => !!item)
             : [];
 
           let totalTasks = 0;
@@ -4890,6 +4982,7 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
           onPick={pickPriority}
           onCancel={() => setPickerOpen(false)}
           accentColor={accentColor}
+          showToast={showToast}
         />
       )}
     </View>
@@ -4967,9 +5060,10 @@ interface PriorityPickerProps {
   onPick: (tier: Tier, reminder?: Reminder) => void;
   onCancel: () => void;
   accentColor: string;
+  showToast?: (msg: string, sub?: string) => void;
 }
 
-function PriorityPicker({ taskText, onPick, onCancel, accentColor }: PriorityPickerProps) {
+function PriorityPicker({ taskText, onPick, onCancel, accentColor, showToast }: PriorityPickerProps) {
   const T = useT();
   const TIERS = TIERS_DEF(T);
   const slideAnim = useRef(new Animated.Value(400)).current;
@@ -4994,7 +5088,7 @@ function PriorityPicker({ taskText, onPick, onCancel, accentColor }: PriorityPic
           <Text numberOfLines={3} style={[styles.pickerPreview, { color: T.text, backgroundColor: T.s2, borderColor: T.border, fontFamily: jks('500') }]}>
             {taskText}
           </Text>
-          <ReminderPicker reminder={reminder} onChange={setReminder} accentColor={accentColor} />
+          <ReminderPicker reminder={reminder} onChange={setReminder} accentColor={accentColor} showToast={showToast} />
           <View style={[styles.pickerTierCol, { marginTop: 12 }]}>
             {TIERS.map(t => (
               <TouchableOpacity key={t.id} onPress={() => onPick(t.id, reminder)} activeOpacity={0.75}
@@ -5945,7 +6039,7 @@ interface ActiveListProps {
   renameList: (id: string, name: string) => void;
   deleteList: (id: string) => void;
   reorderLists: (newLists: TaskList[]) => void;
-  onAddGroceryItems: (items: { name: string; category: string }[]) => void;
+  onAddGroceryItems: (items: GroceryDraft[]) => void;
   setScreen: (s: Screen) => void;
   // Step 11b.2: when present, the active list is a shared one. Mutations
   // route through Firestore writes instead of local setTasks. Tier reordering
@@ -5965,9 +6059,11 @@ interface ActiveListProps {
   // is intentionally a no-op until the unified ListActionSheet ships in
   // step 10 — long-press on a shared pill toasts a 'coming soon' note.
   sharedIdSet?: Set<string>;
+  collapsedGroups: CollapsedGroups;
+  setCollapsedGroup: (key: string, collapsed: boolean) => void;
 }
 
-function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, defaultTier, setArchive, activeListId, lists, setActiveListId, addList, renameList, deleteList, reorderLists, onAddGroceryItems, setScreen, sharedActions, sharedIdSet }: ActiveListProps) {
+function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, defaultTier, setArchive, activeListId, lists, setActiveListId, addList, renameList, deleteList, reorderLists, onAddGroceryItems, setScreen, sharedActions, sharedIdSet, collapsedGroups, setCollapsedGroup }: ActiveListProps) {
   const isPaid = useIsPaid();
   const { user: syncUser } = useSync();
   const {
@@ -6293,11 +6389,16 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
             <Text style={[styles.emptyText, { color: T.textMute, fontFamily: jks('400') }]}>All clear</Text>
           </View>
         ) : (
-          TIERS.map(tier => (
-            <TierGroup key={tier.id} tier={tier} tasks={tasks.filter(t => t.tier === tier.id)}
-              onComplete={handleComplete} onDelete={handleDelete} requestComplete={requestComplete} onEdit={setEditingTask} accentColor={accentColor}
-              onReorderInTier={handleReorderInTier} onDragMove={handleDragMovePageY} />
-          ))
+          TIERS.map(tier => {
+            const collapseKey = `tasks:${activeListId}:${tier.id}`;
+            return (
+              <TierGroup key={tier.id} tier={tier} tasks={tasks.filter(t => t.tier === tier.id)}
+                onComplete={handleComplete} onDelete={handleDelete} requestComplete={requestComplete} onEdit={setEditingTask} accentColor={accentColor}
+                onReorderInTier={handleReorderInTier} onDragMove={handleDragMovePageY}
+                collapsed={collapsedGroups[collapseKey] ?? false}
+                onCollapsedChange={(next) => setCollapsedGroup(collapseKey, next)} />
+            );
+          })
         )}
       </ScrollView>
       <InputBar
@@ -6313,7 +6414,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
         lists={lists}
         activeListId={activeListId}
       />
-      {editingTask && <EditSheet task={editingTask} onSave={handleSave} onCancel={() => setEditingTask(null)} accentColor={accentColor} />}
+      {editingTask && <EditSheet task={editingTask} onSave={handleSave} onCancel={() => setEditingTask(null)} accentColor={accentColor} showToast={showToast} />}
       {actionList && (() => {
         // Step 10: shared-list mode resolution. The same sheet renders rename
         // for both private and shared lists; everything else (rotate, leave,
@@ -6384,6 +6485,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
                         setActiveListId(newId);
                         setActionList({ ...target, id: newId, updatedAt: Date.now() });
                         showToast('Shared list created');
+                        requestReminderNotifications(showToast).catch(() => {});
                       })
                       .catch((e) => showToast('Could not share', e?.message || 'Check connection'));
                   },
@@ -6499,6 +6601,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
             const joined = sharedListsMap[id];
             if (joined?.kind === 'tasks') setActiveListId(id);
             showToast(joined ? `Joined ${joined.name}` : 'Joined shared list');
+            requestReminderNotifications(showToast).catch(() => {});
           }}
         />
       )}
@@ -6704,6 +6807,8 @@ interface ArchiveProps {
   activeListId: string;
   setListTasks: (listId: string, fn: (prev: Task[]) => Task[]) => void;
   onDeleteSharedArchiveItem?: (listId: string, archiveId: string) => Promise<void>;
+  collapsedGroups: CollapsedGroups;
+  setCollapsedGroup: (key: string, collapsed: boolean) => void;
 }
 
 const ARCHIVE_ALL_FILTER = '__all__';
@@ -6718,7 +6823,7 @@ function weekLabel(weekStart: number): string {
   return `${fmt(new Date(weekStart))} – ${fmt(end)}`;
 }
 
-function Archive({ archive, setArchive, accentColor, lists, activeListId, setListTasks, onDeleteSharedArchiveItem }: ArchiveProps) {
+function Archive({ archive, setArchive, accentColor, lists, activeListId, setListTasks, onDeleteSharedArchiveItem, collapsedGroups, setCollapsedGroup }: ArchiveProps) {
   const T = useT();
   const TIERS = TIERS_DEF(T);
   const insets = useSafeAreaInsets();
@@ -6733,10 +6838,9 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
   const thisWeekStart = startOfWeekMonday(Date.now());
   const lastWeekStart = thisWeekStart - ONE_WEEK_MS;
 
-  // Track which week groups are collapsed. Weeks older than last week start collapsed.
-  const [collapsed, setCollapsed] = useState<Record<number, boolean>>({});
-  const isCollapsed = (wStart: number) => collapsed[wStart] ?? (wStart < lastWeekStart);
-  const toggleCollapse = (wStart: number) => setCollapsed(prev => ({ ...prev, [wStart]: !isCollapsed(wStart) }));
+  const archiveGroupKey = (wStart: number) => `archive:${listFilter}:${wStart}`;
+  const isCollapsed = (wStart: number) => collapsedGroups[archiveGroupKey(wStart)] ?? (wStart < lastWeekStart);
+  const toggleCollapse = (wStart: number) => setCollapsedGroup(archiveGroupKey(wStart), !isCollapsed(wStart));
 
   const handleRestore = useCallback((id: TaskId) => {
     const item = archive.find(a => a.id === id);
@@ -8133,9 +8237,8 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
             style={[styles.contextInput, { backgroundColor: T.s2, color: T.text, borderColor: T.border, fontFamily: jks('400') }]} />
         </View>
       </View>
-      {/* Step 15: replaces the old Restore Purchase row. Hidden when both
-          donation URLs are empty so a fresh checkout doesn't ship a row that
-          opens an empty sheet. */}
+      {/* Step 15: replaces the old Restore Purchase row. Hidden only if every
+          donation URL is empty, so configured support links show automatically. */}
       {(!!TRIORITY_PATREON_URL || !!TRIORITY_BMAC_URL) && (
         <View style={[styles.settingsSection, { marginBottom: insets.bottom + 12 }]}>
           <TouchableOpacity
@@ -8342,7 +8445,7 @@ function Onboarding({ onDone, accentColor }: { onDone: () => void; accentColor: 
 
 interface StandaloneGroceryProps {
   groceryItems: GroceryItem[];
-  onAddGroceryItems: (items: { name: string; category: string }[]) => void | Promise<void>;
+  onAddGroceryItems: (items: GroceryDraft[]) => void | Promise<void>;
   onCheckGrocery: (id: string) => void;
   onDeleteGrocery: (id: string) => void;
   onClearCheckedGrocery: () => void;
@@ -8365,6 +8468,9 @@ interface StandaloneGroceryProps {
   activeListId: string;
   onAddMany: (items: { text: string; tier: Tier; reminder?: Reminder }[]) => void;
   onAddManyToList: (listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => void;
+  groupCollapseScope: string;
+  collapsedGroups: CollapsedGroups;
+  setCollapsedGroup: (key: string, collapsed: boolean) => void;
 }
 
 function StandaloneGrocery({
@@ -8374,6 +8480,7 @@ function StandaloneGrocery({
   onShareGrocery, onRotateGroceryShareCode, onMakePrivateSharedGrocery, onLeaveSharedGrocery, onDeleteSharedGrocery,
   hasApiKey, accentColor, defaultTier, lists, activeListId,
   onAddMany, onAddManyToList,
+  groupCollapseScope, collapsedGroups, setCollapsedGroup,
 }: StandaloneGroceryProps) {
   const T = useT();
   const insets = useSafeAreaInsets();
@@ -8401,7 +8508,7 @@ function StandaloneGrocery({
     if (toastTimer.current) { clearTimeout(toastTimer.current); toastTimer.current = null; }
     setToast(null);
   }, []);
-  const handleAddGroceryItems = useCallback((items: { name: string; category: string }[]) => {
+  const handleAddGroceryItems = useCallback((items: GroceryDraft[]) => {
     return Promise.resolve(onAddGroceryItems(items)).catch((e) => {
       showToast('Could not add groceries', e?.message || 'Check connection');
     });
@@ -8431,6 +8538,7 @@ function StandaloneGrocery({
           onShareGrocery()
             .then(() => {
               showToast('Shared groceries created', 'Tap the people button for the code');
+              requestReminderNotifications(showToast).catch(() => {});
               setShareSheetOpen(true);
             })
             .catch((e) => showToast('Could not share', e?.message || 'Check connection'));
@@ -8509,6 +8617,9 @@ function StandaloneGrocery({
         defaultTier={defaultTier}
         showToast={showToast}
         dismissToast={dismissToast}
+        groupCollapseScope={groupCollapseScope}
+        collapsedGroups={collapsedGroups}
+        setCollapsedGroup={setCollapsedGroup}
       />
       <InputBar
         onAddMany={onAddMany}
@@ -8608,6 +8719,7 @@ function StandaloneGrocery({
             );
             const joined = sharedLists[id];
             showToast(joined ? `Joined ${joined.name}` : 'Joined shared list');
+            requestReminderNotifications(showToast).catch(() => {});
           }}
         />
       )}
@@ -8639,6 +8751,7 @@ function TriorityApp() {
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [groceryItems, setGroceryItemsState] = useState<GroceryItem[]>([]);
   const [viewingSharedGrocery, setViewingSharedGroceryState] = useState(false);
+  const [collapsedGroups, setCollapsedGroupsState] = useState<CollapsedGroups>({});
 
   const persistGrocery = (items: GroceryItem[]) => {
     AsyncStorage.setItem('tri_grocery', JSON.stringify(items)).catch(() => {});
@@ -8647,13 +8760,22 @@ function TriorityApp() {
     setViewingSharedGroceryState(viewShared);
     AsyncStorage.setItem(SHARED_GROCERY_TOGGLE_KEY, viewShared ? '1' : '0').catch(() => {});
   }, []);
+  const setCollapsedGroup = useCallback((key: string, collapsed: boolean) => {
+    setCollapsedGroupsState(prev => {
+      const next = { ...prev, [key]: collapsed };
+      AsyncStorage.setItem(COLLAPSED_GROUPS_KEY, JSON.stringify(next)).catch(() => {});
+      return next;
+    });
+  }, []);
 
-  const addGroceryItems = useCallback((items: { name: string; category: string }[]) => {
+  const addGroceryItems = useCallback((items: GroceryDraft[]) => {
     const now = Date.now();
     const newItems: GroceryItem[] = items.map((item, i) => ({
       id: `groc_${now}_${i}`,
-      name: item.name,
-      category: item.category,
+      name: item.name.trim(),
+      category: item.category || GROCERY_UNCATEGORIZED,
+      quantity: cleanOptionalGroceryPart(item.quantity),
+      unit: cleanOptionalGroceryPart(item.unit),
       checked: false,
       createdAt: now + i,
     }));
@@ -8738,6 +8860,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       setAutoClearState(data.autoClear);
       setDarkModeState(data.darkMode);
       setGroceryItemsState(data.groceryItems);
+      setCollapsedGroupsState(data.collapsedGroups);
       try {
         const rawSharedOrder = await AsyncStorage.getItem(SHARED_TASK_ORDER_KEY);
         if (rawSharedOrder) {
@@ -8843,10 +8966,12 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   const archiveRef = useRef(archive);
   const groceryRef = useRef(groceryItems);
   const activeListIdRef = useRef(activeListId);
+  const collapsedGroupsRef = useRef(collapsedGroups);
   useEffect(() => { listsRef.current = lists; }, [lists]);
   useEffect(() => { archiveRef.current = archive; }, [archive]);
   useEffect(() => { groceryRef.current = groceryItems; }, [groceryItems]);
   useEffect(() => { activeListIdRef.current = activeListId; }, [activeListId]);
+  useEffect(() => { collapsedGroupsRef.current = collapsedGroups; }, [collapsedGroups]);
 
   useEffect(() => {
     const flushAll = () => {
@@ -8858,6 +8983,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
         ['tri_archive', JSON.stringify(archiveRef.current)],
         ['tri_grocery', JSON.stringify(groceryRef.current)],
         ['tri_active_list_id', JSON.stringify(activeListIdRef.current)],
+        [COLLAPSED_GROUPS_KEY, JSON.stringify(collapsedGroupsRef.current)],
       ]).catch(() => {});
     };
     const sub = AppState.addEventListener('change', (next) => {
@@ -9284,6 +9410,8 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       id: it.id,
       name: it.name || '',
       category: it.category || GROCERY_UNCATEGORIZED,
+      quantity: it.quantity,
+      unit: it.unit,
       checked: !!it.checked,
       createdAt: it.createdAt || 0,
     }));
@@ -9409,8 +9537,11 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
 
   const usingSharedGrocery = !!sharedGroceryDoc;
   const groceryItemsForScreen = usingSharedGrocery ? sharedGroceryItems : groceryItems;
+  const groceryGroupCollapseScope = usingSharedGrocery && sharedGroceryDoc
+    ? `shared:${sharedGroceryDoc.id}`
+    : 'private';
 
-  const addGroceryItemsForScreen = useCallback((items: { name: string; category: string }[]) => {
+  const addGroceryItemsForScreen = useCallback((items: GroceryDraft[]) => {
     if (!usingSharedGrocery || !sharedGroceryDoc) {
       addGroceryItems(items);
       return;
@@ -9495,7 +9626,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
         <PortalHost>
           <BackButtonManager screen={screen} setScreen={setScreen} />
           <View style={{ flex: 1, overflow: 'hidden' }}>
-            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} />}
+            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} />}
             {screen === 'grocery' && (
               <StandaloneGrocery
                 groceryItems={groceryItemsForScreen}
@@ -9522,6 +9653,8 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
                     id: `groc_${now}_${index}`,
                     name: item.name,
                     category: item.category || GROCERY_UNCATEGORIZED,
+                    quantity: item.quantity,
+                    unit: item.unit,
                     checked: !!item.checked,
                     createdAt: item.createdAt || now + index,
                   }));
@@ -9540,9 +9673,12 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
                 activeListId={activeListId}
                 onAddMany={addManyToActiveList}
                 onAddManyToList={addManyToList}
+                groupCollapseScope={groceryGroupCollapseScope}
+                collapsedGroups={collapsedGroups}
+                setCollapsedGroup={setCollapsedGroup}
               />
             )}
-            {screen === 'archive' && <Archive archive={combinedArchive} setArchive={setArchive} accentColor={accentColor} lists={mergedLists} activeListId={activeListId} setListTasks={setListTasks} onDeleteSharedArchiveItem={deleteSharedArchiveItem} />}
+            {screen === 'archive' && <Archive archive={combinedArchive} setArchive={setArchive} accentColor={accentColor} lists={mergedLists} activeListId={activeListId} setListTasks={setListTasks} onDeleteSharedArchiveItem={deleteSharedArchiveItem} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} />}
             {screen === 'settings' && (
               <Settings accent={accentColor} apiKey={apiKey} setApiKey={setApiKey}
                 hasApiKey={hasApiKey} setHasApiKey={setHasApiKey} personalContext={personalContext} setPersonalContext={setPersonalContext}
@@ -9700,6 +9836,7 @@ const styles = StyleSheet.create({
   groceryViewSwitch: { flexDirection: 'row', alignItems: 'center', height: 36, borderRadius: 10, borderWidth: 1, padding: 3, gap: 3 },
   groceryViewSwitchBtn: { flex: 1, height: 28, borderRadius: 8, borderWidth: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 },
   groceryViewSwitchLabel: { fontSize: 12 },
+  groceryCategoryHeaderRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 16, marginBottom: 6, paddingLeft: 2 },
   groceryCategoryHeader: { fontSize: 11, letterSpacing: 0.6, textTransform: 'uppercase', marginTop: 16, marginBottom: 6, paddingLeft: 2 },
   groceryClearPill: { alignItems: 'center', paddingHorizontal: 12, paddingTop: 5, paddingBottom: 4, borderRadius: 16, borderWidth: 1 },
   groceryClearHint: { fontSize: 8, marginTop: 1 },
