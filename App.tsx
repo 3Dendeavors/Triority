@@ -5042,15 +5042,15 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
     reminderCount: number,
     routedListNames: string[],
   ) => {
-    const steps: string[] = [];
-    if (totalTasks > 0) steps.push(`Added ${totalTasks} task${totalTasks === 1 ? '' : 's'}`);
-    if (groceryCount > 0) steps.push(`Detected ${groceryCount} grocery item${groceryCount === 1 ? '' : 's'}`);
+    const parts: string[] = [];
+    if (totalTasks > 0) parts.push(`${totalTasks} task${totalTasks === 1 ? '' : 's'}`);
+    if (reminderCount > 0) parts.push(`${reminderCount} reminder${reminderCount === 1 ? '' : 's'}`);
+    if (groceryCount > 0) parts.push(`${groceryCount} grocery item${groceryCount === 1 ? '' : 's'}`);
     if (routedListNames.length > 0) {
       const unique = Array.from(new Set(routedListNames)).slice(0, 2);
-      steps.push(`Routed to ${unique.join(' + ')}`);
+      parts.push(`routed to ${unique.join(' + ')}`);
     }
-    if (reminderCount > 0) steps.push(`Set ${reminderCount} reminder${reminderCount === 1 ? '' : 's'}`);
-    return steps.length ? steps : ['Parsed'];
+    return parts.length ? [`Added ${parts.join(' · ')}`] : ['Nothing added'];
   };
 
   const submit = async () => {
