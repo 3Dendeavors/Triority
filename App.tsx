@@ -3112,6 +3112,48 @@ function reminderTargetFromData(data?: Record<string, any> | null): ReminderNavT
   return { listId, taskId, scheduledTaskId };
 }
 
+function reminderNotificationData(task: Task) {
+  const displayTaskId = task.reminderTaskId ?? task.id;
+  return stripUndefined({
+    route: 'taskReminder',
+    taskId: String(displayTaskId),
+    scheduledTaskId: String(task.id),
+    listId: task.reminderListId,
+  });
+}
+
+function activeReminderOccurrence(task: Task, now = Date.now()): number | null {
+  const r = task.reminder;
+  if (!r) return null;
+  const interval = r.repeatHourly ? 3600000 : r.repeatDaily ? 86400000 : 0;
+  const base = r.remindAt;
+  if (now < base) return null;
+  const occurrence = interval > 0
+    ? base + Math.floor((now - base) / interval) * interval
+    : base;
+  return now - occurrence <= 90000 ? occurrence : null;
+}
+
+async function displayActiveReminder(task: Task) {
+  if (!task.reminder) return;
+  await ensureNotifChannel();
+  const settings = await notifee.getNotificationSettings().catch(() => null);
+  const notifOk = settings?.authorizationStatus === AuthorizationStatus.AUTHORIZED
+    || settings?.authorizationStatus === AuthorizationStatus.PROVISIONAL;
+  if (!notifOk) return;
+  await notifee.displayNotification({
+    id: notifIdForTask(task.id),
+    title: task.text.slice(0, 80),
+    body: task.tier === 'high' ? 'High priority reminder' : 'Reminder',
+    android: {
+      channelId: NOTIF_CHANNEL_ID,
+      smallIcon: 'ic_launcher',
+      pressAction: { id: 'default' },
+    },
+    data: reminderNotificationData(task),
+  });
+}
+
 // Returns true if exact-alarm permission is granted (Android 12+).
 // On non-Android (or older Android), always true. Does NOT prompt or redirect.
 async function hasExactAlarmPerm(): Promise<boolean> {
@@ -3161,7 +3203,6 @@ async function scheduleReminder(task: Task) {
     }
   }
 
-  const displayTaskId = task.reminderTaskId ?? task.id;
   await notifee.createTriggerNotification(
     {
       id: notifIdForTask(task.id),
@@ -3173,12 +3214,7 @@ async function scheduleReminder(task: Task) {
         // 'default' pressAction with no launchActivity opens the app's main activity
         pressAction: { id: 'default' },
       },
-      data: stripUndefined({
-        route: 'taskReminder',
-        taskId: String(displayTaskId),
-        scheduledTaskId: String(task.id),
-        listId: task.reminderListId,
-      }),
+      data: reminderNotificationData(task),
     },
     {
       type: TriggerType.TIMESTAMP,
@@ -5564,10 +5600,9 @@ interface ListActionSheetProps {
   // (typed in the Name input but not yet saved) so the new shared list
   // inherits the typed name instead of the stale disk name.
   onShareList?: (pendingName?: string) => void;
-  onJoinCode?: () => void;
 }
 
-function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAskDelete, onClose, sharedMode, onShareList, onJoinCode }: ListActionSheetProps) {
+function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAskDelete, onClose, sharedMode, onShareList }: ListActionSheetProps) {
   const T = useT();
   const insets = useSafeAreaInsets();
   const { height: windowHeight } = useWindowDimensions();
@@ -5692,14 +5727,6 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
               <Text style={{ color: T.textMute, fontSize: 12, fontFamily: jks('400'), marginTop: 6 }}>
                 {sharedMode.memberCount} member{sharedMode.memberCount === 1 ? '' : 's'}{sharedMode.isOwner ? ' • You’re the owner' : ''}
               </Text>
-              {onJoinCode ? (
-                <TouchableOpacity
-                  onPress={onJoinCode}
-                  style={[styles.listSheetActionBtn, { backgroundColor: T.s2, borderColor: T.borderMid, alignSelf: 'stretch', marginTop: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
-                  <Icon name="logIn" size={14} color={T.textSub} />
-                  <Text style={[styles.listSheetActionLabel, { color: T.textSub, fontFamily: jks('700') }]}>Join with code</Text>
-                </TouchableOpacity>
-              ) : null}
               {sharedMode.isOwner ? (
                 <>
                 {sharedMode.onMakePrivate ? (
@@ -5709,7 +5736,7 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
                       const pending = trimmed && trimmed !== list.name ? trimmed : undefined;
                       sharedMode.onMakePrivate?.(pending);
                     }}
-                    style={[styles.listSheetActionBtn, { backgroundColor: `${accentColor}18`, borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: onJoinCode ? 10 : 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
+                    style={[styles.listSheetActionBtn, { backgroundColor: `${accentColor}18`, borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
                     <Icon name="home" size={14} color={accentColor} />
                     <Text style={[styles.listSheetActionLabel, { color: accentColor, fontFamily: jks('700') }]}>Make Private</Text>
                   </TouchableOpacity>
@@ -5735,14 +5762,6 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
               </>
             ) : (
               <>
-              {onJoinCode ? (
-                <TouchableOpacity
-                  onPress={onJoinCode}
-                  style={[styles.listSheetActionBtn, { backgroundColor: T.s2, borderColor: T.borderMid, alignSelf: 'stretch', marginTop: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
-                  <Icon name="logIn" size={14} color={T.textSub} />
-                  <Text style={[styles.listSheetActionLabel, { color: T.textSub, fontFamily: jks('700') }]}>Join with code</Text>
-                </TouchableOpacity>
-              ) : null}
               {onShareList ? (
                 <TouchableOpacity
                   onPress={() => {
@@ -5755,7 +5774,7 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
                     const pending = trimmed && trimmed !== list.name ? trimmed : undefined;
                     onShareList(pending);
                   }}
-                  style={[styles.listSheetActionBtn, { backgroundColor: 'transparent', borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: onJoinCode ? 10 : 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
+                  style={[styles.listSheetActionBtn, { backgroundColor: 'transparent', borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
                   <Icon name="users" size={14} color={accentColor} />
                   <Text style={[styles.listSheetActionLabel, { color: accentColor, fontFamily: jks('700') }]}>Share this list</Text>
                 </TouchableOpacity>
@@ -6651,7 +6670,6 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
               });
             }}
             onClose={() => setActionList(null)}
-            onJoinCode={openJoinSheet}
             onShareList={sharedDoc || !isPaid || isPersonal ? undefined : (pendingName?: string) => {
               // Promote to shared. Defer the confirm() call into a microtask
               // so it runs AFTER the action sheet unmount cycle settles —
@@ -8945,6 +8963,7 @@ function TriorityApp() {
   const [collapsedGroups, setCollapsedGroupsState] = useState<CollapsedGroups>({});
   const [pendingReminderNav, setPendingReminderNav] = useState<ReminderNavTarget | null>(null);
   const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
+  const activeReminderFiredRef = useRef<Set<string>>(new Set());
 
   const persistGrocery = (items: GroceryItem[]) => {
     AsyncStorage.setItem('tri_grocery', JSON.stringify(items)).catch(() => {});
@@ -9639,6 +9658,29 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     syncAllReminders(reminderTasksForScheduling).catch(() => {});
   }, [ready, reminderTasksForScheduling]);
 
+  useEffect(() => {
+    if (!ready) return;
+    const checkDueReminders = () => {
+      if (AppState.currentState !== 'active') return;
+      const now = Date.now();
+      for (const task of reminderTasksForScheduling) {
+        const occurrence = activeReminderOccurrence(task, now);
+        if (!occurrence) continue;
+        const firedKey = `${task.id}:${occurrence}`;
+        if (activeReminderFiredRef.current.has(firedKey)) continue;
+        activeReminderFiredRef.current.add(firedKey);
+        displayActiveReminder(task).catch(() => {});
+      }
+      if (activeReminderFiredRef.current.size > 250) {
+        activeReminderFiredRef.current = new Set(Array.from(activeReminderFiredRef.current).slice(-100));
+      }
+    };
+
+    checkDueReminders();
+    const interval = setInterval(checkDueReminders, 15000);
+    return () => clearInterval(interval);
+  }, [ready, reminderTasksForScheduling]);
+
   const sharedGroceryDoc = useMemo(() => {
     return Object.values(sharedListsMap).find((l) => l.kind === 'grocery') ?? null;
   }, [sharedListsMap]);
@@ -9752,8 +9794,6 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     setActiveListId(targetListId);
     if (taskId) {
       setFocusedTaskId(taskId);
-      const timer = setTimeout(() => setFocusedTaskId(current => current === taskId ? null : current), 5000);
-      return () => clearTimeout(timer);
     }
     setPendingReminderNav(null);
   }, [mergedLists, pendingReminderNav, ready, setActiveListId]);
@@ -9762,6 +9802,14 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     if (!pendingReminderNav || !focusedTaskId) return;
     setPendingReminderNav(null);
   }, [focusedTaskId, pendingReminderNav]);
+
+  useEffect(() => {
+    if (!focusedTaskId) return;
+    const timer = setTimeout(() => {
+      setFocusedTaskId(current => current === focusedTaskId ? null : current);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [focusedTaskId]);
 
   useEffect(() => {
     if (!ready || activeListIdIsLive || !activeList?.id) return;

@@ -20,7 +20,6 @@ notifee.onBackgroundEvent(async ({ type, detail }) => {
   const data = detail.notification?.data;
   if (!data?.taskId && data?.route !== 'taskReminder') return;
   await AsyncStorage.setItem(REMINDER_NAV_KEY, JSON.stringify(data)).catch(() => {});
-  // our current behavior (tap → opens app, no per-notification deep link)
 });
 
 AppRegistry.registerComponent(appName, () => App);
