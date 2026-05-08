@@ -7,7 +7,7 @@ Triority is a private-first Android task, grocery, reminder, and AI triage app. 
 The current public beta APK is published on GitHub Releases:
 
 - Latest release: https://github.com/3Dendeavors/Triority/releases/latest
-- Current beta: `v1.4.3`
+- Current beta: `v1.4.4`
 - Android package id: `com.triority`
 
 Install the APK on Android by downloading it from the latest release and accepting Android's sideload/install prompt. Future installed builds check this repo's `latest.json` and prompt when a newer APK is available.
@@ -50,4 +50,4 @@ Release signing files and Firebase config are intentionally not committed. See `
 
 ## Current Status
 
-The current public beta is `v1.4.3` / `versionCode 19`, a hotfix for shared grocery recovery when Supabase already has a grocery membership but the local app pointer was missing.
+The current public beta is `v1.4.4` / `versionCode 20`, a polish release with recent-add shine feedback, cleaner list headers, contextual shared-list joining, and active shared-grocery AI routing.
