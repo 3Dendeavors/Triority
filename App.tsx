@@ -14,6 +14,7 @@ import {
   AppState,
   BackHandler,
   Dimensions,
+  Easing,
   Keyboard,
   KeyboardAvoidingView,
   Linking,
@@ -460,8 +461,8 @@ function getKeyboardSheetFrame(
     ? reportedInset
     : (forceKeyboardMode ? fallbackKeyboardInset : 0);
   const bottom = keyboardInset > 0 ? keyboardInset : bottomInset;
-  const availableHeight = Math.min(windowHeight, Math.max(180, screenHeight - keyboardInset));
-  const maxHeight = Math.max(180, availableHeight - topInset - bottomInset - 12);
+  const availableHeight = Math.min(windowHeight, Math.max(180, screenHeight - bottom));
+  const maxHeight = Math.max(180, availableHeight - topInset - 12);
   return { bottom, maxHeight, keyboardInset };
 }
 
@@ -2572,11 +2573,17 @@ async function checkForGithubUpdate() {
 }
 
 const APP_VERSION = '2';
+const NEW_ITEM_SHINE_MS = 1900;
+const NEW_ITEM_GLOW_ELIGIBILITY_MS = 5000;
+const NEW_ITEM_SHINE_GOLD = '#FFD76A';
+const NEW_ITEM_SHINE_WARM = '#FFB72E';
+const NEW_ITEM_SHINE_WHITE = '#FFF8D8';
+const SAMPLE_TASK_CREATED_AT = Date.now() - NEW_ITEM_GLOW_ELIGIBILITY_MS - 1000;
 
 const SAMPLE_TASKS: Task[] = [
-  { id: 1, text: 'Swipe left to delete a task.', tier: 'high', createdAt: Date.now() - 3 },
-  { id: 2, text: 'Swipe right to complete and archive a task.', tier: 'medium', createdAt: Date.now() - 2 },
-  { id: 3, text: 'Tap the edit button on a task to edit its text or change its priority.', tier: 'low', createdAt: Date.now() - 1 },
+  { id: 1, text: 'Swipe left to delete a task.', tier: 'high', createdAt: SAMPLE_TASK_CREATED_AT },
+  { id: 2, text: 'Swipe right to complete and archive a task.', tier: 'medium', createdAt: SAMPLE_TASK_CREATED_AT },
+  { id: 3, text: 'Tap the edit button on a task to edit its text or change its priority.', tier: 'low', createdAt: SAMPLE_TASK_CREATED_AT },
 ];
 
 const SAMPLE_ARCHIVE: ArchivedTask[] = [
@@ -3461,7 +3468,7 @@ function EditSheet({ task, onSave, onCancel, accentColor }: EditSheetProps) {
 
   const sheetFrame = getKeyboardSheetFrame(keyboard, insets.top, insets.bottom, windowHeight, inputFocused);
   const scrollMaxHeight = sheetFrame.keyboardInset > 0
-    ? Math.max(140, Math.min(220, sheetFrame.maxHeight - 126))
+    ? Math.max(220, Math.min(430, sheetFrame.maxHeight - 86))
     : 508;
 
   return (
@@ -3536,6 +3543,79 @@ interface TaskRowProps {
 const REVEAL_X = -72; // distance the row holds at when trash is revealed
 const DRAG_LONG_PRESS_MS = 400;
 
+function useNewItemGlow(createdAt: number | undefined, identity: TaskId | string) {
+  const glow = useRef(new Animated.Value(0)).current;
+  const sweep = useRef(new Animated.Value(0)).current;
+  const sparkle = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    glow.stopAnimation();
+    sweep.stopAnimation();
+    sparkle.stopAnimation();
+    glow.setValue(0);
+    sweep.setValue(0);
+    sparkle.setValue(0);
+
+    if (!createdAt) return;
+    const ageMs = Date.now() - createdAt;
+    if (ageMs < 0 || ageMs > NEW_ITEM_GLOW_ELIGIBILITY_MS) return;
+
+    Animated.parallel([
+      Animated.sequence([
+        Animated.timing(glow, { toValue: 1, duration: 140, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+        Animated.delay(420),
+        Animated.timing(glow, { toValue: 0, duration: NEW_ITEM_SHINE_MS, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+      ]),
+      Animated.sequence([
+        Animated.delay(120),
+        Animated.timing(sweep, { toValue: 1, duration: 1050, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+      ]),
+      Animated.sequence([
+        Animated.delay(680),
+        Animated.timing(sparkle, { toValue: 1, duration: 160, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+        Animated.timing(sparkle, { toValue: 0, duration: 520, easing: Easing.in(Easing.quad), useNativeDriver: true }),
+      ]),
+    ]).start();
+  }, [createdAt, glow, identity, sparkle, sweep]);
+
+  return {
+    fillOpacity: glow.interpolate({ inputRange: [0, 1], outputRange: [0, 0.24] }),
+    edgeOpacity: glow.interpolate({ inputRange: [0, 1], outputRange: [0, 0.95] }),
+    contrastEdgeOpacity: glow.interpolate({ inputRange: [0, 1], outputRange: [0, 0.32] }),
+    scale: glow.interpolate({ inputRange: [0, 1], outputRange: [1, 1.012] }),
+    sweepOpacity: sweep.interpolate({
+      inputRange: [0, 0.12, 0.5, 0.82, 1],
+      outputRange: [0, 0, 0.95, 0.35, 0],
+    }),
+    sweepTranslateX: sweep.interpolate({ inputRange: [0, 1], outputRange: [-120, 360] }),
+    sweepScaleX: sweep.interpolate({ inputRange: [0, 0.5, 1], outputRange: [0.7, 1.22, 0.85] }),
+    sparkleOpacity: sparkle.interpolate({ inputRange: [0, 1], outputRange: [0, 1] }),
+    sparkleScale: sparkle.interpolate({ inputRange: [0, 1], outputRange: [0.45, 1.25] }),
+  };
+}
+
+function parseHexRgb(value: string) {
+  const raw = value.trim().replace('#', '');
+  if (![3, 6, 8].includes(raw.length)) return null;
+  const hex = raw.length === 3
+    ? raw.split('').map(c => `${c}${c}`).join('')
+    : raw.slice(0, 6);
+  const num = Number.parseInt(hex, 16);
+  if (!Number.isFinite(num)) return null;
+  return {
+    r: (num >> 16) & 255,
+    g: (num >> 8) & 255,
+    b: num & 255,
+  };
+}
+
+function readableGlowEdgeColor(surfaceColor: string, fallback: string) {
+  const rgb = parseHexRgb(surfaceColor);
+  if (!rgb) return fallback;
+  const luminance = (0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b) / 255;
+  return luminance > 0.58 ? '#000000' : '#FFFFFF';
+}
+
 // Tiny colored dot + single-letter initial used to identify the last editor of
 // a shared list item. Slot index maps into SHARED_AVATAR_COLORS — the slot is
 // assigned once on join and stays stable for the life of the membership.
@@ -3571,6 +3651,8 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
   const tier = TIERS.find(t => t.id === task.tier)!;
   const translateX = useRef(new Animated.Value(0)).current;
   const [revealed, setRevealed] = useState(false);
+  const newItemGlow = useNewItemGlow(task.createdAt, task.id);
+  const glowEdgeColor = readableGlowEdgeColor(T.s2, T.text);
   // Pulse animation for the revealed trash icon — loops while revealed
   const pulse = useRef(new Animated.Value(0)).current;
 
@@ -3767,6 +3849,90 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
           styles.taskRowContent,
           { transform: [{ translateX }], backgroundColor: T.s2, borderLeftColor: tier.color },
         ]}>
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineOverlay,
+            {
+              backgroundColor: NEW_ITEM_SHINE_WARM,
+              opacity: newItemGlow.fillOpacity,
+              transform: [{ scale: newItemGlow.scale }],
+            },
+          ]}
+        />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineSweep,
+            {
+              backgroundColor: NEW_ITEM_SHINE_GOLD,
+              opacity: newItemGlow.sweepOpacity,
+              transform: [
+                { translateX: newItemGlow.sweepTranslateX },
+                { rotate: '14deg' },
+                { scaleX: newItemGlow.sweepScaleX },
+              ],
+            },
+          ]}
+        />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineSweepCore,
+            {
+              backgroundColor: NEW_ITEM_SHINE_WHITE,
+              opacity: newItemGlow.sweepOpacity,
+              transform: [
+                { translateX: newItemGlow.sweepTranslateX },
+                { rotate: '14deg' },
+              ],
+            },
+          ]}
+        />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineEdge,
+            {
+              borderColor: NEW_ITEM_SHINE_GOLD,
+              opacity: newItemGlow.edgeOpacity,
+              transform: [{ scale: newItemGlow.scale }],
+            },
+          ]}
+        />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineContrastEdge,
+            {
+              borderColor: glowEdgeColor,
+              opacity: newItemGlow.contrastEdgeOpacity,
+              transform: [{ scale: newItemGlow.scale }],
+            },
+          ]}
+        />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineSparkle,
+            {
+              backgroundColor: NEW_ITEM_SHINE_WHITE,
+              opacity: newItemGlow.sparkleOpacity,
+              transform: [{ scale: newItemGlow.sparkleScale }],
+            },
+          ]}
+        />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineSparkleSmall,
+            {
+              backgroundColor: NEW_ITEM_SHINE_GOLD,
+              opacity: newItemGlow.sparkleOpacity,
+              transform: [{ scale: newItemGlow.sparkleScale }],
+            },
+          ]}
+        />
         {/* When revealed, an invisible overlay over the row body absorbs taps so users
             can dismiss the trash by tapping the row itself (instead of fighting the
             edit/reminder buttons underneath). */}
@@ -3977,6 +4143,8 @@ function GroceryItemRow({ item, onCheck, onDelete, accentColor }: GroceryItemRow
   const translateX = useRef(new Animated.Value(0)).current;
   const pulse = useRef(new Animated.Value(0)).current;
   const [revealed, setRevealed] = useState(false);
+  const newItemGlow = useNewItemGlow(item.createdAt, item.id);
+  const glowEdgeColor = readableGlowEdgeColor(T.s2, T.text);
 
   useEffect(() => {
     if (revealed) {
@@ -4084,6 +4252,90 @@ function GroceryItemRow({ item, onCheck, onDelete, accentColor }: GroceryItemRow
             opacity: item.checked ? 0.5 : 1,
           },
         ]}>
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineOverlay,
+            {
+              backgroundColor: NEW_ITEM_SHINE_WARM,
+              opacity: newItemGlow.fillOpacity,
+              transform: [{ scale: newItemGlow.scale }],
+            },
+          ]}
+        />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineSweep,
+            {
+              backgroundColor: NEW_ITEM_SHINE_GOLD,
+              opacity: newItemGlow.sweepOpacity,
+              transform: [
+                { translateX: newItemGlow.sweepTranslateX },
+                { rotate: '14deg' },
+                { scaleX: newItemGlow.sweepScaleX },
+              ],
+            },
+          ]}
+        />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineSweepCore,
+            {
+              backgroundColor: NEW_ITEM_SHINE_WHITE,
+              opacity: newItemGlow.sweepOpacity,
+              transform: [
+                { translateX: newItemGlow.sweepTranslateX },
+                { rotate: '14deg' },
+              ],
+            },
+          ]}
+        />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineEdge,
+            {
+              borderColor: NEW_ITEM_SHINE_GOLD,
+              opacity: newItemGlow.edgeOpacity,
+              transform: [{ scale: newItemGlow.scale }],
+            },
+          ]}
+        />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineContrastEdge,
+            {
+              borderColor: glowEdgeColor,
+              opacity: newItemGlow.contrastEdgeOpacity,
+              transform: [{ scale: newItemGlow.scale }],
+            },
+          ]}
+        />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineSparkle,
+            {
+              backgroundColor: NEW_ITEM_SHINE_WHITE,
+              opacity: newItemGlow.sparkleOpacity,
+              transform: [{ scale: newItemGlow.sparkleScale }],
+            },
+          ]}
+        />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.newItemShineSparkleSmall,
+            {
+              backgroundColor: NEW_ITEM_SHINE_GOLD,
+              opacity: newItemGlow.sparkleOpacity,
+              transform: [{ scale: newItemGlow.sparkleScale }],
+            },
+          ]}
+        />
         {revealed && (
           <TouchableOpacity
             onPress={springBack}
@@ -4798,6 +5050,7 @@ interface DraggablePillProps {
   onSelect: (id: string) => void;
   onLongPress: (id: string) => void;
   onReorder: (newLists: TaskList[]) => void;
+  onLayoutMeasured: () => void;
   isShared?: boolean;
   isPersonal?: boolean;
 }
@@ -4806,7 +5059,7 @@ function DraggablePill({
   list: l, index, activeListId, accentColor, isDragging, shift, dragX,
   dragIndexRef, hoverIndexRef, longPressTimerRef, didDragRef, pillLayoutsRef,
   lists, getHoverIndex, setDraggingIndex, setHoverIndex,
-  onSelect, onLongPress, onReorder, isShared, isPersonal,
+  onSelect, onLongPress, onReorder, onLayoutMeasured, isShared, isPersonal,
 }: DraggablePillProps) {
   const T = useT();
   const active = l.id === activeListId;
@@ -4859,6 +5112,7 @@ function DraggablePill({
       onLayout={(e) => {
         const { x, width } = e.nativeEvent.layout;
         pillLayoutsRef.current[index] = { x, width };
+        onLayoutMeasured();
       }}
       style={{
         transform: [{ translateX: isDragging ? dragX : shift }, { scale: isDragging ? 1.06 : 1 }],
@@ -4870,8 +5124,8 @@ function DraggablePill({
         activeOpacity={0.7}
         onPress={() => { if (dragIndexRef.current === null) onSelect(l.id); }}
         onLongPress={() => {
-          // Long-press arms drag mode. The pencil button at the top of the
-          // Tasks screen is the ONLY entry point to the list-edit sheet —
+          // Long-press arms drag mode. The title edit mark at the top of the
+          // Tasks screen is the clearest entry point to the list-edit sheet —
           // long-press here was previously dual-purpose (drag OR open sheet
           // depending on whether the finger moved before release), but real
           // fingers wobble enough that the sheet would steal the gesture.
@@ -4912,6 +5166,7 @@ function DraggablePill({
 function ListPillRow({ lists, activeListId, accentColor, isPaid, onSelect, onLongPress, onAddPress, onReorder, sharedIds }: ListPillRowProps) {
   const T = useT();
 
+  const scrollRef = useRef<ScrollView | null>(null);
   const dragIndexRef = useRef<number | null>(null);
   const hoverIndexRef = useRef<number | null>(null);
   const dragX = useRef(new Animated.Value(0)).current;
@@ -4921,6 +5176,13 @@ function ListPillRow({ lists, activeListId, accentColor, isPaid, onSelect, onLon
 
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
+  const [viewportWidth, setViewportWidth] = useState(0);
+  const [contentWidth, setContentWidth] = useState(0);
+  const [layoutVersion, setLayoutVersion] = useState(0);
+
+  const handlePillMeasured = useCallback(() => {
+    setLayoutVersion(v => v + 1);
+  }, []);
 
   const getHoverIndex = useCallback((dragIdx: number, offsetX: number): number => {
     const layouts = pillLayoutsRef.current;
@@ -4944,13 +5206,38 @@ function ListPillRow({ lists, activeListId, accentColor, isPaid, onSelect, onLon
     return 0;
   };
 
+  const centerActivePill = useCallback((animated: boolean) => {
+    if (draggingIndex !== null || !viewportWidth) return;
+    const activeIndex = lists.findIndex(l => l.id === activeListId);
+    if (activeIndex < 0) return;
+    const layout = pillLayoutsRef.current[activeIndex];
+    if (!layout) return;
+    const maxX = Math.max(0, contentWidth - viewportWidth);
+    const targetX = Math.max(0, Math.min(maxX, layout.x + layout.width / 2 - viewportWidth / 2));
+    scrollRef.current?.scrollTo({ x: targetX, animated });
+  }, [activeListId, contentWidth, draggingIndex, lists, viewportWidth]);
+
+  useEffect(() => {
+    const timeout = setTimeout(() => centerActivePill(true), 40);
+    return () => clearTimeout(timeout);
+  }, [activeListId, centerActivePill, layoutVersion, lists.length]);
+
   return (
     <ScrollView
+      ref={scrollRef}
       horizontal
       showsHorizontalScrollIndicator={false}
       contentContainerStyle={styles.listPillRowContent}
       style={styles.listPillRow}
-      scrollEnabled={draggingIndex === null}>
+      scrollEnabled={draggingIndex === null}
+      onLayout={(e) => {
+        setViewportWidth(e.nativeEvent.layout.width);
+        setTimeout(() => centerActivePill(false), 0);
+      }}
+      onContentSizeChange={(width) => {
+        setContentWidth(width);
+        setTimeout(() => centerActivePill(false), 0);
+      }}>
       {lists.map((l, i) => (
         <DraggablePill
           key={l.id}
@@ -4973,6 +5260,7 @@ function ListPillRow({ lists, activeListId, accentColor, isPaid, onSelect, onLon
           onSelect={onSelect}
           onLongPress={onLongPress}
           onReorder={onReorder}
+          onLayoutMeasured={handlePillMeasured}
           isShared={sharedIds?.has(l.id) ?? false}
           isPersonal={l.id === DEFAULT_LIST_ID}
         />
@@ -5014,9 +5302,10 @@ interface ListActionSheetProps {
   // (typed in the Name input but not yet saved) so the new shared list
   // inherits the typed name instead of the stale disk name.
   onShareList?: (pendingName?: string) => void;
+  onJoinCode?: () => void;
 }
 
-function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAskDelete, onClose, sharedMode, onShareList }: ListActionSheetProps) {
+function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAskDelete, onClose, sharedMode, onShareList, onJoinCode }: ListActionSheetProps) {
   const T = useT();
   const insets = useSafeAreaInsets();
   const { height: windowHeight } = useWindowDimensions();
@@ -5073,6 +5362,9 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
   }, [slide]);
 
   const sheetFrame = getKeyboardSheetFrame(keyboard, insets.top, insets.bottom, windowHeight, inputFocused);
+  const scrollMaxHeight = sheetFrame.keyboardInset > 0
+    ? Math.max(280, sheetFrame.maxHeight - 12)
+    : sheetFrame.maxHeight;
 
   const save = () => {
     Keyboard.dismiss();
@@ -5094,10 +5386,10 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
             <View style={[styles.sheetHandleBar, { backgroundColor: T.s3 }]} />
           </View>
           <ScrollView
-            style={styles.sheetScroll}
+            style={[styles.sheetScroll, { maxHeight: scrollMaxHeight }]}
             keyboardShouldPersistTaps="always"
             showsVerticalScrollIndicator={false}
-            contentContainerStyle={styles.sheetCompactContent}>
+            contentContainerStyle={[styles.sheetCompactContent, { paddingBottom: sheetFrame.keyboardInset > 0 ? 20 : 4 }]}>
             <Text style={[styles.sheetTitle, { color: T.text, fontFamily: jks('700') }]}>List Settings</Text>
 
             <Text style={[styles.sheetSectionLabel, { color: T.textSub, fontFamily: jks('600') }]}>Name</Text>
@@ -5138,6 +5430,14 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
               <Text style={{ color: T.textMute, fontSize: 12, fontFamily: jks('400'), marginTop: 6 }}>
                 {sharedMode.memberCount} member{sharedMode.memberCount === 1 ? '' : 's'}{sharedMode.isOwner ? ' • You’re the owner' : ''}
               </Text>
+              {onJoinCode ? (
+                <TouchableOpacity
+                  onPress={onJoinCode}
+                  style={[styles.listSheetActionBtn, { backgroundColor: T.s2, borderColor: T.borderMid, alignSelf: 'stretch', marginTop: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
+                  <Icon name="logIn" size={14} color={T.textSub} />
+                  <Text style={[styles.listSheetActionLabel, { color: T.textSub, fontFamily: jks('700') }]}>Join with code</Text>
+                </TouchableOpacity>
+              ) : null}
               {sharedMode.isOwner ? (
                 <>
                 {sharedMode.onMakePrivate ? (
@@ -5147,7 +5447,7 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
                       const pending = trimmed && trimmed !== list.name ? trimmed : undefined;
                       sharedMode.onMakePrivate?.(pending);
                     }}
-                    style={[styles.listSheetActionBtn, { backgroundColor: `${accentColor}18`, borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
+                    style={[styles.listSheetActionBtn, { backgroundColor: `${accentColor}18`, borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: onJoinCode ? 10 : 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
                     <Icon name="home" size={14} color={accentColor} />
                     <Text style={[styles.listSheetActionLabel, { color: accentColor, fontFamily: jks('700') }]}>Make Private</Text>
                   </TouchableOpacity>
@@ -5173,6 +5473,14 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
               </>
             ) : (
               <>
+              {onJoinCode ? (
+                <TouchableOpacity
+                  onPress={onJoinCode}
+                  style={[styles.listSheetActionBtn, { backgroundColor: T.s2, borderColor: T.borderMid, alignSelf: 'stretch', marginTop: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
+                  <Icon name="logIn" size={14} color={T.textSub} />
+                  <Text style={[styles.listSheetActionLabel, { color: T.textSub, fontFamily: jks('700') }]}>Join with code</Text>
+                </TouchableOpacity>
+              ) : null}
               {onShareList ? (
                 <TouchableOpacity
                   onPress={() => {
@@ -5185,7 +5493,7 @@ function ListActionSheet({ list, canDelete, isPaid, accentColor, onRename, onAsk
                     const pending = trimmed && trimmed !== list.name ? trimmed : undefined;
                     onShareList(pending);
                   }}
-                  style={[styles.listSheetActionBtn, { backgroundColor: 'transparent', borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
+                  style={[styles.listSheetActionBtn, { backgroundColor: 'transparent', borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: onJoinCode ? 10 : 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
                   <Icon name="users" size={14} color={accentColor} />
                   <Text style={[styles.listSheetActionLabel, { color: accentColor, fontFamily: jks('700') }]}>Share this list</Text>
                 </TouchableOpacity>
@@ -5226,17 +5534,19 @@ interface JoinSharedListSheetProps {
 
 interface GroceryShareSheetProps {
   accentColor: string;
-  shareCode: string;
-  memberCount: number;
-  isOwner: boolean;
+  shareCode?: string;
+  memberCount?: number;
+  isOwner?: boolean;
   onClose: () => void;
-  onRotateCode: () => Promise<void>;
+  onRotateCode?: () => Promise<void>;
+  onShare?: () => void;
+  onJoinCode?: () => void;
   onMakePrivate?: () => void;
-  onLeave: () => void;
-  onDelete: () => void;
+  onLeave?: () => void;
+  onDelete?: () => void;
 }
 
-function GroceryShareSheet({ accentColor, shareCode, memberCount, isOwner, onClose, onRotateCode, onMakePrivate, onLeave, onDelete }: GroceryShareSheetProps) {
+function GroceryShareSheet({ accentColor, shareCode, memberCount = 0, isOwner, onClose, onRotateCode, onShare, onJoinCode, onMakePrivate, onLeave, onDelete }: GroceryShareSheetProps) {
   const T = useT();
   const insets = useSafeAreaInsets();
   const slide = useRef(new Animated.Value(0)).current;
@@ -5271,28 +5581,54 @@ function GroceryShareSheet({ accentColor, shareCode, memberCount, isOwner, onClo
               <Icon name="users" size={12} color={accentColor} />
               <Text style={[styles.upsellBadgeLabel, { color: accentColor, fontFamily: jks('700') }]}>Shared Groceries</Text>
             </View>
-            <Text style={[styles.sheetTitle, { color: T.text, fontFamily: jks('700'), marginTop: 14 }]}>Share code</Text>
-            <View style={[styles.listRenameRow, { backgroundColor: T.s2, borderColor: T.border, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14 }]}>
-              <Text selectable style={{ color: T.text, fontFamily: jks('700'), fontSize: 18, letterSpacing: 3 }}>
-                {shareCode}
-              </Text>
-              {isOwner ? (
-                <TouchableOpacity
-                  onPress={() => onRotateCode().catch(() => {})}
-                  style={{ paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, borderWidth: 1, borderColor: T.borderMid, backgroundColor: T.s3 }}>
-                  <Text style={{ color: T.textSub, fontFamily: jks('600'), fontSize: 12 }}>Rotate</Text>
-                </TouchableOpacity>
-              ) : null}
-            </View>
-            <Text style={{ color: T.textMute, fontSize: 12, fontFamily: jks('400'), marginTop: 8 }}>
-              {memberCount} member{memberCount === 1 ? '' : 's'}{isOwner ? ' - You are the owner' : ''}
+            <Text style={[styles.sheetTitle, { color: T.text, fontFamily: jks('700'), marginTop: 14 }]}>
+              {shareCode ? 'Share code' : 'Grocery Sharing'}
             </Text>
-            {isOwner ? (
+            {shareCode ? (
+              <>
+              <View style={[styles.listRenameRow, { backgroundColor: T.s2, borderColor: T.border, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14 }]}>
+                <Text selectable style={{ color: T.text, fontFamily: jks('700'), fontSize: 18, letterSpacing: 3 }}>
+                  {shareCode}
+                </Text>
+                {isOwner && onRotateCode ? (
+                  <TouchableOpacity
+                    onPress={() => onRotateCode().catch(() => {})}
+                    style={{ paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, borderWidth: 1, borderColor: T.borderMid, backgroundColor: T.s3 }}>
+                    <Text style={{ color: T.textSub, fontFamily: jks('600'), fontSize: 12 }}>Rotate</Text>
+                  </TouchableOpacity>
+                ) : null}
+              </View>
+              <Text style={{ color: T.textMute, fontSize: 12, fontFamily: jks('400'), marginTop: 8 }}>
+                {memberCount} member{memberCount === 1 ? '' : 's'}{isOwner ? ' - You are the owner' : ''}
+              </Text>
+              </>
+            ) : (
+              <Text style={{ color: T.textMute, fontSize: 12, fontFamily: jks('400'), marginTop: 2, lineHeight: 17 }}>
+                Share this grocery list or enter a code from someone else.
+              </Text>
+            )}
+            {onJoinCode ? (
+              <TouchableOpacity
+                onPress={onJoinCode}
+                style={[styles.listSheetActionBtn, { backgroundColor: T.s2, borderColor: T.borderMid, alignSelf: 'stretch', marginTop: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
+                <Icon name="logIn" size={14} color={T.textSub} />
+                <Text style={[styles.listSheetActionLabel, { color: T.textSub, fontFamily: jks('700') }]}>Join with code</Text>
+              </TouchableOpacity>
+            ) : null}
+            {!shareCode && onShare ? (
+              <TouchableOpacity
+                onPress={onShare}
+                style={[styles.listSheetActionBtn, { backgroundColor: `${accentColor}18`, borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
+                <Icon name="users" size={14} color={accentColor} />
+                <Text style={[styles.listSheetActionLabel, { color: accentColor, fontFamily: jks('700') }]}>Share groceries</Text>
+              </TouchableOpacity>
+            ) : null}
+            {shareCode && isOwner ? (
               <>
                 {onMakePrivate ? (
                   <TouchableOpacity
                     onPress={onMakePrivate}
-                    style={[styles.listSheetActionBtn, { backgroundColor: `${accentColor}18`, borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
+                    style={[styles.listSheetActionBtn, { backgroundColor: `${accentColor}18`, borderColor: `${accentColor}80`, alignSelf: 'stretch', marginTop: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }]}>
                     <Icon name="home" size={14} color={accentColor} />
                     <Text
                       numberOfLines={2}
@@ -5309,13 +5645,13 @@ function GroceryShareSheet({ accentColor, shareCode, memberCount, isOwner, onClo
                   <Text style={[styles.listSheetActionLabel, { color: T.high, fontFamily: jks('700') }]}>Delete</Text>
                 </TouchableOpacity>
               </>
-            ) : (
+            ) : shareCode ? (
               <TouchableOpacity
                 onPress={onLeave}
                 style={[styles.listSheetActionBtn, { backgroundColor: 'transparent', borderColor: `${T.high}80`, alignSelf: 'stretch', marginTop: 16 }]}>
                 <Text style={[styles.listSheetActionLabel, { color: T.high, fontFamily: jks('700') }]}>Leave Shared Groceries</Text>
               </TouchableOpacity>
-            )}
+            ) : null}
           </View>
         </Animated.View>
       </View>
@@ -5641,9 +5977,11 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     renameSharedList,
     leaveSharedList,
     deleteSharedList,
+    joinSharedListByCode,
   } = useSharedLists();
   const [actionList, setActionList] = useState<TaskList | null>(null);
   const [showUpsell, setShowUpsell] = useState(false);
+  const [showJoinSheet, setShowJoinSheet] = useState(false);
   const onAddListPress = useCallback(() => {
     if (!isPaid) {
       setShowUpsell(true);
@@ -5741,6 +6079,20 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
   // glowing trash + tap UX in TaskRow (no modal — swipe reveals, tap deletes).
   const [confirmNode, confirm] = useConfirm(accentColor);
 
+  const openJoinSheet = useCallback(() => {
+    if (!syncUser) {
+      showToast('Sign in to join', 'Open Settings and sign in with Google');
+      return;
+    }
+    if (!isPaid) {
+      setShowUpsell(true);
+      return;
+    }
+    Keyboard.dismiss();
+    setActionList(null);
+    setTimeout(() => setShowJoinSheet(true), 0);
+  }, [isPaid, showToast, syncUser]);
+
   const requestComplete = useCallback((id: TaskId) => {
     handleComplete(id);
   }, [handleComplete]);
@@ -5805,6 +6157,8 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
   }, [setTasks, showToast, sharedActions]);
 
   const total = tasks.length;
+  const activeSharedDoc = sharedIdSet?.has(activeListId) ? sharedListsMap[activeListId] : null;
+  const activeSharedMemberCount = activeSharedDoc ? Object.keys(activeSharedDoc.members || {}).length : 0;
 
   // Edge-scroll while dragging: TierGroup reports the finger's pageY via onDragMove.
   // If it falls within EDGE_PX of the ScrollView's top/bottom, run an interval that
@@ -5851,6 +6205,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
         <View style={styles.listHeaderTop}>
           <View style={styles.listTitleRow}>
             <TouchableOpacity
+              style={styles.listTitleTap}
               activeOpacity={0.7}
               hitSlop={{ top: 8, bottom: 8, left: 16, right: 16 }}
               onPress={() => {
@@ -5865,24 +6220,27 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
                 numberOfLines={1}>
                 {lists.find(l => l.id === activeListId)?.name || DEFAULT_LIST_NAME}
               </Text>
+              <View style={[styles.listTitleEditMark, { borderColor: `${accentColor}66`, backgroundColor: `${accentColor}16` }]}>
+                <Icon name="pencil" size={9} color={accentColor} strokeWidth={1.8} />
+              </View>
             </TouchableOpacity>
           </View>
-          <View style={styles.listMetaRow}>
-            <Text style={[styles.listSubHeading, { color: T.textMute, fontFamily: jks('400') }]}>
-              {formatDate(new Date())}
-              <Text style={[styles.metaBullet, { color: T.textMute }]}>  •  </Text>
-              <Text style={[styles.taskCountInline, { color: T.textMute, fontFamily: jks('500') }]}>
-                {`${total} task${total !== 1 ? 's' : ''}`}
-              </Text>
+          <View style={styles.listMetaRowInline}>
+            <Text style={[styles.taskCountInline, { color: T.textMute, fontFamily: jks('500') }]}>
+              {`${total} task${total !== 1 ? 's' : ''}`}
             </Text>
+            {activeSharedDoc ? (
+              <>
+                <Text style={[styles.metaBullet, { color: T.textMute }]}>•</Text>
+                <View style={styles.sharedMetaPill}>
+                  <Icon name="users" size={11} color={accentColor} strokeWidth={1.8} />
+                  <Text style={[styles.taskCountInline, { color: accentColor, fontFamily: jks('700') }]}>
+                    {activeSharedMemberCount}
+                  </Text>
+                </View>
+              </>
+            ) : null}
           </View>
-          <TouchableOpacity
-            activeOpacity={0.7}
-            onPress={() => { const cur = lists.find(l => l.id === activeListId); if (cur) setActionList(cur); }}
-            style={[styles.headerActionBtnTopRight, { backgroundColor: `${accentColor}14`, borderColor: `${accentColor}55` }]}
-            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-            <Icon name="pencil" size={14} color={accentColor} strokeWidth={1.6} />
-          </TouchableOpacity>
           <TouchableOpacity
             activeOpacity={0.7}
             onPress={() => setScreen('archive')}
@@ -6001,6 +6359,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
               });
             }}
             onClose={() => setActionList(null)}
+            onJoinCode={openJoinSheet}
             onShareList={sharedDoc || !isPaid || isPersonal ? undefined : (pendingName?: string) => {
               // Promote to shared. Defer the confirm() call into a microtask
               // so it runs AFTER the action sheet unmount cycle settles —
@@ -6127,6 +6486,22 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
         );
       })()}
       {showUpsell && <ProUpsellSheet accentColor={accentColor} onClose={() => setShowUpsell(false)} showToast={showToast} />}
+      {showJoinSheet && (
+        <JoinSharedListSheet
+          accentColor={accentColor}
+          onClose={() => setShowJoinSheet(false)}
+          onSubmit={async (rawCode) => {
+            const id = await withTimeout(
+              joinSharedListByCode(rawCode),
+              15000,
+              'Join timed out. Check connection and make sure the latest Firestore rules are published.',
+            );
+            const joined = sharedListsMap[id];
+            if (joined?.kind === 'tasks') setActiveListId(id);
+            showToast(joined ? `Joined ${joined.name}` : 'Joined shared list');
+          }}
+        />
+      )}
       {toast && <View style={styles.toastContainer} pointerEvents="none"><Toast message={toast.message} sub={toast.sub} /></View>}
       {confirmNode}
     </KeyboardAvoidingView>
@@ -7431,12 +7806,10 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
   const isPaid = useIsPaid();
   const { restorePurchases } = useIAP();
   const { user: syncUser, signingIn, signIn: doSignIn, signOut: doSignOut, error: syncError, clearError: clearSyncError } = useSync();
-  const { joinSharedListByCode, sharedLists } = useSharedLists();
   const [showKey, setShowKey] = useState(false);
   const [keyDraft, setKeyDraft] = useState(apiKey);
   const [showUpsell, setShowUpsell] = useState(false);
   const [showDonate, setShowDonate] = useState(false);
-  const [showJoinSheet, setShowJoinSheet] = useState(false);
   const [editingCustomSlot, setEditingCustomSlot] = useState<number | null>(null);
   const [settingsToast, setSettingsToast] = useState<string | null>(null);
   const settingsToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -7574,36 +7947,6 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
           </View>
         )}
       </View>
-
-      {syncUser ? (
-        <>
-          <SettingsSection title="Shared Lists" />
-          <View style={[cardStyle, { marginBottom: 16 }]}>
-            <View style={{ paddingVertical: 14, paddingHorizontal: 14 }}>
-              <Text style={[styles.settingRowLabel, { color: T.text, fontFamily: jks('600') }]}>Join a shared list</Text>
-              <Text style={{ color: T.textMute, fontSize: 12, fontFamily: jks('400'), marginTop: 6, lineHeight: 17 }}>
-                Got a 6-character share code from someone? Enter it to add their list to your lists.
-                You can be in {SHARED_TASK_LIST_LIMIT} shared task lists and {SHARED_GROCERY_LIMIT} shared grocery list at a time.
-              </Text>
-              <TouchableOpacity
-                onPress={() => {
-                  if (!isPaid) { setShowUpsell(true); return; }
-                  setShowJoinSheet(true);
-                }}
-                style={{ marginTop: 12, height: 44, borderRadius: 10, backgroundColor: accent, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }}
-                activeOpacity={0.85}>
-                <Icon name="users" size={15} color="#fff" />
-                <Text style={[styles.sheetSaveLabel, { fontFamily: jks('700') }]}>Enter share code</Text>
-              </TouchableOpacity>
-              {Object.keys(sharedLists).length > 0 ? (
-                <Text style={{ color: T.textSub, fontSize: 12, fontFamily: jks('500'), marginTop: 10 }}>
-                  Currently in {Object.keys(sharedLists).length} shared list{Object.keys(sharedLists).length === 1 ? '' : 's'}.
-                </Text>
-              ) : null}
-            </View>
-          </View>
-        </>
-      ) : null}
 
       <SettingsSection title="Appearance" />
       <View style={cardStyle}>
@@ -7809,21 +8152,6 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
     {settingsToast && <View style={[styles.toastContainer, { pointerEvents: 'none' }]}><Toast message={settingsToast} /></View>}
     {showUpsell && <ProUpsellSheet accentColor={accent} onClose={() => setShowUpsell(false)} showToast={showSettingsToast} />}
     {showDonate && <DonateSheet accentColor={accent} onClose={() => setShowDonate(false)} />}
-    {showJoinSheet && (
-      <JoinSharedListSheet
-        accentColor={accent}
-        onClose={() => setShowJoinSheet(false)}
-        onSubmit={async (rawCode) => {
-          const id = await withTimeout(
-            joinSharedListByCode(rawCode),
-            15000,
-            'Join timed out. Check connection and make sure the latest Firestore rules are published.',
-          );
-          const joined = sharedLists[id];
-          showSettingsToast(joined ? `Joined ${joined.name}` : 'Joined shared list');
-        }}
-      />
-    )}
     {editingCustomSlot !== null && (
       <CustomThemeSheet
         initialDraft={customThemeDrafts[editingCustomSlot] ?? DEFAULT_CUSTOM_THEME_DRAFT}
@@ -7904,7 +8232,7 @@ const ONBOARDING_STEPS: OnboardingStep[] = [
   {
     icon: 'layers',
     title: 'Multiple lists',
-    body: 'Create as many lists as you need — Work, Home, Errands, whatever. Tap a list pill to switch. Long-press a list pill to drag and reorder. The pencil next to your list name renames or deletes the active list.',
+    body: 'Create as many lists as you need — Work, Home, Errands, whatever. Tap a list pill to switch. Long-press a list pill to drag and reorder. Tap the list name to manage the active list.',
   },
   {
     icon: 'shopping-bag',
@@ -8051,10 +8379,12 @@ function StandaloneGrocery({
   const insets = useSafeAreaInsets();
   const isPaid = useIsPaid();
   const { user: syncUser } = useSync();
+  const { joinSharedListByCode, sharedLists } = useSharedLists();
   const [grocerySortMode, setGrocerySortMode] = useState<'category' | 'alpha'>('category');
   const [toast, setToast] = useState<ToastData | null>(null);
   const [showUpsell, setShowUpsell] = useState(false);
   const [shareSheetOpen, setShareSheetOpen] = useState(false);
+  const [showJoinSheet, setShowJoinSheet] = useState(false);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [confirmNode, confirm] = useConfirm(accentColor);
   // AI Sort busy flag — set true while a sort request is in-flight, prevents
@@ -8088,6 +8418,33 @@ function StandaloneGrocery({
     });
   }, [aiSorting, showToast, onAiSortGrocery]);
 
+  const startShareGrocery = useCallback(() => {
+    setShareSheetOpen(false);
+    setTimeout(() => {
+      confirm({
+        title: 'Share Groceries',
+        message: 'Share your grocery list with a code? Anyone you give the code to can see and update this grocery list.',
+        confirmLabel: 'Share',
+        destructive: false,
+        onConfirm: () => {
+          showToast('Sharing groceries...', 'Creating share code', true);
+          onShareGrocery()
+            .then(() => {
+              showToast('Shared groceries created', 'Tap the people button for the code');
+              setShareSheetOpen(true);
+            })
+            .catch((e) => showToast('Could not share', e?.message || 'Check connection'));
+        },
+      });
+    }, 0);
+  }, [confirm, onShareGrocery, showToast]);
+
+  const openJoinSheet = useCallback(() => {
+    setShareSheetOpen(false);
+    Keyboard.dismiss();
+    setTimeout(() => setShowJoinSheet(true), 0);
+  }, []);
+
   const openShare = useCallback(() => {
     if (!syncUser) {
       showToast('Sign in to share', 'Open Settings and sign in with Google');
@@ -8097,26 +8454,8 @@ function StandaloneGrocery({
       setShowUpsell(true);
       return;
     }
-    if (sharedGrocery) {
-      setShareSheetOpen(true);
-      return;
-    }
-    confirm({
-      title: 'Share Groceries',
-      message: 'Share your grocery list with a code? Anyone you give the code to can see and update this grocery list.',
-      confirmLabel: 'Share',
-      destructive: false,
-      onConfirm: () => {
-        showToast('Sharing groceries...', 'Creating share code', true);
-        onShareGrocery()
-          .then(() => {
-            showToast('Shared groceries created', 'Tap the people button for the code');
-            setShareSheetOpen(true);
-          })
-          .catch((e) => showToast('Could not share', e?.message || 'Check connection'));
-      },
-    });
-  }, [confirm, isPaid, onShareGrocery, sharedGrocery, showToast, syncUser]);
+    setShareSheetOpen(true);
+  }, [isPaid, showToast, syncUser]);
 
   return (
     <KeyboardAvoidingView
@@ -8129,20 +8468,21 @@ function StandaloneGrocery({
               Groceries
             </Text>
           </View>
-          <View style={styles.listMetaRow}>
-            <Text style={[styles.listSubHeading, { color: T.textMute, fontFamily: jks('400') }]}>
-              {formatDate(new Date())}
-              <Text style={[styles.metaBullet, { color: T.textMute }]}>  •  </Text>
-              <Text style={[styles.taskCountInline, { color: T.textMute, fontFamily: jks('500') }]}>
-                {`${groceryItems.length} item${groceryItems.length !== 1 ? 's' : ''}`}
-              </Text>
-              <Text style={[styles.metaBullet, { color: T.textMute }]}>  •  </Text>
-              <Text style={[styles.taskCountInline, { color: sharedGrocery ? accentColor : T.textMute, fontFamily: jks('700') }]}>
-                {sharedGrocery
-                  ? `Shared · ${sharedGrocery.memberCount} member${sharedGrocery.memberCount === 1 ? '' : 's'}`
-                  : 'Private'}
-              </Text>
+          <View style={styles.listMetaRowInline}>
+            <Text style={[styles.taskCountInline, { color: T.textMute, fontFamily: jks('500') }]}>
+              {`${groceryItems.length} item${groceryItems.length !== 1 ? 's' : ''}`}
             </Text>
+            {sharedGrocery ? (
+              <>
+                <Text style={[styles.metaBullet, { color: T.textMute }]}>•</Text>
+                <View style={styles.sharedMetaPill}>
+                  <Icon name="users" size={11} color={accentColor} strokeWidth={1.8} />
+                  <Text style={[styles.taskCountInline, { color: accentColor, fontFamily: jks('700') }]}>
+                    {sharedGrocery.memberCount}
+                  </Text>
+                </View>
+              </>
+            ) : null}
           </View>
           <TouchableOpacity
             activeOpacity={0.7}
@@ -8186,22 +8526,24 @@ function StandaloneGrocery({
       {toast && <View style={styles.toastContainer} pointerEvents="none"><Toast message={toast.message} sub={toast.sub} /></View>}
       {confirmNode}
       {showUpsell && <ProUpsellSheet accentColor={accentColor} onClose={() => setShowUpsell(false)} showToast={showToast} />}
-      {shareSheetOpen && sharedGrocery && (
+      {shareSheetOpen && (
         <GroceryShareSheet
           accentColor={accentColor}
-          shareCode={sharedGrocery.shareCode}
-          memberCount={sharedGrocery.memberCount}
-          isOwner={sharedGrocery.isOwner}
+          shareCode={sharedGrocery?.shareCode}
+          memberCount={sharedGrocery?.memberCount}
+          isOwner={sharedGrocery?.isOwner}
           onClose={() => setShareSheetOpen(false)}
-          onRotateCode={async () => {
+          onShare={!sharedGrocery ? startShareGrocery : undefined}
+          onJoinCode={openJoinSheet}
+          onRotateCode={sharedGrocery ? async () => {
             try {
               await onRotateGroceryShareCode();
               showToast('Share code rotated', 'Old code no longer works');
             } catch (e: any) {
               showToast('Could not rotate', e?.message || 'Check connection');
             }
-          }}
-          onMakePrivate={sharedGrocery.isOwner ? () => {
+          } : undefined}
+          onMakePrivate={sharedGrocery?.isOwner ? () => {
             setShareSheetOpen(false);
             setTimeout(() => {
               confirm({
@@ -8218,7 +8560,7 @@ function StandaloneGrocery({
               });
             }, 0);
           } : undefined}
-          onLeave={() => {
+          onLeave={sharedGrocery ? () => {
             setShareSheetOpen(false);
             setTimeout(() => {
               confirm({
@@ -8234,8 +8576,8 @@ function StandaloneGrocery({
                 },
               });
             }, 0);
-          }}
-          onDelete={() => {
+          } : undefined}
+          onDelete={sharedGrocery ? () => {
             setShareSheetOpen(false);
             setTimeout(() => {
               confirm({
@@ -8251,6 +8593,21 @@ function StandaloneGrocery({
                 },
               });
             }, 0);
+          } : undefined}
+        />
+      )}
+      {showJoinSheet && (
+        <JoinSharedListSheet
+          accentColor={accentColor}
+          onClose={() => setShowJoinSheet(false)}
+          onSubmit={async (rawCode) => {
+            const id = await withTimeout(
+              joinSharedListByCode(rawCode),
+              15000,
+              'Join timed out. Check connection and make sure the latest Firestore rules are published.',
+            );
+            const joined = sharedLists[id];
+            showToast(joined ? `Joined ${joined.name}` : 'Joined shared list');
           }}
         />
       )}
@@ -9138,7 +9495,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
         <PortalHost>
           <BackButtonManager screen={screen} setScreen={setScreen} />
           <View style={{ flex: 1, overflow: 'hidden' }}>
-            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItems} setScreen={setScreen} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} />}
+            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} />}
             {screen === 'grocery' && (
               <StandaloneGrocery
                 groceryItems={groceryItemsForScreen}
@@ -9275,7 +9632,14 @@ const styles = StyleSheet.create({
   // Drop indicator line shown while a task is being dragged within its tier — sits
   // at the edge of the slot the row would land in on release.
   dropIndicator: { position: 'absolute', left: 8, right: 8, height: 3, borderRadius: 2 },
-  taskRowContent: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 13, paddingLeft: 12, paddingRight: 10, borderLeftWidth: 3 },
+  taskRowContent: { position: 'relative', overflow: 'hidden', flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 13, paddingLeft: 12, paddingRight: 10, borderLeftWidth: 3 },
+  newItemShineOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  newItemShineSweep: { position: 'absolute', top: -18, bottom: -18, width: 92, borderRadius: 999 },
+  newItemShineSweepCore: { position: 'absolute', top: -18, bottom: -18, width: 22, borderRadius: 999 },
+  newItemShineEdge: { position: 'absolute', top: 2, left: 3, right: 2, bottom: 2, borderWidth: 2 },
+  newItemShineContrastEdge: { position: 'absolute', top: 1, left: 2, right: 1, bottom: 1, borderWidth: 1 },
+  newItemShineSparkle: { position: 'absolute', right: 46, top: 8, width: 7, height: 7, borderRadius: 4 },
+  newItemShineSparkleSmall: { position: 'absolute', right: 34, bottom: 8, width: 4, height: 4, borderRadius: 2 },
   taskTierBadge: { width: 22, height: 22, borderRadius: 11, borderWidth: 2, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   taskTierDot: { width: 6, height: 6, borderRadius: 3, opacity: 0.9 },
   taskText: { fontSize: 14.5, lineHeight: 20 },
@@ -9318,20 +9682,19 @@ const styles = StyleSheet.create({
   listPillAddIcon: { paddingHorizontal: 8, justifyContent: 'center' },
   listPillLabel: { fontSize: 12 },
 
-  // Title row for the active list — list name centered, action buttons (pencil + archive)
-  // are absolutely-positioned over the header at fixed `right`, so their x-position never
-  // shifts with list-name length. Top button (pencil) sits next to the title row;
-  // bottom button (archive) sits next to the date+counter row directly below.
-  // The buttons are positioned relative to listHeaderTop, with `right: 0` (not 16) since
-  // listHeader already has paddingHorizontal: 16. Pencil top: 0 lines it up with the
-  // title row; archive top: 32 lines it up with the date row beneath.
+  // The list name opens list settings. Archive stays fixed at the right edge
+  // so header layout does not shift with long list names.
   listTitleRow: { alignItems: 'center', justifyContent: 'center', minHeight: 28, paddingHorizontal: 48 },
-  listTitleText: { fontSize: 22, letterSpacing: -0.4 },
-  headerActionBtnTopRight: { position: 'absolute', right: 0, top: 0, width: 28, height: 28, borderRadius: 8, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
-  headerActionBtnBottomRight: { position: 'absolute', right: 0, top: 32, width: 28, height: 28, borderRadius: 8, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  listTitleTap: { maxWidth: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 },
+  listTitleText: { fontSize: 22, letterSpacing: 0, flexShrink: 1 },
+  listTitleEditMark: { width: 15, height: 15, borderRadius: 8, borderWidth: 1, alignItems: 'center', justifyContent: 'center', marginTop: 2, flexShrink: 0 },
+  headerActionBtnTopRight: { position: 'absolute', right: 0, top: 0, width: 32, height: 32, borderRadius: 8, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  headerActionBtnBottomRight: { position: 'absolute', right: 0, top: -2, width: 32, height: 32, borderRadius: 8, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   metaBullet: { fontSize: 12 },
   taskCountInline: { fontSize: 12 },
   listMetaRow: { alignItems: 'center', marginTop: 2, marginBottom: 2 },
+  listMetaRowInline: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 2, marginBottom: 2, flexWrap: 'wrap' },
+  sharedMetaPill: { flexDirection: 'row', alignItems: 'center', gap: 4 },
   groceryActionPillRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, gap: 8 },
   groceryViewSwitchWrap: { paddingHorizontal: 16, paddingTop: 10 },
   groceryViewSwitch: { flexDirection: 'row', alignItems: 'center', height: 36, borderRadius: 10, borderWidth: 1, padding: 3, gap: 3 },
