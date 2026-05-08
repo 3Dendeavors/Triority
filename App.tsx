@@ -119,6 +119,7 @@ interface ArchivedTask {
   text: string;
   tier: Tier;
   completedAt: number;
+  createdAt?: number;
   reminder?: Reminder; // preserved so restore can reinstate it
   listId?: string;     // origin list, for list-scoped archive view + restore-to-origin (v1.2+)
   sharedListId?: string;
@@ -881,6 +882,7 @@ interface SharedListsContextValue {
   editSharedTaskItem: (listId: string, itemId: string, patch: { text?: string; tier?: Tier; reminder?: Reminder | null }) => Promise<void>;
   deleteSharedTaskItem: (listId: string, itemId: string) => Promise<void>;
   archiveSharedTaskItem: (listId: string, itemId: string, item: { text: string; tier: Tier; createdAt?: number }) => Promise<void>;
+  restoreSharedArchiveItem: (listId: string, archiveId: string, item: { text: string; tier: Tier; createdAt?: number }) => Promise<void>;
   deleteSharedArchiveItem: (listId: string, archiveId: string) => Promise<void>;
   addSharedGroceryItems: (listId: string, items: GroceryDraft[]) => Promise<void>;
   updateSharedGroceryItem: (listId: string, itemId: string, patch: { name?: string; category?: string; checked?: boolean }) => Promise<void>;
@@ -924,6 +926,7 @@ const SharedListsContext = createContext<SharedListsContextValue>({
   editSharedTaskItem: async () => { throw new Error('SharedListsProvider not mounted'); },
   deleteSharedTaskItem: async () => { throw new Error('SharedListsProvider not mounted'); },
   archiveSharedTaskItem: async () => { throw new Error('SharedListsProvider not mounted'); },
+  restoreSharedArchiveItem: async () => { throw new Error('SharedListsProvider not mounted'); },
   deleteSharedArchiveItem: async () => { throw new Error('SharedListsProvider not mounted'); },
   addSharedGroceryItems: async () => { throw new Error('SharedListsProvider not mounted'); },
   updateSharedGroceryItem: async () => { throw new Error('SharedListsProvider not mounted'); },
@@ -1701,6 +1704,111 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     await deleteDoc(doc(db, 'sharedLists', listId, 'archive', archiveId));
   }, [user]);
 
+  const restoreSharedArchiveItem = useCallback(async (listId: string, archiveId: string, item: { text: string; tier: Tier; createdAt?: number }) => {
+    if (!user) throw new Error('Not signed in');
+    const now = Date.now();
+    if (isSupabaseSharedListId(listId)) {
+      const restoredId = randomUuid();
+      const row = {
+        id: restoredId,
+        list_id: listId,
+        text: item.text,
+        tier: item.tier,
+        checked: false,
+        created_by: user.uid,
+        created_at: new Date(item.createdAt || now).toISOString(),
+        last_edited_by: user.uid,
+        last_edited_at: new Date(now).toISOString(),
+      };
+      const restored = mapSupabaseItem(row);
+      let prevItems: SharedListItem[] | undefined;
+      let prevArchives: SharedArchiveItem[] | undefined;
+      pendingSharedItemIdsRef.current.add(restoredId);
+      setSharedItems((prev) => {
+        prevItems = prev[listId];
+        return { ...prev, [listId]: [...(prev[listId] || []), restored] };
+      });
+      setSharedArchives((prev) => {
+        prevArchives = prev[listId];
+        return { ...prev, [listId]: (prev[listId] || []).filter((it) => it.id !== archiveId) };
+      });
+      const rollback = () => {
+        pendingSharedItemIdsRef.current.delete(restoredId);
+        setSharedItems((prev) => ({ ...prev, [listId]: prevItems || [] }));
+        setSharedArchives((prev) => {
+          if (prevArchives === undefined) {
+            const next = { ...prev };
+            delete next[listId];
+            return next;
+          }
+          return { ...prev, [listId]: prevArchives };
+        });
+      };
+      const { error: insertError } = await supabase.from('tri_shared_items').insert(row);
+      if (insertError) {
+        rollback();
+        throw new Error(supabaseErrorMessage(insertError, 'Could not restore shared task.'));
+      }
+      const { error: deleteError } = await supabase.from('tri_shared_archives').delete().eq('id', archiveId).eq('list_id', listId);
+      if (deleteError) {
+        try {
+          await supabase.from('tri_shared_items').delete().eq('id', restoredId).eq('list_id', listId);
+        } catch {}
+        rollback();
+        throw new Error(supabaseErrorMessage(deleteError, 'Could not remove shared archive item.'));
+      }
+      return;
+    }
+    const db = getFirestore(getApp());
+    const itemRef = doc(collection(db, 'sharedLists', listId, 'items'));
+    const archiveRef = doc(db, 'sharedLists', listId, 'archive', archiveId);
+    const restored: SharedListItem = stripUndefined({
+      id: itemRef.id,
+      text: item.text,
+      tier: item.tier,
+      completed: false,
+      createdBy: user.uid,
+      createdAt: item.createdAt || now,
+      lastEditedBy: user.uid,
+      lastEditedAt: now,
+    }) as SharedListItem;
+    let prevItems: SharedListItem[] | undefined;
+    let prevArchives: SharedArchiveItem[] | undefined;
+    setSharedItems((prev) => {
+      prevItems = prev[listId];
+      return { ...prev, [listId]: [...(prev[listId] || []), restored] };
+    });
+    setSharedArchives((prev) => {
+      prevArchives = prev[listId];
+      return { ...prev, [listId]: (prev[listId] || []).filter((it) => it.id !== archiveId) };
+    });
+    const batch = writeBatch(db);
+    batch.set(itemRef, stripUndefined({
+      text: restored.text,
+      tier: restored.tier,
+      completed: false,
+      createdBy: restored.createdBy,
+      createdAt: restored.createdAt,
+      lastEditedBy: restored.lastEditedBy,
+      lastEditedAt: restored.lastEditedAt,
+    }));
+    batch.delete(archiveRef);
+    try {
+      await batch.commit();
+    } catch (e) {
+      setSharedItems((prev) => ({ ...prev, [listId]: prevItems || [] }));
+      setSharedArchives((prev) => {
+        if (prevArchives === undefined) {
+          const next = { ...prev };
+          delete next[listId];
+          return next;
+        }
+        return { ...prev, [listId]: prevArchives };
+      });
+      throw e;
+    }
+  }, [user]);
+
   const addSharedGroceryItems = useCallback(async (listId: string, items: GroceryDraft[]) => {
     if (!user) throw new Error('Not signed in');
     if (items.length === 0) return;
@@ -2353,6 +2461,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     editSharedTaskItem,
     deleteSharedTaskItem,
     archiveSharedTaskItem,
+    restoreSharedArchiveItem,
     deleteSharedArchiveItem,
     addSharedGroceryItems,
     updateSharedGroceryItem,
@@ -7015,6 +7124,7 @@ interface ArchiveProps {
   lists: TaskList[];
   activeListId: string;
   setListTasks: (listId: string, fn: (prev: Task[]) => Task[]) => void;
+  onRestoreSharedArchiveItem?: (listId: string, archiveId: string, item: { text: string; tier: Tier; createdAt?: number }) => Promise<void>;
   onDeleteSharedArchiveItem?: (listId: string, archiveId: string) => Promise<void>;
   collapsedGroups: CollapsedGroups;
   setCollapsedGroup: (key: string, collapsed: boolean) => void;
@@ -7032,7 +7142,7 @@ function weekLabel(weekStart: number): string {
   return `${fmt(new Date(weekStart))} – ${fmt(end)}`;
 }
 
-function Archive({ archive, setArchive, accentColor, lists, activeListId, setListTasks, onDeleteSharedArchiveItem, collapsedGroups, setCollapsedGroup }: ArchiveProps) {
+function Archive({ archive, setArchive, accentColor, lists, activeListId, setListTasks, onRestoreSharedArchiveItem, onDeleteSharedArchiveItem, collapsedGroups, setCollapsedGroup }: ArchiveProps) {
   const T = useT();
   const TIERS = TIERS_DEF(T);
   const insets = useSafeAreaInsets();
@@ -7042,6 +7152,9 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
   const [calOpen, setCalOpen] = useState(false);
   const [listFilter, setListFilter] = useState<string>(activeListId);
   const [confirmNode, confirm] = useConfirm(accentColor);
+  const pillScrollRef = useRef<any>(null);
+  const pillLayoutsRef = useRef<Record<string, { x: number; width: number }>>({});
+  const [pillViewportWidth, setPillViewportWidth] = useState(0);
   const privateArchiveCount = useMemo(() => archive.filter(item => !item.sharedListId).length, [archive]);
 
   const thisWeekStart = startOfWeekMonday(Date.now());
@@ -7051,15 +7164,39 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
   const isCollapsed = (wStart: number) => collapsedGroups[archiveGroupKey(wStart)] ?? (wStart < lastWeekStart);
   const toggleCollapse = (wStart: number) => setCollapsedGroup(archiveGroupKey(wStart), !isCollapsed(wStart));
 
-  const handleRestore = useCallback((id: TaskId) => {
-    const item = archive.find(a => a.id === id);
-    if (!item || item.sharedListId) return;
+  const centerSelectedPill = useCallback((id: string) => {
+    const layout = pillLayoutsRef.current[id];
+    if (!layout || !pillViewportWidth || !pillScrollRef.current) return;
+    const x = Math.max(0, layout.x + layout.width / 2 - pillViewportWidth / 2);
+    pillScrollRef.current.scrollTo({ x, animated: true });
+  }, [pillViewportWidth]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => centerSelectedPill(listFilter), 60);
+    return () => clearTimeout(timer);
+  }, [centerSelectedPill, listFilter, lists.length]);
+
+  const rememberPillLayout = useCallback((id: string) => (event: any) => {
+    pillLayoutsRef.current[id] = event.nativeEvent.layout;
+    if (id === listFilter) setTimeout(() => centerSelectedPill(id), 0);
+  }, [centerSelectedPill, listFilter]);
+
+  const handleRestore = useCallback((item: ArchivedTask) => {
+    if (item.sharedListId) {
+      if (!onRestoreSharedArchiveItem) return;
+      onRestoreSharedArchiveItem(item.sharedListId, String(item.id), {
+        text: item.text,
+        tier: item.tier,
+        createdAt: item.createdAt,
+      }).catch(() => {});
+      return;
+    }
     const targetListId = (item.listId && lists.some(l => l.id === item.listId)) ? item.listId : activeListId;
     const restored: Task = { id: Date.now(), text: item.text, tier: item.tier, createdAt: Date.now(), reminder: item.reminder };
     setListTasks(targetListId, ts => [restored, ...ts]);
-    setArchive(a => a.filter(a => a.id !== id));
+    setArchive(a => a.filter(a => a.id !== item.id));
     if (restored.reminder) scheduleRemindersBatch([restored], () => {});
-  }, [archive, lists, activeListId, setListTasks, setArchive]);
+  }, [lists, activeListId, setListTasks, setArchive, onRestoreSharedArchiveItem]);
 
   const handleDeleteShared = useCallback((item: ArchivedTask) => {
     if (!item.sharedListId || !onDeleteSharedArchiveItem) return;
@@ -7185,12 +7322,15 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
         </Text>
         {lists.length > 1 && (
           <ScrollView
+            ref={pillScrollRef}
             horizontal
             showsHorizontalScrollIndicator={false}
+            onLayout={(event) => setPillViewportWidth(event.nativeEvent.layout.width)}
             contentContainerStyle={styles.listPillRowContent}
             style={[styles.listPillRow, { marginTop: 10 }]}>
             <TouchableOpacity
               activeOpacity={0.7}
+              onLayout={rememberPillLayout(ARCHIVE_ALL_FILTER)}
               onPress={() => setListFilter(ARCHIVE_ALL_FILTER)}
               style={[styles.listPill, { backgroundColor: listFilter === ARCHIVE_ALL_FILTER ? accentColor : 'transparent', borderColor: listFilter === ARCHIVE_ALL_FILTER ? accentColor : T.borderMid }]}>
               <Text style={[styles.listPillLabel, { color: listFilter === ARCHIVE_ALL_FILTER ? readableOn(accentColor) : T.textSub, fontFamily: jks(listFilter === ARCHIVE_ALL_FILTER ? '700' : '500') }]}>
@@ -7204,6 +7344,7 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
                 <TouchableOpacity
                   key={l.id}
                   activeOpacity={0.7}
+                  onLayout={rememberPillLayout(l.id)}
                   onPress={() => setListFilter(l.id)}
                   style={[styles.listPill, { backgroundColor: sel ? tint : 'transparent', borderColor: sel ? tint : T.borderMid }]}>
                   <Text style={[styles.listPillLabel, { color: sel ? readableOn(tint) : T.textSub, fontFamily: jks(sel ? '700' : '500') }]} numberOfLines={1}>
@@ -7265,7 +7406,7 @@ interface ArchiveItemProps {
   item: ArchivedTask;
   tiers: { id: Tier; label: string; color: string; bg: string }[];
   accentColor: string;
-  onRestore: (id: TaskId) => void;
+  onRestore: (item: ArchivedTask) => void;
   onDeleteShared: (item: ArchivedTask) => void;
 }
 
@@ -7286,13 +7427,18 @@ function ArchiveItem({ item, tiers, accentColor, onRestore, onDeleteShared }: Ar
         <Text style={[styles.archiveItemDay, { color: T.textMute, fontFamily: jks('400') }]}>{metaLabel}</Text>
       </View>
       {item.sharedListId ? (
-        item.sharedCanDelete ? (
+        <>
+        <TouchableOpacity onPress={() => onRestore(item)} style={styles.restoreBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+          <Icon name="restore" size={15} color={accentColor} />
+        </TouchableOpacity>
+        {item.sharedCanDelete ? (
           <TouchableOpacity onPress={() => onDeleteShared(item)} style={styles.restoreBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
             <Icon name="trash" size={15} color={accentColor} />
           </TouchableOpacity>
-        ) : null
+        ) : null}
+        </>
       ) : (
-        <TouchableOpacity onPress={() => onRestore(item.id)} style={styles.restoreBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+        <TouchableOpacity onPress={() => onRestore(item)} style={styles.restoreBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
           <Icon name="restore" size={15} color={accentColor} />
         </TouchableOpacity>
       )}
@@ -9599,6 +9745,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     editSharedTaskItem,
     deleteSharedTaskItem,
     archiveSharedTaskItem,
+    restoreSharedArchiveItem,
     deleteSharedArchiveItem,
     promoteGroceryListToShared,
     addSharedGroceryItems,
@@ -9708,6 +9855,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
           text: item.text || '',
           tier: item.tier || 'medium',
           completedAt: item.completedAt || 0,
+          createdAt: item.createdAt,
           listId: l.id,
           sharedListId: l.id,
           sharedListName: l.name,
@@ -9987,7 +10135,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
                 setCollapsedGroup={setCollapsedGroup}
               />
             )}
-            {screen === 'archive' && <Archive archive={combinedArchive} setArchive={setArchive} accentColor={accentColor} lists={mergedLists} activeListId={activeListId} setListTasks={setListTasks} onDeleteSharedArchiveItem={deleteSharedArchiveItem} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} />}
+            {screen === 'archive' && <Archive archive={combinedArchive} setArchive={setArchive} accentColor={accentColor} lists={mergedLists} activeListId={activeListId} setListTasks={setListTasks} onRestoreSharedArchiveItem={restoreSharedArchiveItem} onDeleteSharedArchiveItem={deleteSharedArchiveItem} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} />}
             {screen === 'settings' && (
               <Settings accent={accentColor} apiKey={apiKey} setApiKey={setApiKey}
                 hasApiKey={hasApiKey} setHasApiKey={setHasApiKey} personalContext={personalContext} setPersonalContext={setPersonalContext}
