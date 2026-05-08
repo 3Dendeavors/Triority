@@ -3,6 +3,14 @@
 ## Unreleased
 
 - Recover existing Supabase grocery memberships when the server says the user is already in a shared grocery list, so stale/orphaned memberships can be surfaced in-app instead of blocking sharing.
+- Replaced the recent-add soft glow with a short gold shine/glint animation for newly added task and grocery rows.
+- Center the horizontal task-list pill row on the selected list when the active list changes.
+- Moved shared-list join-code entry from Settings into task-list and grocery management flows, keeping the keyboard-aware code-entry sheet.
+- Changed task-list management to use the tappable list title with a small pencil mark, avoiding the copy-looking clipboard button.
+- Matched shared task-list and shared grocery header readouts with the same people-icon/member-count language instead of private/shared text.
+- Adjusted keyboard-aware sheet sizing for task-edit and list-settings modals so normal-sized phones should not scroll by default without adding an artificial gap above Samsung/Gboard.
+- Routed task-screen AI grocery/material output through the active grocery surface, so generated items land in a shared grocery list when that is the current grocery workspace.
+- Removed the date from task and grocery headers and aligned the task archive button with the active list title row.
 
 ## v1.4.3
 
