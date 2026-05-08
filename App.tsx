@@ -74,7 +74,7 @@ import {
 } from 'react-native-speech-recognition-kit';
 import Feather from '@react-native-vector-icons/feather';
 import Ionicons from '@react-native-vector-icons/ionicons';
-import notifee, { AndroidImportance, AndroidNotificationSetting, TriggerType, RepeatFrequency, AuthorizationStatus } from '@notifee/react-native';
+import notifee, { AndroidImportance, AndroidNotificationSetting, TriggerType, RepeatFrequency, AuthorizationStatus, EventType } from '@notifee/react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -104,6 +104,8 @@ interface Task {
   tier: Tier;
   createdAt: number;
   reminder?: Reminder;
+  reminderListId?: string;
+  reminderTaskId?: TaskId;
   // Step 13: shared-item provenance baked in by the parent adapter when a Task
   // originates from a sharedLists/{id}/items doc. Absent on private items.
   // TaskRow shows a member avatar dot + initial + relative-time when present.
@@ -146,6 +148,12 @@ interface GroceryItem {
   checked: boolean;
   createdAt: number;
 }
+
+type ReminderNavTarget = {
+  listId?: string;
+  taskId?: string;
+  scheduledTaskId?: string;
+};
 
 interface GroceryDraft {
   name: string;
@@ -301,6 +309,7 @@ const SHARED_GROCERY_TOGGLE_KEY = 'tri_shared_grocery_view';   // '1' = viewing 
 const SUPABASE_SHARED_GROCERY_ID_KEY = 'tri_supabase_shared_grocery_id_v1';
 const SHARED_CACHE_KEY = 'tri_shared_cache_v1';
 const COLLAPSED_GROUPS_KEY = 'tri_collapsed_groups_v1';
+const REMINDER_NAV_KEY = 'tri_pending_reminder_nav_v1';
 const SHARED_STALE_RESTORE_CUTOFF_MS = new Date('2026-05-07T00:00:00-04:00').getTime();
 
 function isMissingOrPermissionError(e: any) {
@@ -3093,6 +3102,16 @@ function notifIdForTask(taskId: TaskId): string {
   return `tri-task-${taskId}`;
 }
 
+function reminderTargetFromData(data?: Record<string, any> | null): ReminderNavTarget | null {
+  if (!data) return null;
+  const route = String(data.route || '');
+  const taskId = data.taskId == null ? undefined : String(data.taskId);
+  const listId = data.listId == null ? undefined : String(data.listId);
+  const scheduledTaskId = data.scheduledTaskId == null ? taskId : String(data.scheduledTaskId);
+  if (route !== 'taskReminder' && !taskId) return null;
+  return { listId, taskId, scheduledTaskId };
+}
+
 // Returns true if exact-alarm permission is granted (Android 12+).
 // On non-Android (or older Android), always true. Does NOT prompt or redirect.
 async function hasExactAlarmPerm(): Promise<boolean> {
@@ -3142,6 +3161,7 @@ async function scheduleReminder(task: Task) {
     }
   }
 
+  const displayTaskId = task.reminderTaskId ?? task.id;
   await notifee.createTriggerNotification(
     {
       id: notifIdForTask(task.id),
@@ -3153,7 +3173,12 @@ async function scheduleReminder(task: Task) {
         // 'default' pressAction with no launchActivity opens the app's main activity
         pressAction: { id: 'default' },
       },
-      data: { taskId: String(task.id) },
+      data: stripUndefined({
+        route: 'taskReminder',
+        taskId: String(displayTaskId),
+        scheduledTaskId: String(task.id),
+        listId: task.reminderListId,
+      }),
     },
     {
       type: TriggerType.TIMESTAMP,
@@ -3176,8 +3201,11 @@ async function cancelReminder(taskId: TaskId) {
 async function scheduleRemindersBatch(
   tasks: Task[],
   showToast: (msg: string, sub?: string) => void,
+  listId?: string,
 ) {
-  const remTasks = tasks.filter(t => t.reminder);
+  const remTasks = tasks
+    .filter(t => t.reminder)
+    .map(t => stripUndefined({ ...t, reminderListId: t.reminderListId ?? listId, reminderTaskId: t.reminderTaskId ?? t.id }) as Task);
   if (remTasks.length === 0) return;
 
   if (!(await requestReminderSchedulingPermissions(showToast))) return;
@@ -3685,6 +3713,7 @@ interface TaskRowProps {
   onDragMove: (dy: number, fingerPageY: number) => void;
   onDragEnd: (committed: boolean) => void;
   isDragging: boolean;
+  focused?: boolean;
 }
 
 const REVEAL_X = -72; // distance the row holds at when trash is revealed
@@ -3792,7 +3821,7 @@ function MemberAvatar({ slot, initial, size = 14 }: { slot: number; initial: str
   );
 }
 
-function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentColor, onLongPressStart, onDragMove, onDragEnd, isDragging }: TaskRowProps) {
+function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentColor, onLongPressStart, onDragMove, onDragEnd, isDragging, focused }: TaskRowProps) {
   const T = useT();
   const TIERS = TIERS_DEF(T);
   const tier = TIERS.find(t => t.id === task.tier)!;
@@ -3994,8 +4023,14 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
         onTouchCancel={handleTouchEnd}
         style={[
           styles.taskRowContent,
-          { transform: [{ translateX }], backgroundColor: T.s2, borderLeftColor: tier.color },
+          { transform: [{ translateX }], backgroundColor: T.s2, borderLeftColor: focused ? accentColor : tier.color },
         ]}>
+        {focused ? (
+          <View
+            pointerEvents="none"
+            style={[styles.reminderFocusOverlay, { borderColor: accentColor, backgroundColor: `${accentColor}14` }]}
+          />
+        ) : null}
         <Animated.View
           pointerEvents="none"
           style={[
@@ -4149,10 +4184,13 @@ interface TierGroupProps {
   onDragMove?: (pageY: number | null) => void;
   collapsed: boolean;
   onCollapsedChange: (collapsed: boolean) => void;
+  focusedTaskId?: string | null;
+  onFocusedTaskLayout?: (y: number) => void;
 }
 
-function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit, accentColor, onReorderInTier, onDragMove, collapsed, onCollapsedChange }: TierGroupProps) {
+function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit, accentColor, onReorderInTier, onDragMove, collapsed, onCollapsedChange, focusedTaskId, onFocusedTaskLayout }: TierGroupProps) {
   const T = useT();
+  const tierYRef = useRef(0);
 
   // Drag state. dragId = id of the task currently being dragged (null = no drag).
   // dragOffsetY = signed offset from the dragged row's resting Y, used to translate
@@ -4215,7 +4253,9 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
   };
 
   return (
-    <View style={{ marginBottom: 20 }}>
+    <View
+      style={{ marginBottom: 20 }}
+      onLayout={(e) => { tierYRef.current = e.nativeEvent.layout.y; }}>
       <TouchableOpacity onPress={() => onCollapsedChange(!collapsed)} style={styles.tierHeader} activeOpacity={0.7}>
         <View style={[styles.tierHeaderDot, { backgroundColor: tier.color }]} />
         <Text style={[styles.tierHeaderLabel, { color: tier.color, fontFamily: jks('700') }]}>{tier.label}</Text>
@@ -4233,6 +4273,9 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
                 onLayout={(e) => {
                   const { y, height } = e.nativeEvent.layout;
                   layoutsRef.current[index] = { y, height };
+                  if (focusedTaskId && String(task.id) === focusedTaskId) {
+                    onFocusedTaskLayout?.(tierYRef.current + y);
+                  }
                 }}
                 style={{
                   opacity: isDragging ? 0.25 : 1,
@@ -4251,6 +4294,7 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
                   onDragMove={handleDragMove}
                   onDragEnd={handleDragEnd}
                   isDragging={isDragging}
+                  focused={focusedTaskId === String(task.id)}
                 />
               </View>
             );
@@ -6183,9 +6227,10 @@ interface ActiveListProps {
   sharedIdSet?: Set<string>;
   collapsedGroups: CollapsedGroups;
   setCollapsedGroup: (key: string, collapsed: boolean) => void;
+  focusedTaskId?: string | null;
 }
 
-function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, defaultTier, setArchive, activeListId, lists, setActiveListId, addList, renameList, deleteList, reorderLists, onAddGroceryItems, setScreen, sharedActions, sharedIdSet, collapsedGroups, setCollapsedGroup }: ActiveListProps) {
+function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, defaultTier, setArchive, activeListId, lists, setActiveListId, addList, renameList, deleteList, reorderLists, onAddGroceryItems, setScreen, sharedActions, sharedIdSet, collapsedGroups, setCollapsedGroup, focusedTaskId }: ActiveListProps) {
   const isPaid = useIsPaid();
   const { user: syncUser } = useSync();
   const {
@@ -6337,8 +6382,8 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
       reminder: item.reminder,
     }));
     setTasks(ts => [...ts, ...newTasks]);
-    scheduleRemindersBatch(newTasks, showToast);
-  }, [setTasks, showToast, sharedActions]);
+    scheduleRemindersBatch(newTasks, showToast, activeListId);
+  }, [activeListId, setTasks, showToast, sharedActions]);
 
   const handleAddManyToList = useCallback((listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => {
     if (sharedIdSet?.has(listId)) {
@@ -6358,7 +6403,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
       reminder: item.reminder,
     }));
     setListTasks(listId, ts => [...ts, ...newTasks]);
-    scheduleRemindersBatch(newTasks, showToast);
+    scheduleRemindersBatch(newTasks, showToast, listId);
   }, [addSharedTaskItems, setListTasks, sharedIdSet, showToast]);
 
   const handleSave = useCallback((updated: Task) => {
@@ -6375,12 +6420,12 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     setTasks(ts => ts.map(t => (t.id === updated.id ? updated : t)));
     // Re-schedule (or cancel) when the reminder changes via edit
     if (updated.reminder) {
-      scheduleRemindersBatch([updated], showToast);
+      scheduleRemindersBatch([updated], showToast, activeListId);
     } else {
       cancelReminder(updated.id).catch(() => {});
     }
     setEditingTask(null);
-  }, [setTasks, showToast, sharedActions]);
+  }, [activeListId, setTasks, showToast, sharedActions]);
 
   const total = tasks.length;
   const activeSharedDoc = sharedIdSet?.has(activeListId) ? sharedListsMap[activeListId] : null;
@@ -6393,6 +6438,19 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
   const scrollOffsetRef = useRef(0);
   const scrollViewLayoutRef = useRef<{ y: number; height: number }>({ y: 0, height: 0 });
   const edgeScrollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const focusedTaskTier = useMemo(() => tasks.find(t => String(t.id) === focusedTaskId)?.tier, [focusedTaskId, tasks]);
+
+  useEffect(() => {
+    if (!focusedTaskId || !focusedTaskTier) return;
+    const collapseKey = `tasks:${activeListId}:${focusedTaskTier}`;
+    if (collapsedGroups[collapseKey]) setCollapsedGroup(collapseKey, false);
+  }, [activeListId, collapsedGroups, focusedTaskId, focusedTaskTier, setCollapsedGroup]);
+
+  const scrollToFocusedTask = useCallback((y: number) => {
+    setTimeout(() => {
+      scrollRef.current?.scrollTo({ y: Math.max(0, y - 72), animated: true });
+    }, 80);
+  }, []);
 
   const stopEdgeScroll = () => {
     if (edgeScrollTimerRef.current) {
@@ -6527,7 +6585,9 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
                 onComplete={handleComplete} onDelete={handleDelete} requestComplete={requestComplete} onEdit={setEditingTask} accentColor={accentColor}
                 onReorderInTier={handleReorderInTier} onDragMove={handleDragMovePageY}
                 collapsed={collapsedGroups[collapseKey] ?? false}
-                onCollapsedChange={(next) => setCollapsedGroup(collapseKey, next)} />
+                onCollapsedChange={(next) => setCollapsedGroup(collapseKey, next)}
+                focusedTaskId={focusedTaskId}
+                onFocusedTaskLayout={scrollToFocusedTask} />
             );
           })
         )}
@@ -8883,6 +8943,8 @@ function TriorityApp() {
   const [groceryItems, setGroceryItemsState] = useState<GroceryItem[]>([]);
   const [viewingSharedGrocery, setViewingSharedGroceryState] = useState(false);
   const [collapsedGroups, setCollapsedGroupsState] = useState<CollapsedGroups>({});
+  const [pendingReminderNav, setPendingReminderNav] = useState<ReminderNavTarget | null>(null);
+  const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
 
   const persistGrocery = (items: GroceryItem[]) => {
     AsyncStorage.setItem('tri_grocery', JSON.stringify(items)).catch(() => {});
@@ -9015,12 +9077,44 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       // Reminders are global across lists — flatten task arrays for the sync.
       // Always reconcile, even when no tasks have reminders, so orphaned alarms
       // (e.g. left over after deleting the last reminder-bearing task) get cancelled.
-      const allTasks = data.lists.flatMap(l => l.tasks);
+      const allTasks = data.lists.flatMap(l =>
+        l.tasks.map(t => ({ ...t, reminderListId: l.id, reminderTaskId: t.id })),
+      );
       try {
         await ensureNotifChannel();
         await syncAllReminders(allTasks);
       } catch {}
     });
+  }, []);
+
+  useEffect(() => {
+    const handleTarget = (target: ReminderNavTarget | null) => {
+      if (!target) return;
+      setPendingReminderNav(target);
+    };
+    const consumeStoredTarget = async () => {
+      const raw = await AsyncStorage.getItem(REMINDER_NAV_KEY).catch(() => null);
+      if (!raw) return;
+      await AsyncStorage.removeItem(REMINDER_NAV_KEY).catch(() => {});
+      try {
+        handleTarget(reminderTargetFromData(JSON.parse(raw)));
+      } catch {}
+    };
+    notifee.getInitialNotification()
+      .then((initial) => handleTarget(reminderTargetFromData(initial?.notification?.data as any)))
+      .catch(() => {});
+    consumeStoredTarget().catch(() => {});
+    const unsubscribe = notifee.onForegroundEvent(({ type, detail }) => {
+      if (type !== EventType.PRESS && type !== EventType.ACTION_PRESS) return;
+      handleTarget(reminderTargetFromData(detail.notification?.data as any));
+    });
+    const appStateSub = AppState.addEventListener('change', (next) => {
+      if (next === 'active') consumeStoredTarget().catch(() => {});
+    });
+    return () => {
+      unsubscribe();
+      appStateSub.remove();
+    };
   }, []);
 
   // ─── Step 14: cold-start surfacing of unread notifications ───────────────
@@ -9379,8 +9473,8 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     }));
     setTasks(ts => [...ts, ...newTasks]);
     // No toast renderer at TriorityApp scope; missing-perm path still redirects to system settings.
-    scheduleRemindersBatch(newTasks, () => {});
-  }, [setTasks]);
+    scheduleRemindersBatch(newTasks, () => {}, activeListId);
+  }, [activeListId, setTasks]);
 
   const addManyToList = useCallback((listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => {
     const now = Date.now();
@@ -9388,7 +9482,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       id: now + i, text: item.text, tier: item.tier, createdAt: now + i, reminder: item.reminder,
     }));
     setListTasks(listId, ts => [...ts, ...newTasks]);
-    scheduleRemindersBatch(newTasks, () => {});
+    scheduleRemindersBatch(newTasks, () => {}, listId);
   }, [setListTasks]);
 
   const setActiveListId = useCallback((id: string) => {
@@ -9531,9 +9625,11 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
 
   const sharedTaskIdSet = useMemo(() => new Set(sharedTaskLists.map(l => l.id)), [sharedTaskLists]);
   const reminderTasksForScheduling = useMemo(() => {
-    const privateTasks = lists.flatMap(l => l.tasks);
+    const privateTasks = lists.flatMap(l =>
+      l.tasks.map(t => ({ ...t, reminderListId: l.id, reminderTaskId: t.id })),
+    );
     const sharedTasks = sharedTaskLists.flatMap(l =>
-      l.tasks.map(t => ({ ...t, id: `shared_${l.id}_${t.id}` })),
+      l.tasks.map(t => ({ ...t, id: `shared_${l.id}_${t.id}`, reminderListId: l.id, reminderTaskId: t.id })),
     );
     return [...privateTasks, ...sharedTasks];
   }, [lists, sharedTaskLists]);
@@ -9643,6 +9739,29 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   const activeList = activeShared ?? lists.find(l => l.id === activeListId) ?? lists[0];
   const isActiveShared = !!activeShared;
   const activeListIdIsLive = mergedLists.some(l => l.id === activeListId);
+
+  useEffect(() => {
+    if (!ready || !pendingReminderNav) return;
+    const taskId = pendingReminderNav.taskId || pendingReminderNav.scheduledTaskId;
+    let targetListId = pendingReminderNav.listId;
+    if (!targetListId && taskId) {
+      targetListId = mergedLists.find(l => l.tasks.some(t => String(t.id) === taskId))?.id;
+    }
+    if (!targetListId || !mergedLists.some(l => l.id === targetListId)) return;
+    setScreen('list');
+    setActiveListId(targetListId);
+    if (taskId) {
+      setFocusedTaskId(taskId);
+      const timer = setTimeout(() => setFocusedTaskId(current => current === taskId ? null : current), 5000);
+      return () => clearTimeout(timer);
+    }
+    setPendingReminderNav(null);
+  }, [mergedLists, pendingReminderNav, ready, setActiveListId]);
+
+  useEffect(() => {
+    if (!pendingReminderNav || !focusedTaskId) return;
+    setPendingReminderNav(null);
+  }, [focusedTaskId, pendingReminderNav]);
 
   useEffect(() => {
     if (!ready || activeListIdIsLive || !activeList?.id) return;
@@ -9768,7 +9887,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
         <PortalHost>
           <BackButtonManager screen={screen} setScreen={setScreen} />
           <View style={{ flex: 1, overflow: 'hidden' }}>
-            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} />}
+            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} />}
             {screen === 'grocery' && (
               <StandaloneGrocery
                 groceryItems={groceryItemsForScreen}
@@ -9911,6 +10030,7 @@ const styles = StyleSheet.create({
   // at the edge of the slot the row would land in on release.
   dropIndicator: { position: 'absolute', left: 8, right: 8, height: 3, borderRadius: 2 },
   taskRowContent: { position: 'relative', overflow: 'hidden', flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 13, paddingLeft: 12, paddingRight: 10, borderLeftWidth: 3 },
+  reminderFocusOverlay: { position: 'absolute', top: 1, left: 1, right: 1, bottom: 1, borderWidth: 2, borderRadius: 7 },
   newItemShineOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
   newItemShineSweep: { position: 'absolute', top: -18, bottom: -18, width: 92, borderRadius: 999 },
   newItemShineSweepCore: { position: 'absolute', top: -18, bottom: -18, width: 22, borderRadius: 999 },
