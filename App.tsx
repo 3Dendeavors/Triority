@@ -5233,6 +5233,7 @@ interface ListPillRowProps {
   onSelect: (id: string) => void;
   onLongPress: (id: string) => void;
   onAddPress: () => void;
+  onJoinPress: () => void;
   onReorder: (newLists: TaskList[]) => void;
   // List IDs that are shared (vs. private). Shared pills render a small
   // users-icon prefix. Step 11 — sharedIds is empty until a follow-up step
@@ -5373,7 +5374,7 @@ function DraggablePill({
   );
 }
 
-function ListPillRow({ lists, activeListId, accentColor, isPaid, onSelect, onLongPress, onAddPress, onReorder, sharedIds }: ListPillRowProps) {
+function ListPillRow({ lists, activeListId, accentColor, isPaid, onSelect, onLongPress, onAddPress, onJoinPress, onReorder, sharedIds }: ListPillRowProps) {
   const T = useT();
 
   const scrollRef = useRef<ScrollView | null>(null);
@@ -5480,6 +5481,13 @@ function ListPillRow({ lists, activeListId, accentColor, isPaid, onSelect, onLon
         onPress={onAddPress}
         style={[styles.listPill, styles.listPillAdd, styles.listPillAddIcon, { backgroundColor: T.s2, borderColor: isPaid ? `${accentColor}40` : T.border, opacity: isPaid ? 1 : 0.5 }]}>
         <Icon name="plus" size={14} color={isPaid ? T.textSub : T.textMute} />
+      </TouchableOpacity>
+      <TouchableOpacity
+        activeOpacity={0.7}
+        onPress={onJoinPress}
+        style={[styles.listPill, styles.listPillAdd, { backgroundColor: T.s2, borderColor: isPaid ? `${accentColor}40` : T.border, opacity: isPaid ? 1 : 0.5, flexDirection: 'row', alignItems: 'center', gap: 6 }]}>
+        <Icon name="logIn" size={14} color={isPaid ? T.textSub : T.textMute} />
+        <Text style={[styles.listPillLabel, { color: isPaid ? T.textSub : T.textMute, fontFamily: jks('600') }]}>Join</Text>
       </TouchableOpacity>
     </ScrollView>
   );
@@ -6478,6 +6486,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
             if (l) setActionList(l);
           }}
           onAddPress={onAddListPress}
+          onJoinPress={openJoinSheet}
           onReorder={reorderLists}
           sharedIds={sharedIdSet}
         />
