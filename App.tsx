@@ -3243,6 +3243,17 @@ function activeReminderOccurrence(task: Task, now = Date.now()): number | null {
   return now - occurrence <= 90000 ? occurrence : null;
 }
 
+function reminderTaskMatchesTarget(task: Task, target: ReminderNavTarget): boolean {
+  const displayTaskId = String(task.reminderTaskId ?? task.id);
+  const scheduledTaskId = String(task.id);
+  const targetTaskId = target.taskId == null ? '' : String(target.taskId);
+  const targetScheduledTaskId = target.scheduledTaskId == null ? '' : String(target.scheduledTaskId);
+  const targetListId = target.listId == null ? '' : String(target.listId);
+  if (targetScheduledTaskId && targetScheduledTaskId === scheduledTaskId) return true;
+  if (!targetTaskId || targetTaskId !== displayTaskId) return false;
+  return !targetListId || targetListId === task.reminderListId;
+}
+
 async function displayActiveReminder(task: Task) {
   if (!task.reminder) return;
   await ensureNotifChannel();
@@ -3864,7 +3875,7 @@ interface TaskRowProps {
 const REVEAL_X = -72; // distance the row holds at when trash is revealed
 const DRAG_LONG_PRESS_MS = 400;
 
-function useNewItemGlow(createdAt: number | undefined, identity: TaskId | string) {
+function useNewItemGlow(createdAt: number | undefined, identity: TaskId | string, triggerKey?: string) {
   const glow = useRef(new Animated.Value(0)).current;
   const sweep = useRef(new Animated.Value(0)).current;
   const sparkle = useRef(new Animated.Value(0)).current;
@@ -3877,9 +3888,12 @@ function useNewItemGlow(createdAt: number | undefined, identity: TaskId | string
     sweep.setValue(0);
     sparkle.setValue(0);
 
-    if (!createdAt) return;
-    const ageMs = Date.now() - createdAt;
-    if (ageMs < 0 || ageMs > NEW_ITEM_GLOW_ELIGIBILITY_MS) return;
+    const forced = !!triggerKey;
+    if (!forced) {
+      if (!createdAt) return;
+      const ageMs = Date.now() - createdAt;
+      if (ageMs < 0 || ageMs > NEW_ITEM_GLOW_ELIGIBILITY_MS) return;
+    }
 
     Animated.parallel([
       Animated.sequence([
@@ -3897,7 +3911,7 @@ function useNewItemGlow(createdAt: number | undefined, identity: TaskId | string
         Animated.timing(sparkle, { toValue: 0, duration: 520, easing: Easing.in(Easing.quad), useNativeDriver: true }),
       ]),
     ]).start();
-  }, [createdAt, glow, identity, sparkle, sweep]);
+  }, [createdAt, glow, identity, sparkle, sweep, triggerKey]);
 
   return {
     fillOpacity: glow.interpolate({ inputRange: [0, 1], outputRange: [0, 0.24] }),
@@ -3972,7 +3986,7 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
   const tier = TIERS.find(t => t.id === task.tier)!;
   const translateX = useRef(new Animated.Value(0)).current;
   const [revealed, setRevealed] = useState(false);
-  const newItemGlow = useNewItemGlow(task.createdAt, task.id);
+  const newItemGlow = useNewItemGlow(task.createdAt, task.id, focused ? 'focused' : undefined);
   const glowEdgeColor = readableGlowEdgeColor(T.s2, T.text);
   // Pulse animation for the revealed trash icon — loops while revealed
   const pulse = useRef(new Animated.Value(0)).current;
@@ -9110,6 +9124,7 @@ function TriorityApp() {
   const [pendingReminderNav, setPendingReminderNav] = useState<ReminderNavTarget | null>(null);
   const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
   const activeReminderFiredRef = useRef<Set<string>>(new Set());
+  const openedReminderTargetsRef = useRef<{ target: ReminderNavTarget; openedAt: number }[]>([]);
 
   const persistGrocery = (items: GroceryItem[]) => {
     AsyncStorage.setItem('tri_grocery', JSON.stringify(items)).catch(() => {});
@@ -9255,6 +9270,11 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   useEffect(() => {
     const handleTarget = (target: ReminderNavTarget | null) => {
       if (!target) return;
+      const now = Date.now();
+      openedReminderTargetsRef.current = [
+        ...openedReminderTargetsRef.current.filter((entry) => now - entry.openedAt < 90000),
+        { target, openedAt: now },
+      ];
       setPendingReminderNav(target);
     };
     const consumeStoredTarget = async () => {
@@ -9815,6 +9835,11 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
         if (!occurrence) continue;
         const firedKey = `${task.id}:${occurrence}`;
         if (activeReminderFiredRef.current.has(firedKey)) continue;
+        openedReminderTargetsRef.current = openedReminderTargetsRef.current.filter((entry) => now - entry.openedAt < 90000);
+        if (openedReminderTargetsRef.current.some((entry) => reminderTaskMatchesTarget(task, entry.target))) {
+          activeReminderFiredRef.current.add(firedKey);
+          continue;
+        }
         activeReminderFiredRef.current.add(firedKey);
         displayActiveReminder(task).catch(() => {});
       }
