@@ -96,6 +96,8 @@ interface Reminder {
   repeatDaily: boolean;  // if true, re-notify daily at same time until archived/deleted
 }
 
+type TaskDraft = { text: string; tier: Tier; reminder?: Reminder };
+
 interface Task {
   id: TaskId;
   text: string;
@@ -175,16 +177,32 @@ function groceryDisplayName(item: { name?: string; quantity?: string; unit?: str
   return prefix ? `${prefix} ${name}`.trim() : name;
 }
 
-function normalizeGroceryDraft(item: any): GroceryDraft | null {
+function shouldInferGroceryQuantities(input: string) {
+  return /\b(recipe|ingredients?|bake|cook|meal prep|materials?|bill of materials|bom|project|build|repair|supplies for|shopping list for|list for|make a|make an)\b/i.test(input);
+}
+
+function inputMentionsQuantityForItem(input: string, itemName: string) {
+  const raw = input.toLowerCase();
+  const words = itemName.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+  const anchor = words[0];
+  if (!anchor) return false;
+  const idx = raw.indexOf(anchor);
+  if (idx < 0) return false;
+  const near = raw.slice(Math.max(0, idx - 32), Math.min(raw.length, idx + anchor.length + 32));
+  return /(\d+(\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|dozen|half|quarter)\s*(ct|count|pack|packs|box|boxes|bag|bags|loaf|loaves|dozen|gal|gallon|gallons|qt|quart|oz|ounce|ounces|lb|lbs|pound|pounds|cup|cups|tbsp|tsp|stick|sticks)?\b/i.test(near);
+}
+
+function normalizeGroceryDraft(item: any, input = '', allowInferredQuantity = true): GroceryDraft | null {
   const name = typeof item?.name === 'string' ? item.name.trim() : '';
   if (!name) return null;
   const validCats = new Set([...GROCERY_CATEGORIES, GROCERY_UNCATEGORIZED]);
   const category = validCats.has(item.category) ? item.category : GROCERY_UNCATEGORIZED;
+  const keepQuantity = allowInferredQuantity || inputMentionsQuantityForItem(input, name);
   return stripUndefined({
     name,
     category,
-    quantity: cleanOptionalGroceryPart(item.quantity),
-    unit: cleanOptionalGroceryPart(item.unit),
+    quantity: keepQuantity ? cleanOptionalGroceryPart(item.quantity) : undefined,
+    unit: keepQuantity ? cleanOptionalGroceryPart(item.unit) : undefined,
   });
 }
 
@@ -434,6 +452,7 @@ function mapSupabaseItem(row: any): SharedListItem {
     text: row.text ?? undefined,
     tier: row.tier === 'high' || row.tier === 'medium' || row.tier === 'low' ? row.tier : undefined,
     completed: false,
+    reminder: row.reminder ?? undefined,
     name: row.name ?? undefined,
     category: row.category ?? undefined,
     quantity: row.quantity ?? undefined,
@@ -849,8 +868,8 @@ interface SharedListsContextValue {
   // to /sharedLists/{listId}/items and bumps lastEditedBy/At so step 13's
   // avatar render shows who touched it last. Throws if not signed in or
   // Firestore rejects (caller toasts).
-  addSharedTaskItems: (listId: string, items: { text: string; tier: Tier }[]) => Promise<void>;
-  editSharedTaskItem: (listId: string, itemId: string, patch: { text?: string; tier?: Tier }) => Promise<void>;
+  addSharedTaskItems: (listId: string, items: TaskDraft[]) => Promise<void>;
+  editSharedTaskItem: (listId: string, itemId: string, patch: { text?: string; tier?: Tier; reminder?: Reminder | null }) => Promise<void>;
   deleteSharedTaskItem: (listId: string, itemId: string) => Promise<void>;
   archiveSharedTaskItem: (listId: string, itemId: string, item: { text: string; tier: Tier; createdAt?: number }) => Promise<void>;
   deleteSharedArchiveItem: (listId: string, archiveId: string) => Promise<void>;
@@ -1443,7 +1462,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   // bumps lastEditedBy/At so the per-item avatar (Step 13) reflects the
   // most recent change. The listener pipes the update back into local state
   // — callers don't optimistic-update.
-  const addSharedTaskItems = useCallback(async (listId: string, items: { text: string; tier: Tier }[]) => {
+  const addSharedTaskItems = useCallback(async (listId: string, items: TaskDraft[]) => {
     if (!user) throw new Error('Not signed in');
     if (items.length === 0) return;
     if (isSupabaseSharedListId(listId)) {
@@ -1454,6 +1473,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
           list_id: listId,
           text: it.text,
           tier: it.tier,
+          reminder: it.reminder ? stripUndefined(it.reminder) : undefined,
           checked: false,
           created_by: user.uid,
           created_at: new Date(now).toISOString(),
@@ -1485,6 +1505,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       const data: Omit<SharedListItem, 'id'> = {
         text: it.text,
         tier: it.tier,
+        reminder: it.reminder,
         completed: false,
         createdBy: user.uid,
         createdAt: now,
@@ -1517,7 +1538,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     }
   }, [user, setSharedItems]);
 
-  const editSharedTaskItem = useCallback(async (listId: string, itemId: string, patch: { text?: string; tier?: Tier }) => {
+  const editSharedTaskItem = useCallback(async (listId: string, itemId: string, patch: { text?: string; tier?: Tier; reminder?: Reminder | null }) => {
     if (!user) throw new Error('Not signed in');
     if (isSupabaseSharedListId(listId)) {
       const { error } = await supabase
@@ -1525,6 +1546,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         .update(stripUndefined({
           text: patch.text,
           tier: patch.tier,
+          reminder: patch.reminder === null ? null : (patch.reminder ? stripUndefined(patch.reminder) : undefined),
           last_edited_by: user.uid,
           last_edited_at: new Date().toISOString(),
         }))
@@ -1536,6 +1558,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     const db = getFirestore(getApp());
     await updateDoc(doc(db, 'sharedLists', listId, 'items', itemId), stripUndefined({
       ...patch,
+      ...(patch.reminder === undefined ? {} : { reminder: patch.reminder }),
       lastEditedBy: user.uid,
       lastEditedAt: Date.now(),
     }));
@@ -2072,6 +2095,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       const items = list.tasks.map((t) => ({
         text: t.text,
         tier: t.tier,
+        reminder: t.reminder,
         checked: false,
         createdAt: t.createdAt || now,
       }));
@@ -2162,6 +2186,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
           const itemData: Omit<SharedListItem, 'id'> = {
             text: t.text,
             tier: t.tier,
+            reminder: t.reminder,
             completed: false,
             createdBy: user.uid,
             createdAt: t.createdAt || now,
@@ -3053,6 +3078,17 @@ async function requestReminderNotifications(showToast?: (msg: string, sub?: stri
   return ok;
 }
 
+async function requestReminderSchedulingPermissions(showToast?: (msg: string, sub?: string) => void): Promise<boolean> {
+  const notifOk = await requestReminderNotifications(showToast);
+  if (!notifOk) return false;
+  if (!(await hasExactAlarmPerm())) {
+    showToast?.('Allow exact alarms', 'Opening Settings > Alarms & reminders');
+    await notifee.openAlarmPermissionSettings().catch(() => {});
+    return false;
+  }
+  return true;
+}
+
 function notifIdForTask(taskId: TaskId): string {
   return `tri-task-${taskId}`;
 }
@@ -3144,17 +3180,7 @@ async function scheduleRemindersBatch(
   const remTasks = tasks.filter(t => t.reminder);
   if (remTasks.length === 0) return;
 
-  const notifOk = await requestReminderNotifications(showToast);
-  if (!notifOk) {
-    showToast('Reminders need notification permission', 'Enable in Settings');
-    return;
-  }
-
-  if (!(await hasExactAlarmPerm())) {
-    showToast('Allow exact alarms', 'Opening Settings → Alarms & reminders');
-    await notifee.openAlarmPermissionSettings().catch(() => {});
-    return;
-  }
+  if (!(await requestReminderSchedulingPermissions(showToast))) return;
 
   let failed = 0;
   for (const t of remTasks) {
@@ -4778,14 +4804,21 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
       try {
         const nowDate = new Date();
         const nowDescr = nowDate.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
+        const inferGroceryQuantities = shouldInferGroceryQuantities(raw);
+        const quantityInstruction = inferGroceryQuantities
+          ? 'Preserve any user-specified quantity and unit in separate "quantity" and "unit" fields. If the user asks for a recipe, project, bill of materials, or material list without exact quantities, infer reasonable starter quantities when practical.'
+          : 'Preserve quantity and unit only when the user explicitly wrote them. Do not infer amounts for a simple item list.';
+        const groceryJsonExample = inferGroceryQuantities
+          ? '[{"name":"eggs","quantity":"12","unit":"count","category":"Dairy"},{"name":"deck screws","quantity":"1","unit":"box","category":"Fasteners"}]'
+          : '[{"name":"eggs","category":"Dairy"},{"name":"bread","category":"Bakery"},{"name":"milk","category":"Dairy"}]';
 
         if (groceryMode) {
           // Grocery-only AI: parse items with category assignment
           const systemPrompt = `You are a grocery and materials list assistant. Parse the user input into individual purchasable items. For each item, assign a category from this list: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}" if none fit.
-Preserve any user-specified quantity and unit in separate "quantity" and "unit" fields. If the user asks for a project/material list without exact quantities, infer reasonable starter quantities when practical.
+${quantityInstruction}
 
 Return ONLY valid JSON, no other text, no markdown.
-Format: [{"name":"eggs","quantity":"12","unit":"count","category":"Dairy"},{"name":"deck screws","quantity":"1","unit":"box","category":"Fasteners"}]`;
+Format: ${groceryJsonExample}`;
           const resp = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': storedKey, 'anthropic-version': '2023-06-01' },
@@ -4798,7 +4831,7 @@ Format: [{"name":"eggs","quantity":"12","unit":"count","category":"Dairy"},{"nam
           const parsed = JSON.parse(cleaned);
           if (!Array.isArray(parsed)) throw new Error('Not an array');
           const grocItems = parsed
-            .map(normalizeGroceryDraft)
+            .map((item: any) => normalizeGroceryDraft(item, raw, inferGroceryQuantities))
             .filter((item: GroceryDraft | null): item is GroceryDraft => !!item);
           addGroceryItemsSafely(grocItems);
           showToast(`${grocItems.length} item${grocItems.length !== 1 ? 's' : ''} added`);
@@ -4815,7 +4848,7 @@ ${multiList ? `\nAVAILABLE LISTS: ${JSON.stringify(listMap)}\nACTIVE LIST ID: ${
 ${groceryEnabled
   ? `Classify each item as a "task" (something to do) or a "grocery" item (something to buy at a store, hardware store, or supply store).
 - Grocery/material items get a category from: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
-- Preserve specified quantity and unit separately. For generated project/material lists, infer reasonable starter quantities when practical.`
+- ${quantityInstruction}`
   : 'All items are tasks.'}
 ${multiList
   ? `For tasks: if the user mentions a specific list by name, set listId to that list's id. Otherwise use null (= active list). Match list names case-insensitively and partially (e.g. "new list 1" matches "New List 1").`
@@ -4838,7 +4871,7 @@ For task text and grocery/material item names: clean, short descriptions. No tim
 
 Return ONLY valid JSON, no markdown:
 ${multiList
-  ? '{"tasks":[{"text":"call dentist","tier":"medium","listId":null,"reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":[{"name":"eggs","quantity":"12","unit":"count","category":"Dairy"}]}'
+  ? `{"tasks":[{"text":"call dentist","tier":"medium","listId":null,"reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":${groceryJsonExample}}`
   : '{"tasks":[{"text":"call dentist","tier":"medium","reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":[]}'}
 Omit reminder field if no reminder. Either array can be empty. listId must be a valid id from AVAILABLE LISTS or null.`;
 
@@ -4875,7 +4908,7 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
 
           const grocItems = groceryEnabled
             ? (Array.isArray(parsed.grocery) ? parsed.grocery : [])
-                .map(normalizeGroceryDraft)
+                .map((item: any) => normalizeGroceryDraft(item, raw, inferGroceryQuantities))
                 .filter((item: GroceryDraft | null): item is GroceryDraft => !!item)
             : [];
 
@@ -6042,13 +6075,11 @@ interface ActiveListProps {
   onAddGroceryItems: (items: GroceryDraft[]) => void;
   setScreen: (s: Screen) => void;
   // Step 11b.2: when present, the active list is a shared one. Mutations
-  // route through Firestore writes instead of local setTasks. Tier reordering
+  // route through shared-list writes instead of local setTasks. Tier reordering
   // is a no-op on shared lists in v1 (ordering field deferred to v2).
-  // Reminders on shared items are also v2 (Notifee is local; cross-device
-  // schedule needs design). Edit-via-EditSheet drops reminder on save.
   sharedActions?: {
-    addItems: (items: { text: string; tier: Tier }[]) => Promise<void>;
-    editItem: (itemId: TaskId, patch: { text?: string; tier?: Tier }) => Promise<void>;
+    addItems: (items: TaskDraft[]) => Promise<void>;
+    editItem: (itemId: TaskId, patch: { text?: string; tier?: Tier; reminder?: Reminder | null }) => Promise<void>;
     deleteItem: (itemId: TaskId) => Promise<void>;
     archiveItem: (itemId: TaskId, item: { text: string; tier: Tier; createdAt?: number }) => Promise<void>;
     // Restore: shared items are deleted from the subcollection and a local
@@ -6068,6 +6099,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
   const { user: syncUser } = useSync();
   const {
     sharedLists: sharedListsMap,
+    addSharedTaskItems,
     promoteTaskListToShared,
     rotateShareCode,
     renameSharedList,
@@ -6195,14 +6227,14 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
 
   const handleAddMany = useCallback((items: { text: string; tier: Tier; reminder?: Reminder }[]) => {
     if (sharedActions) {
-      // Drop reminders on shared items — local Notifee schedules don't have a
-      // cross-device model yet (annotated v2). Strip and write through.
-      sharedActions
-        .addItems(items.map(it => ({ text: it.text, tier: it.tier })))
-        .catch(() => showToast('Could not add', 'Check connection'));
+      // Shared reminders are stored on the row; each device schedules locally
+      // only when that user has granted reminder permissions.
       if (items.some(it => it.reminder)) {
-        showToast('Reminders are local-only', 'Not synced to other members yet');
+        requestReminderSchedulingPermissions(showToast).catch(() => {});
       }
+      sharedActions
+        .addItems(items.map(it => ({ text: it.text, tier: it.tier, reminder: it.reminder })))
+        .catch(() => showToast('Could not add', 'Check connection'));
       return;
     }
     const now = Date.now();
@@ -6218,6 +6250,14 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
   }, [setTasks, showToast, sharedActions]);
 
   const handleAddManyToList = useCallback((listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => {
+    if (sharedIdSet?.has(listId)) {
+      if (items.some(it => it.reminder)) {
+        requestReminderSchedulingPermissions(showToast).catch(() => {});
+      }
+      addSharedTaskItems(listId, items)
+        .catch(() => showToast('Could not add', 'Check connection'));
+      return;
+    }
     const now = Date.now();
     const newTasks: Task[] = items.map((item, i) => ({
       id: now + i,
@@ -6228,17 +6268,16 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     }));
     setListTasks(listId, ts => [...ts, ...newTasks]);
     scheduleRemindersBatch(newTasks, showToast);
-  }, [setListTasks, showToast]);
+  }, [addSharedTaskItems, setListTasks, sharedIdSet, showToast]);
 
   const handleSave = useCallback((updated: Task) => {
     if (sharedActions) {
-      sharedActions
-        .editItem(updated.id, { text: updated.text, tier: updated.tier })
-        .catch(() => showToast('Could not save', 'Check connection'));
-      // Reminder edits dropped on shared items in v1. Surface once if user set one.
       if (updated.reminder) {
-        showToast('Reminders are local-only', 'Not synced to other members yet');
+        requestReminderSchedulingPermissions(showToast).catch(() => {});
       }
+      sharedActions
+        .editItem(updated.id, { text: updated.text, tier: updated.tier, reminder: updated.reminder ?? null })
+        .catch(() => showToast('Could not save', 'Check connection'));
       setEditingTask(null);
       return;
     }
@@ -9367,11 +9406,8 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     deleteSharedList,
   } = useSharedLists();
 
-  // Adapt /sharedLists/{id}/items/* into Task[] for ActiveList rendering.
-  // Reminders are intentionally absent (cross-device Notifee is v2). Per-item
-  // shared provenance (last editor's avatar slot + initial + relative-time) is
-  // baked in here so TaskRow stays roster-unaware — it just renders whatever
-  // sharedAvatar* fields are present on the Task.
+  // Adapt shared-list items into Task[] for ActiveList rendering.
+  // Reminder payloads stay on the row so each member device can schedule them locally.
   const sharedTaskLists: TaskList[] = useMemo(() => {
     const out: TaskList[] = [];
     for (const l of Object.values(sharedListsMap)) {
@@ -9384,6 +9420,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
           text: it.text || '',
           tier: it.tier || 'medium',
           createdAt: it.createdAt || 0,
+          reminder: it.reminder || undefined,
           sharedAvatarSlot: editor?.avatarSlot,
           sharedAvatarInitial: editor?.emailInitial,
           sharedLastEditedAt: it.lastEditedAt,
@@ -9401,6 +9438,19 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   }, [sharedListsMap, sharedItems]);
 
   const sharedTaskIdSet = useMemo(() => new Set(sharedTaskLists.map(l => l.id)), [sharedTaskLists]);
+  const reminderTasksForScheduling = useMemo(() => {
+    const privateTasks = lists.flatMap(l => l.tasks);
+    const sharedTasks = sharedTaskLists.flatMap(l =>
+      l.tasks.map(t => ({ ...t, id: `shared_${l.id}_${t.id}` })),
+    );
+    return [...privateTasks, ...sharedTasks];
+  }, [lists, sharedTaskLists]);
+
+  useEffect(() => {
+    if (!ready) return;
+    syncAllReminders(reminderTasksForScheduling).catch(() => {});
+  }, [ready, reminderTasksForScheduling]);
+
   const sharedGroceryDoc = useMemo(() => {
     return Object.values(sharedListsMap).find((l) => l.kind === 'grocery') ?? null;
   }, [sharedListsMap]);
@@ -9513,8 +9563,8 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     if (!isActiveShared) return undefined;
     const listId = activeListId;
     return {
-      addItems: (items: { text: string; tier: Tier }[]) => addSharedTaskItems(listId, items),
-      editItem: (itemId: TaskId, patch: { text?: string; tier?: Tier }) => editSharedTaskItem(listId, String(itemId), patch),
+      addItems: (items: TaskDraft[]) => addSharedTaskItems(listId, items),
+      editItem: (itemId: TaskId, patch: { text?: string; tier?: Tier; reminder?: Reminder | null }) => editSharedTaskItem(listId, String(itemId), patch),
       deleteItem: (itemId: TaskId) => deleteSharedTaskItem(listId, String(itemId)),
       archiveItem: (itemId: TaskId, item: { text: string; tier: Tier; createdAt?: number }) => archiveSharedTaskItem(listId, String(itemId), item),
     };
