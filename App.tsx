@@ -340,6 +340,9 @@ const SHARED_GROCERY_TOGGLE_KEY = 'tri_shared_grocery_view';   // '1' = viewing 
 const SUPABASE_SHARED_GROCERY_ID_KEY = 'tri_supabase_shared_grocery_id_v1';
 const SHARED_CACHE_KEY = 'tri_shared_cache_v1';
 const COLLAPSED_GROUPS_KEY = 'tri_collapsed_groups_v1';
+const CALENDAR_CONFLICTS_ENABLED_KEY = 'tri_calendar_conflicts_enabled_v1';
+const GOOGLE_CALENDAR_FREEBUSY_SCOPE = 'https://www.googleapis.com/auth/calendar.freebusy';
+const CALENDAR_CONFLICT_WINDOW_MS = 30 * 60 * 1000;
 const REMINDER_NAV_KEY = 'tri_pending_reminder_nav_v1';
 const SHARED_STALE_RESTORE_CUTOFF_MS = new Date('2026-05-07T00:00:00-04:00').getTime();
 
@@ -3288,6 +3291,61 @@ function reminderTaskMatchesTarget(task: Task, target: ReminderNavTarget): boole
   return !targetListId || targetListId === task.reminderListId;
 }
 
+function calendarConflictKey(listId: string | undefined, taskId: TaskId | undefined) {
+  if (!listId || taskId == null) return '';
+  return `${listId}:${String(taskId)}`;
+}
+
+function calendarConflictKeyForTask(task: Task, fallbackListId?: string) {
+  return calendarConflictKey(task.reminderListId || fallbackListId, task.reminderTaskId ?? task.id);
+}
+
+function nextReminderOccurrenceAt(r: Reminder, now = Date.now()): number | null {
+  const interval = r.repeatHourly ? 3600000 : r.repeatDaily ? 86400000 : 0;
+  if (r.remindAt >= now - 60000) return r.remindAt;
+  if (!interval) return null;
+  return r.remindAt + Math.ceil((now - r.remindAt) / interval) * interval;
+}
+
+async function getCalendarFreeBusyAccessToken() {
+  await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
+  try {
+    const current = GoogleSignin.getCurrentUser?.();
+    const scopes = current?.scopes || [];
+    if (!scopes.includes(GOOGLE_CALENDAR_FREEBUSY_SCOPE)) {
+      const response = await GoogleSignin.addScopes({ scopes: [GOOGLE_CALENDAR_FREEBUSY_SCOPE] });
+      if (response && response.type === 'cancelled') return null;
+    }
+  } catch {}
+  const tokens = await GoogleSignin.getTokens();
+  return tokens.accessToken;
+}
+
+async function fetchCalendarBusyBlocks(accessToken: string, timeMin: number, timeMax: number) {
+  const resp = await fetch('https://www.googleapis.com/calendar/v3/freeBusy', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      timeMin: new Date(timeMin).toISOString(),
+      timeMax: new Date(timeMax).toISOString(),
+      items: [{ id: 'primary' }],
+    }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.error?.message || 'Could not check calendar');
+  const busy = data?.calendars?.primary?.busy;
+  if (!Array.isArray(busy)) return [];
+  return busy
+    .map((b: any) => ({ start: Date.parse(b.start), end: Date.parse(b.end) }))
+    .filter((b: { start: number; end: number }) => {
+      if (!Number.isFinite(b.start) || !Number.isFinite(b.end) || b.end <= b.start) return false;
+      return b.end - b.start < 20 * 60 * 60 * 1000;
+    });
+}
+
 async function displayActiveReminder(task: Task) {
   if (!task.reminder) return;
   await ensureNotifChannel();
@@ -3857,6 +3915,7 @@ interface TaskRowProps {
   onDragEnd: (committed: boolean) => void;
   isDragging: boolean;
   focused?: boolean;
+  calendarConflict?: boolean;
 }
 
 const REVEAL_X = -72; // distance the row holds at when trash is revealed
@@ -3967,7 +4026,7 @@ function MemberAvatar({ slot, initial, size = 14 }: { slot: number; initial: str
   );
 }
 
-function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentColor, onLongPressStart, onDragMove, onDragEnd, isDragging, focused }: TaskRowProps) {
+function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentColor, onLongPressStart, onDragMove, onDragEnd, isDragging, focused, calendarConflict }: TaskRowProps) {
   const T = useT();
   const TIERS = TIERS_DEF(T);
   const tier = TIERS.find(t => t.id === task.tier)!;
@@ -4296,6 +4355,11 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
             </View>
           )}
         </View>
+        {calendarConflict ? (
+          <View style={[styles.recurBadge, { backgroundColor: 'rgba(255,80,64,0.14)', borderColor: 'rgba(255,80,64,0.42)' }]}>
+            <Icon name="calendar" size={10} color="#FF5040" />
+          </View>
+        ) : null}
         {task.reminder && (
           <View style={[styles.recurBadge, { backgroundColor: `${tier.color}18`, borderColor: `${tier.color}40` }]}>
             <Icon name="bell" size={10} color={tier.color} />
@@ -4331,10 +4395,12 @@ interface TierGroupProps {
   collapsed: boolean;
   onCollapsedChange: (collapsed: boolean) => void;
   focusedTaskId?: string | null;
+  calendarConflictKeys?: Set<string>;
+  activeListId: string;
   onFocusedTaskLayout?: (y: number) => void;
 }
 
-function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit, accentColor, onReorderInTier, onDragMove, collapsed, onCollapsedChange, focusedTaskId, onFocusedTaskLayout }: TierGroupProps) {
+function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit, accentColor, onReorderInTier, onDragMove, collapsed, onCollapsedChange, focusedTaskId, calendarConflictKeys, activeListId, onFocusedTaskLayout }: TierGroupProps) {
   const T = useT();
   const tierYRef = useRef(0);
 
@@ -4441,6 +4507,7 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
                   onDragEnd={handleDragEnd}
                   isDragging={isDragging}
                   focused={focusedTaskId === String(task.id)}
+                  calendarConflict={calendarConflictKeys?.has(calendarConflictKey(activeListId, task.id))}
                 />
               </View>
             );
@@ -6348,9 +6415,10 @@ interface ActiveListProps {
   collapsedGroups: CollapsedGroups;
   setCollapsedGroup: (key: string, collapsed: boolean) => void;
   focusedTaskId?: string | null;
+  calendarConflictKeys?: Set<string>;
 }
 
-function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, defaultTier, setArchive, activeListId, lists, setActiveListId, addList, renameList, deleteList, reorderLists, onAddGroceryItems, setScreen, sharedActions, sharedIdSet, collapsedGroups, setCollapsedGroup, focusedTaskId }: ActiveListProps) {
+function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, defaultTier, setArchive, activeListId, lists, setActiveListId, addList, renameList, deleteList, reorderLists, onAddGroceryItems, setScreen, sharedActions, sharedIdSet, collapsedGroups, setCollapsedGroup, focusedTaskId, calendarConflictKeys }: ActiveListProps) {
   const isPaid = useIsPaid();
   const { user: syncUser } = useSync();
   const {
@@ -6384,6 +6452,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
   const [editingTask, setEditingTask] = useState<Task | null>(null);
   const [toast, setToast] = useState<ToastData | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const shownCalendarConflictKeysRef = useRef<Set<string>>(new Set());
   // Tick every 30s so reminder subtext ("In 5m", "Overdue") stays current
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -6403,6 +6472,23 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     if (toastTimer.current) { clearTimeout(toastTimer.current); toastTimer.current = null; }
     setToast(null);
   }, []);
+
+  useEffect(() => {
+    if (!calendarConflictKeys || calendarConflictKeys.size === 0) {
+      shownCalendarConflictKeysRef.current.clear();
+      return;
+    }
+    const visibleConflicts = tasks
+      .map((task) => calendarConflictKey(activeListId, task.id))
+      .filter((key) => key && calendarConflictKeys.has(key));
+    shownCalendarConflictKeysRef.current = new Set(
+      Array.from(shownCalendarConflictKeysRef.current).filter((key) => visibleConflicts.includes(key)),
+    );
+    const firstNew = visibleConflicts.find((key) => !shownCalendarConflictKeysRef.current.has(key));
+    if (!firstNew) return;
+    for (const key of visibleConflicts) shownCalendarConflictKeysRef.current.add(key);
+    showToast('Reminder conflicts with your calendar');
+  }, [activeListId, calendarConflictKeys, showToast, tasks]);
 
   const handleComplete = useCallback((id: TaskId) => {
     if (sharedActions) {
@@ -6707,6 +6793,8 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
                 collapsed={collapsedGroups[collapseKey] ?? false}
                 onCollapsedChange={(next) => setCollapsedGroup(collapseKey, next)}
                 focusedTaskId={focusedTaskId}
+                calendarConflictKeys={calendarConflictKeys}
+                activeListId={activeListId}
                 onFocusedTaskLayout={scrollToFocusedTask} />
             );
           })
@@ -7453,6 +7541,9 @@ interface SettingsProps {
   customThemeDrafts: (CustomThemeDraft | null)[]; setCustomThemeDrafts: (drafts: (CustomThemeDraft | null)[]) => void;
   onClearArchive: () => void;
   onReplayOnboarding: () => void;
+  calendarConflictsEnabled: boolean;
+  setCalendarConflictsEnabled: (enabled: boolean) => void;
+  onRequestCalendarConflictAccess: () => Promise<boolean>;
 }
 
 function Toggle({ value, onChange, accent }: { value: boolean; onChange: (v: boolean) => void; accent: string }) {
@@ -8251,7 +8342,7 @@ function CustomThemeSheet({ initialDraft, onSave, onClose }: CustomThemeSheetPro
   );
 }
 
-function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personalContext, setPersonalContext, autoClear, setAutoClear, darkMode, setDarkMode, accentLight, accentDark, setAccentLight, setAccentDark, themeId, setThemeId, customThemeDrafts, setCustomThemeDrafts, onClearArchive, onReplayOnboarding }: SettingsProps) {
+function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personalContext, setPersonalContext, autoClear, setAutoClear, darkMode, setDarkMode, accentLight, accentDark, setAccentLight, setAccentDark, themeId, setThemeId, customThemeDrafts, setCustomThemeDrafts, onClearArchive, onReplayOnboarding, calendarConflictsEnabled, setCalendarConflictsEnabled, onRequestCalendarConflictAccess }: SettingsProps) {
   const T = useT();
   const insets = useSafeAreaInsets();
   const isPaid = useIsPaid();
@@ -8323,6 +8414,24 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
 
   const saveKey = () => { if (!keyIsValid) return; setApiKey(keyDraft.trim()); setHasApiKey(true); };
   const cardStyle = [styles.settingsCard, { backgroundColor: T.s1, borderColor: T.border }];
+  const toggleCalendarConflicts = async (enabled: boolean) => {
+    if (!enabled) {
+      setCalendarConflictsEnabled(false);
+      showSettingsToast('Calendar conflict checks off');
+      return;
+    }
+    if (!syncUser) {
+      showSettingsToast('Sign in with Google first');
+      return;
+    }
+    const ok = await onRequestCalendarConflictAccess();
+    if (!ok) {
+      showSettingsToast('Calendar access not enabled');
+      return;
+    }
+    setCalendarConflictsEnabled(true);
+    showSettingsToast('Calendar conflict checks on');
+  };
 
   return (
     <>
@@ -8397,6 +8506,15 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
             </TouchableOpacity>
           </View>
         )}
+      </View>
+
+      <SettingsSection title="Calendar" />
+      <View style={[cardStyle, { marginBottom: 16 }]}>
+        <SettingRow
+          label="Conflict Checks"
+          subtitle="Read-only Google Calendar busy-time check for task reminders. Triority never creates calendar events."
+          right={<Toggle value={calendarConflictsEnabled} onChange={toggleCalendarConflicts} accent={accent} />}
+        />
       </View>
 
       <SettingsSection title="Appearance" />
@@ -9101,6 +9219,8 @@ function TriorityApp() {
   const [collapsedGroups, setCollapsedGroupsState] = useState<CollapsedGroups>({});
   const [pendingReminderNav, setPendingReminderNav] = useState<ReminderNavTarget | null>(null);
   const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
+  const [calendarConflictsEnabled, setCalendarConflictsEnabledState] = useState(false);
+  const [calendarConflictKeys, setCalendarConflictKeys] = useState<Set<string>>(new Set());
   const activeReminderFiredRef = useRef<Set<string>>(new Set());
   const openedReminderTargetsRef = useRef<{ target: ReminderNavTarget; openedAt: number }[]>([]);
 
@@ -9117,6 +9237,19 @@ function TriorityApp() {
       AsyncStorage.setItem(COLLAPSED_GROUPS_KEY, JSON.stringify(next)).catch(() => {});
       return next;
     });
+  }, []);
+  const setCalendarConflictsEnabled = useCallback((enabled: boolean) => {
+    setCalendarConflictsEnabledState(enabled);
+    if (!enabled) setCalendarConflictKeys(new Set());
+    AsyncStorage.setItem(CALENDAR_CONFLICTS_ENABLED_KEY, enabled ? '1' : '0').catch(() => {});
+  }, []);
+  const requestCalendarConflictAccess = useCallback(async () => {
+    try {
+      const token = await getCalendarFreeBusyAccessToken();
+      return !!token;
+    } catch {
+      return false;
+    }
   }, []);
 
   const addGroceryItems = useCallback((items: GroceryDraft[]) => {
@@ -9230,6 +9363,8 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
         }
         const rawSharedGroceryView = await AsyncStorage.getItem(SHARED_GROCERY_TOGGLE_KEY);
         setViewingSharedGroceryState(rawSharedGroceryView === '1');
+        const rawCalendarConflicts = await AsyncStorage.getItem(CALENDAR_CONFLICTS_ENABLED_KEY);
+        setCalendarConflictsEnabledState(rawCalendarConflicts === '1');
       } catch {}
       setShowOnboarding(!data.onboarded);
       setReady(true);
@@ -9805,6 +9940,62 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   }, [ready, reminderTasksForScheduling]);
 
   useEffect(() => {
+    if (!ready || !calendarConflictsEnabled || !syncUser?.uid) {
+      setCalendarConflictKeys(new Set());
+      return;
+    }
+
+    let cancelled = false;
+    const checkCalendarConflicts = async () => {
+      const now = Date.now();
+      const candidates = reminderTasksForScheduling
+        .map((task) => {
+          if (!task.reminder) return null;
+          const remindAt = nextReminderOccurrenceAt(task.reminder, now);
+          const key = calendarConflictKeyForTask(task);
+          if (!remindAt || !key) return null;
+          return {
+            key,
+            start: remindAt,
+            end: remindAt + CALENDAR_CONFLICT_WINDOW_MS,
+          };
+        })
+        .filter((candidate): candidate is { key: string; start: number; end: number } => !!candidate);
+
+      if (candidates.length === 0) {
+        if (!cancelled) setCalendarConflictKeys(new Set());
+        return;
+      }
+
+      const token = await getCalendarFreeBusyAccessToken();
+      if (!token) return;
+
+      const min = Math.min(...candidates.map((candidate) => candidate.start));
+      const max = Math.max(...candidates.map((candidate) => candidate.end));
+      const busyBlocks = await fetchCalendarBusyBlocks(token, min - 60000, max + 60000);
+      const nextKeys = new Set<string>();
+      for (const candidate of candidates) {
+        if (busyBlocks.some((busy) => busy.start < candidate.end && busy.end > candidate.start)) {
+          nextKeys.add(candidate.key);
+        }
+      }
+      if (!cancelled) setCalendarConflictKeys(nextKeys);
+    };
+
+    checkCalendarConflicts().catch(() => {
+      if (!cancelled) setCalendarConflictKeys(new Set());
+    });
+    const interval = setInterval(() => {
+      checkCalendarConflicts().catch(() => {});
+    }, 5 * 60 * 1000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [calendarConflictsEnabled, ready, reminderTasksForScheduling, syncUser?.uid]);
+
+  useEffect(() => {
     if (!ready) return;
     const checkDueReminders = () => {
       if (AppState.currentState !== 'active') return;
@@ -10088,7 +10279,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
         <PortalHost>
           <BackButtonManager screen={screen} setScreen={setScreen} />
           <View style={{ flex: 1, overflow: 'hidden' }}>
-            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} />}
+            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} calendarConflictKeys={calendarConflictKeys} />}
             {screen === 'grocery' && (
               <StandaloneGrocery
                 groceryItems={groceryItemsForScreen}
@@ -10150,7 +10341,10 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
                 accentLight={accentLight} accentDark={accentDark} setAccentLight={setAccentLight} setAccentDark={setAccentDark}
                 themeId={themeId} setThemeId={setThemeId}
                 customThemeDrafts={customThemeDrafts} setCustomThemeDrafts={setCustomThemeDrafts}
-                onClearArchive={() => setArchive(() => [])} onReplayOnboarding={replayOnboarding} />
+                onClearArchive={() => setArchive(() => [])} onReplayOnboarding={replayOnboarding}
+                calendarConflictsEnabled={calendarConflictsEnabled}
+                setCalendarConflictsEnabled={setCalendarConflictsEnabled}
+                onRequestCalendarConflictAccess={requestCalendarConflictAccess} />
             )}
           </View>
           <TabBar screen={screen} setScreen={setScreen} accentColor={accentColor} isPaid={isPaid} onLockedGrocery={() => setShowGroceryUpsell(true)} />
