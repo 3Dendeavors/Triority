@@ -17,12 +17,12 @@ Use the release APK asset for installs. Source-code archives attached to GitHub 
 ## What It Does
 
 - Tasks organized into High, Medium, and Low tiers.
-- Multiple task lists with drag reorder inside each tier.
-- Built-in grocery list with category sorting and a Got It section.
-- Shared task lists and one shared grocery list through optional sign-in.
-- Task archive with restore support.
-- Local reminders for tasks.
-- Optional AI triage using your own Claude API key.
+- Multiple task lists with drag reorder inside each tier, archive/restore support, and a short shine on newly added rows.
+- Built-in grocery list with category sorting, a Got It section, recipe/project quantities, and material-shopping categories.
+- Shared task lists and one shared grocery page through optional sign-in and invite codes.
+- Local and shared task reminders, with each device alerting only when that user allows notifications.
+- Optional read-only Google Calendar conflict checks for reminder tasks.
+- Optional AI triage using your own Claude API key, Personal Context, and the current task/grocery workspace.
 - Themes, accent colors, and personal context for AI prompting.
 - Optional support through Buy Me a Coffee: https://buymeacoffee.com/3DEndeavors
 
@@ -34,9 +34,10 @@ Network calls are limited to:
 
 - Firebase for optional Google sign-in, sync, and legacy shared lists.
 - Supabase for current shared-list collaboration.
+- Google Calendar free/busy checks only when you enable calendar conflict checks.
 - Anthropic only when you provide a Claude API key and use AI features.
 
-Your Anthropic API key is stored locally with encrypted storage and is not intentionally synced.
+Google handles sign-in. Triority does not receive your Google password. Your Anthropic API key is stored locally with encrypted storage and is not intentionally synced.
 
 ## Building
 
@@ -53,4 +54,4 @@ Release signing files and Firebase config are intentionally not committed. See `
 
 ## Current Status
 
-The current public beta is `v1.4.4` / `versionCode 20`, a polish release with recent-add shine feedback, cleaner list headers, contextual shared-list joining, and active shared-grocery AI routing. The `main` branch is intended to match the latest public APK source.
+The current public beta is `v1.4.4` / `versionCode 20`. The source on `main` now includes additional post-release polish for shared reminders, read-only calendar conflict checks, safer account switching, contextual AI/grocery quantity handling, replayable onboarding, and Settings cleanup. The next public release should be packaged with a real APK asset before `latest.json` is updated.

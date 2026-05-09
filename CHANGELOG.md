@@ -10,6 +10,18 @@
 - Expanded grocery categories with lightweight material-shopping groups for hardware, lumber, electrical, plumbing, automotive, office supplies, tools, paint, and fasteners.
 - Updated AI grocery/material parsing to preserve specified quantities/units and infer practical starter quantities for generated project/material lists where reasonable.
 - Added notification-permission nudges when users share or join lists, and when they enable a task reminder.
+- Added shared task reminders. Shared rows store the reminder for everyone to see, while each member's phone only schedules/fires local alerts when that member grants notification and reminder permissions.
+- Routed reminder notification taps back into the matching list/task and reused the new-row shine so the task that pinged the user is easier to spot.
+- Ensured foreground reminders still alert while the app is open, so reminders are not missed during active list use or shopping.
+- Added a direct shared-list join action in list/grocery management, then removed redundant join-code clutter from the edit screen.
+- Restored shared archived tasks in Archive and fixed shared-list task completion undo behavior.
+- Removed the compact AI action readout experiment after it proved less useful than the visible row changes and toasts.
+- Tightened AI routing prompts so simple grocery item lists do not get guessed quantities, while recipe/project prompts can include practical measurements and package-size hints.
+- Added optional read-only Google Calendar conflict checks for reminder tasks. Conflicts show a red calendar icon/toast; the app does not create or edit calendar events.
+- Improved account-switching safety by keeping sync caches account-scoped and recovering Supabase shared memberships for the signed-in account.
+- Slowed the task-list pill auto-center behavior so user scrolling is not immediately snapped back.
+- Reworked onboarding as a replayable feature tour with concise copy, fake app previews, and coverage for quick capture, AI routing, sharing, groceries/materials/recipes, reminders, privacy, and optional sync.
+- Cleaned up Settings by combining Sync and Calendar conflict checks, keeping Help above the bottom Support Triority row, and sizing the support row for its label.
 
 ## v1.4.4
 
