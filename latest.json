@@ -1,8 +1,8 @@
 {
-  "versionName": "1.4.4",
-  "versionCode": 20,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.4/Triority-v1.4.4.apk",
-  "releaseNotes": "Polish release with recent-add shine feedback, selected list centering, contextual shared-list joining, cleaner headers, keyboard-aware edit/list sheets, and active shared-grocery AI routing.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.4",
+  "versionName": "1.4.5",
+  "versionCode": 21,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.5/Triority-v1.4.5.apk",
+  "releaseNotes": "Polish release with shared reminders, read-only calendar conflict checks, safer account switching, contextual AI grocery quantity/package handling, replayable onboarding, and Settings cleanup.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.5",
   "required": false
 }
