@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Nothing yet.
+
+## v1.4.5 - 2026-05-09
+
 - Documentation pass: recorded v1.4.4 as the current public APK release, clarified that GitHub releases must include an APK asset, and preserved Ross's keyboard-sheet and public-repo preferences for future sessions.
 - Added the Buy Me a Coffee support link so Settings can show the Support Triority row.
 - Verified the support row/link, keyboard/list-modal polish, and active shared-grocery AI routing in local testing.
