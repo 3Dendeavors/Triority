@@ -342,6 +342,7 @@ const SHARED_CACHE_KEY = 'tri_shared_cache_v1';
 const COLLAPSED_GROUPS_KEY = 'tri_collapsed_groups_v1';
 const CALENDAR_CONFLICTS_ENABLED_KEY = 'tri_calendar_conflicts_enabled_v1';
 const GOOGLE_CALENDAR_FREEBUSY_SCOPE = 'https://www.googleapis.com/auth/calendar.freebusy';
+const GOOGLE_CALENDAR_LIST_SCOPE = 'https://www.googleapis.com/auth/calendar.calendarlist.readonly';
 const CALENDAR_CONFLICT_WINDOW_MS = 30 * 60 * 1000;
 const REMINDER_NAV_KEY = 'tri_pending_reminder_nav_v1';
 const SHARED_STALE_RESTORE_CUTOFF_MS = new Date('2026-05-07T00:00:00-04:00').getTime();
@@ -591,8 +592,8 @@ function withTimeout<T>(promise: PromiseLike<T>, ms: number, message: string): P
 // every useIsPaid() / useIAP() call site continues to compile, and isPaid is
 // hardcoded true so all formerly-Pro features unlock for everyone.
 //
-// Settings shows a "Support Triority" row that opens DonateSheet linking to
-// these URLs. The row hides itself if BOTH URLs are empty.
+// Settings shows a support row that opens DonateSheet linking to
+// these URLs. The button hides itself if BOTH URLs are empty.
 const TRIORITY_PATREON_URL = '';
 const TRIORITY_BMAC_URL = 'https://buymeacoffee.com/3DEndeavors';
 
@@ -703,7 +704,10 @@ function SyncProvider({ children }: { children: React.ReactNode }) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    GoogleSignin.configure({ webClientId: WEB_CLIENT_ID });
+    GoogleSignin.configure({
+      webClientId: WEB_CLIENT_ID,
+      scopes: [GOOGLE_CALENDAR_FREEBUSY_SCOPE, GOOGLE_CALENDAR_LIST_SCOPE],
+    });
     const unsubscribe = onAuthStateChanged(getAuth(getApp()), (next) => {
       setUser(next);
       setAuthReady(true);
@@ -771,6 +775,8 @@ const SYNC_SCHEMA_VERSION = 1;
 const SYNC_DEBOUNCE_MS = 800;          // batch rapid edits into one write
 const SYNC_LAST_REMOTE_KEY = 'tri_sync_last_remote_at';   // mirrors remote updatedAt last seen
 const SYNC_LAST_LOCAL_KEY  = 'tri_sync_last_local_at';    // mirrors local updatedAt last written
+const SYNC_CURRENT_UID_KEY = 'tri_sync_current_uid_v1';
+const SYNC_ACCOUNT_CACHE_PREFIX = 'tri_sync_account_cache_v1:';
 
 interface SyncedState {
   lists: TaskList[];
@@ -799,6 +805,11 @@ interface SyncedState {
   // implies the user is past onboarding anyway.
 }
 
+type AccountCache = {
+  savedAt: number;
+  data: SyncedState;
+};
+
 // Firestore rejects fields whose value is `undefined`. The app's data shape
 // uses optional fields like Task.reminder that come through as undefined when
 // unset. Strip them before sending. JSON.stringify drops undefined and
@@ -815,6 +826,22 @@ function buildSyncBlob(s: SyncedState, updatedAt: number) {
     updatedAt,
     data: stripUndefined(s),
   };
+}
+
+function syncAccountKey(prefix: string, uid: string) {
+  return `${prefix}${stableFirestoreId(uid)}`;
+}
+
+function syncLastLocalKey(uid: string) {
+  return syncAccountKey(`${SYNC_LAST_LOCAL_KEY}:`, uid);
+}
+
+function syncLastRemoteKey(uid: string) {
+  return syncAccountKey(`${SYNC_LAST_REMOTE_KEY}:`, uid);
+}
+
+function syncAccountCacheKey(uid: string) {
+  return syncAccountKey(SYNC_ACCOUNT_CACHE_PREFIX, uid);
 }
 
 // ─── Shared list helpers (Phase 2) ────────────────────────────────────────────
@@ -1207,6 +1234,41 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     setSharedArchives((prev) => ({ ...prev, [listId]: (archivesRes.data || []).map(mapSupabaseArchive) }));
   }, [forgetSharedListLocally, removeJoinedId]);
 
+  const recoverSupabaseMembershipsForUser = useCallback(async () => {
+    if (!user) return;
+    const { data: memberRows, error: memberError } = await supabase
+      .from('tri_shared_members')
+      .select('list_id')
+      .eq('uid', user.uid);
+    if (memberError || !Array.isArray(memberRows) || memberRows.length === 0) return;
+
+    const recoveredIds = Array.from(new Set(
+      memberRows
+        .map((row: any) => String(row.list_id || ''))
+        .filter((id: string) => isSupabaseSharedListId(id)),
+    ));
+    if (recoveredIds.length === 0) return;
+
+    const { data: listRows } = await supabase
+      .from('tri_shared_lists')
+      .select('id, kind')
+      .in('id', recoveredIds);
+    const recoveredGroceryIds = (Array.isArray(listRows) ? listRows : [])
+      .filter((row: any) => row?.kind === 'grocery')
+      .map((row: any) => String(row.id || ''))
+      .filter((id: string) => isSupabaseSharedListId(id));
+
+    for (const id of recoveredIds) locallyRemovedSharedIdsRef.current.delete(id);
+    if (recoveredGroceryIds.length > 0) {
+      await markSupabaseSharedGroceryActive(recoveredGroceryIds[0]);
+    }
+    const merged = Array.from(new Set([...joinedIdsRef.current, ...recoveredIds]));
+    await setJoinedIds(merged);
+    recoveredIds.forEach((id) => {
+      refreshSupabaseSharedList(id).catch(() => {});
+    });
+  }, [refreshSupabaseSharedList, setJoinedIds, user]);
+
   const recoverExistingSupabaseGroceryMembership = useCallback(async (): Promise<string | null> => {
     if (!user) return null;
     const { data, error } = await supabase
@@ -1258,6 +1320,16 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       cancelled = true;
     };
   }, [authReady, user, appActive]);
+
+  const recoveredSupabaseForUidRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!authReady || !user || !appActive || hydrating) return;
+    if (recoveredSupabaseForUidRef.current === user.uid) return;
+    recoveredSupabaseForUidRef.current = user.uid;
+    recoverSupabaseMembershipsForUser().catch(() => {
+      recoveredSupabaseForUidRef.current = null;
+    });
+  }, [authReady, user, appActive, hydrating, recoverSupabaseMembershipsForUser]);
 
   useEffect(() => {
     if (!authReady || !user || !appActive) return;
@@ -2828,6 +2900,28 @@ function ensurePersonalListPresent(lists: TaskList[] = []): TaskList[] {
   ];
 }
 
+function emptySyncedState(): SyncedState {
+  const now = Date.now();
+  return {
+    lists: [{ id: DEFAULT_LIST_ID, name: DEFAULT_LIST_NAME, tasks: [], createdAt: now, updatedAt: now }],
+    activeListId: DEFAULT_LIST_ID,
+    archive: [],
+    accentLight: null,
+    accentDark: null,
+    themeId: 'slate',
+    customThemeDrafts: [null, null, null],
+    personalContext: '',
+    defaultTier: 'medium',
+    autoClear: 'Never',
+    darkMode: true,
+    groceryItems: [],
+    joinedSharedLists: [],
+    syncEnabledForGrocery: false,
+    sharedTaskOrder: [],
+    listRowOrder: [DEFAULT_LIST_ID],
+  };
+}
+
 function parseCollapsedGroups(raw: string | null): CollapsedGroups {
   if (!raw) return {};
   try {
@@ -3307,21 +3401,70 @@ function nextReminderOccurrenceAt(r: Reminder, now = Date.now()): number | null 
   return r.remindAt + Math.ceil((now - r.remindAt) / interval) * interval;
 }
 
+type CalendarBusyBlock = { start: number; end: number };
+
 async function getCalendarFreeBusyAccessToken() {
   await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
+  let cachedAccessToken = '';
   try {
     const current = GoogleSignin.getCurrentUser?.();
     const scopes = current?.scopes || [];
-    if (!scopes.includes(GOOGLE_CALENDAR_FREEBUSY_SCOPE)) {
-      const response = await GoogleSignin.addScopes({ scopes: [GOOGLE_CALENDAR_FREEBUSY_SCOPE] });
+    const missingScopes = [GOOGLE_CALENDAR_FREEBUSY_SCOPE, GOOGLE_CALENDAR_LIST_SCOPE]
+      .filter((scope) => !scopes.includes(scope));
+    if (missingScopes.length > 0) {
+      cachedAccessToken = (await GoogleSignin.getTokens().catch(() => ({ accessToken: '' }))).accessToken;
+      const response = await GoogleSignin.addScopes({ scopes: missingScopes });
       if (response && response.type === 'cancelled') return null;
+      if (cachedAccessToken) {
+        await GoogleSignin.clearCachedAccessToken(cachedAccessToken).catch(() => {});
+      }
     }
   } catch {}
   const tokens = await GoogleSignin.getTokens();
   return tokens.accessToken;
 }
 
-async function fetchCalendarBusyBlocks(accessToken: string, timeMin: number, timeMax: number) {
+function calendarCheckErrorMessage(error: any) {
+  const raw = String(error?.message || error || '').trim();
+  const lower = raw.toLowerCase();
+  if (lower.includes('calendar api has not been used') || lower.includes('disabled')) {
+    return 'Calendar API is not enabled';
+  }
+  if (lower.includes('insufficient') || lower.includes('scope') || lower.includes('403')) {
+    return 'Calendar permission needs reconnect';
+  }
+  if (lower.includes('401') || lower.includes('unauthorized') || lower.includes('invalid credentials')) {
+    return 'Google sign-in needs refresh';
+  }
+  if (lower.includes('network') || lower.includes('failed to fetch')) {
+    return 'Calendar network check failed';
+  }
+  return raw ? `Calendar check failed: ${raw.slice(0, 80)}` : 'Calendar conflicts could not be checked';
+}
+
+async function fetchCalendarIds(accessToken: string) {
+  const resp = await fetch('https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=reader', {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.error?.message || 'Could not read calendar list');
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const ids = items
+    .filter((item: any) => item?.id && item.hidden !== true && item.selected !== false)
+    .map((item: any) => String(item.id));
+  return ids.length > 0 ? Array.from(new Set(ids)) : ['primary'];
+}
+
+async function fetchCalendarBusyBlocks(accessToken: string, timeMin: number, timeMax: number): Promise<CalendarBusyBlock[]> {
+  const primaryBlocks = await fetchCalendarBusyBlocksForIds(accessToken, timeMin, timeMax, ['primary']);
+  const calendarIds = await fetchCalendarIds(accessToken).catch(() => []);
+  const extraCalendarIds = calendarIds.filter((id) => id !== 'primary');
+  if (extraCalendarIds.length === 0) return primaryBlocks;
+  const extraBlocks = await fetchCalendarBusyBlocksForIds(accessToken, timeMin, timeMax, extraCalendarIds).catch(() => []);
+  return [...primaryBlocks, ...extraBlocks];
+}
+
+async function fetchCalendarBusyBlocksForIds(accessToken: string, timeMin: number, timeMax: number, calendarIds: string[]): Promise<CalendarBusyBlock[]> {
   const resp = await fetch('https://www.googleapis.com/calendar/v3/freeBusy', {
     method: 'POST',
     headers: {
@@ -3331,13 +3474,18 @@ async function fetchCalendarBusyBlocks(accessToken: string, timeMin: number, tim
     body: JSON.stringify({
       timeMin: new Date(timeMin).toISOString(),
       timeMax: new Date(timeMax).toISOString(),
-      items: [{ id: 'primary' }],
+      items: calendarIds.map((id) => ({ id })),
     }),
   });
   const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.error?.message || 'Could not check calendar');
-  const busy = data?.calendars?.primary?.busy;
-  if (!Array.isArray(busy)) return [];
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${data?.error?.message || 'Could not check calendar'}`);
+  const calendars = data?.calendars && typeof data.calendars === 'object' ? data.calendars : {};
+  const calendarErrors = Object.values(calendars)
+    .flatMap((calendar: any) => Array.isArray(calendar?.errors) ? calendar.errors : [])
+    .map((err: any) => String(err?.reason || err?.message || 'calendar error'))
+    .filter(Boolean);
+  if (calendarErrors.length > 0) throw new Error(calendarErrors[0]);
+  const busy = Object.values(calendars).flatMap((calendar: any) => Array.isArray(calendar?.busy) ? calendar.busy : []);
   return busy
     .map((b: any) => ({ start: Date.parse(b.start), end: Date.parse(b.end) }))
     .filter((b: { start: number; end: number }) => {
@@ -5638,6 +5786,11 @@ function ListPillRow({ lists, activeListId, accentColor, isPaid, onSelect, onLon
   const [viewportWidth, setViewportWidth] = useState(0);
   const [contentWidth, setContentWidth] = useState(0);
   const [layoutVersion, setLayoutVersion] = useState(0);
+  const scrollXRef = useRef(0);
+  const scrollAnimRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const centerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const userScrolledAtRef = useRef(0);
+  const suppressScrollEventRef = useRef(false);
 
   const handlePillMeasured = useCallback(() => {
     setLayoutVersion(v => v + 1);
@@ -5667,19 +5820,68 @@ function ListPillRow({ lists, activeListId, accentColor, isPaid, onSelect, onLon
 
   const centerActivePill = useCallback((animated: boolean) => {
     if (draggingIndex !== null || !viewportWidth) return;
+    if (scrollAnimRef.current) {
+      clearInterval(scrollAnimRef.current);
+      scrollAnimRef.current = null;
+    }
     const activeIndex = lists.findIndex(l => l.id === activeListId);
     if (activeIndex < 0) return;
     const layout = pillLayoutsRef.current[activeIndex];
     if (!layout) return;
     const maxX = Math.max(0, contentWidth - viewportWidth);
     const targetX = Math.max(0, Math.min(maxX, layout.x + layout.width / 2 - viewportWidth / 2));
-    scrollRef.current?.scrollTo({ x: targetX, animated });
+    if (!animated) {
+      scrollXRef.current = targetX;
+      suppressScrollEventRef.current = true;
+      scrollRef.current?.scrollTo({ x: targetX, animated: false });
+      setTimeout(() => { suppressScrollEventRef.current = false; }, 0);
+      return;
+    }
+    const startX = scrollXRef.current;
+    const delta = targetX - startX;
+    if (Math.abs(delta) < 2) return;
+    const duration = 2000;
+    const startedAt = Date.now();
+    scrollAnimRef.current = setInterval(() => {
+      const t = Math.min(1, (Date.now() - startedAt) / duration);
+      const eased = 1 - Math.pow(1 - t, 3);
+      const nextX = startX + delta * eased;
+      scrollXRef.current = nextX;
+      suppressScrollEventRef.current = true;
+      scrollRef.current?.scrollTo({ x: nextX, animated: false });
+      setTimeout(() => { suppressScrollEventRef.current = false; }, 0);
+      if (t >= 1 && scrollAnimRef.current) {
+        clearInterval(scrollAnimRef.current);
+        scrollAnimRef.current = null;
+        scrollXRef.current = targetX;
+      }
+    }, 16);
   }, [activeListId, contentWidth, draggingIndex, lists, viewportWidth]);
 
+  const scheduleCenterActivePill = useCallback((delayMs: number) => {
+    if (centerTimerRef.current) clearTimeout(centerTimerRef.current);
+    centerTimerRef.current = setTimeout(() => {
+      if (Date.now() - userScrolledAtRef.current < delayMs) {
+        scheduleCenterActivePill(delayMs);
+        return;
+      }
+      centerActivePill(true);
+    }, delayMs);
+  }, [centerActivePill]);
+
   useEffect(() => {
-    const timeout = setTimeout(() => centerActivePill(true), 40);
-    return () => clearTimeout(timeout);
-  }, [activeListId, centerActivePill, layoutVersion, lists.length]);
+    scheduleCenterActivePill(3000);
+    return () => {
+      if (centerTimerRef.current) clearTimeout(centerTimerRef.current);
+    };
+  }, [activeListId, layoutVersion, lists.length, scheduleCenterActivePill]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollAnimRef.current) clearInterval(scrollAnimRef.current);
+      if (centerTimerRef.current) clearTimeout(centerTimerRef.current);
+    };
+  }, []);
 
   return (
     <ScrollView
@@ -5689,6 +5891,25 @@ function ListPillRow({ lists, activeListId, accentColor, isPaid, onSelect, onLon
       contentContainerStyle={styles.listPillRowContent}
       style={styles.listPillRow}
       scrollEnabled={draggingIndex === null}
+      onScroll={(e) => { scrollXRef.current = e.nativeEvent.contentOffset.x; }}
+      scrollEventThrottle={16}
+      onScrollBeginDrag={() => {
+        userScrolledAtRef.current = Date.now();
+        if (scrollAnimRef.current) {
+          clearInterval(scrollAnimRef.current);
+          scrollAnimRef.current = null;
+        }
+        if (centerTimerRef.current) clearTimeout(centerTimerRef.current);
+      }}
+      onScrollEndDrag={() => {
+        userScrolledAtRef.current = Date.now();
+        scheduleCenterActivePill(3000);
+      }}
+      onMomentumScrollEnd={() => {
+        if (suppressScrollEventRef.current) return;
+        userScrolledAtRef.current = Date.now();
+        scheduleCenterActivePill(3000);
+      }}
       onLayout={(e) => {
         setViewportWidth(e.nativeEvent.layout.width);
         setTimeout(() => centerActivePill(false), 0);
@@ -6416,9 +6637,10 @@ interface ActiveListProps {
   setCollapsedGroup: (key: string, collapsed: boolean) => void;
   focusedTaskId?: string | null;
   calendarConflictKeys?: Set<string>;
+  calendarConflictNotice?: string | null;
 }
 
-function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, defaultTier, setArchive, activeListId, lists, setActiveListId, addList, renameList, deleteList, reorderLists, onAddGroceryItems, setScreen, sharedActions, sharedIdSet, collapsedGroups, setCollapsedGroup, focusedTaskId, calendarConflictKeys }: ActiveListProps) {
+function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, defaultTier, setArchive, activeListId, lists, setActiveListId, addList, renameList, deleteList, reorderLists, onAddGroceryItems, setScreen, sharedActions, sharedIdSet, collapsedGroups, setCollapsedGroup, focusedTaskId, calendarConflictKeys, calendarConflictNotice }: ActiveListProps) {
   const isPaid = useIsPaid();
   const { user: syncUser } = useSync();
   const {
@@ -6453,6 +6675,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
   const [toast, setToast] = useState<ToastData | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const shownCalendarConflictKeysRef = useRef<Set<string>>(new Set());
+  const shownCalendarNoticeRef = useRef<string | null>(null);
   // Tick every 30s so reminder subtext ("In 5m", "Overdue") stays current
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -6489,6 +6712,13 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     for (const key of visibleConflicts) shownCalendarConflictKeysRef.current.add(key);
     showToast('Reminder conflicts with your calendar');
   }, [activeListId, calendarConflictKeys, showToast, tasks]);
+
+  useEffect(() => {
+    if (!calendarConflictNotice) return;
+    if (shownCalendarNoticeRef.current === calendarConflictNotice) return;
+    shownCalendarNoticeRef.current = calendarConflictNotice;
+    showToast(calendarConflictNotice);
+  }, [calendarConflictNotice, showToast]);
 
   const handleComplete = useCallback((id: TaskId) => {
     if (sharedActions) {
@@ -8394,6 +8624,7 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
   const themeDef = getTheme(themeId);
   const currentModeAccent = darkMode ? accentDark : accentLight;
   const accentIsDefault = currentModeAccent == null;
+  const hasSupportLink = !!TRIORITY_PATREON_URL || !!TRIORITY_BMAC_URL;
   const onPickAccent = (v: string) => {
     if (!isPaid) { setShowUpsell(true); return; }
     // Tapping the active accent again clears both modes back to theme defaults.
@@ -8449,10 +8680,10 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
         <View style={[styles.divider, { backgroundColor: T.border }]} />
       </View>
 
-      <SettingsSection title="Sync" />
+      <SettingsSection title="Sync & Calendar" />
       <View style={[cardStyle, { marginBottom: 16 }]}>
         {syncUser ? (
-          <View style={{ paddingVertical: 14, paddingHorizontal: 14 }}>
+          <View style={[styles.settingsCardInner, { borderBottomColor: T.border }]}>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
               <View style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: `${accent}20`, borderWidth: 1, borderColor: `${accent}55`, alignItems: 'center', justifyContent: 'center' }}>
                 <Icon name="user" size={16} color={accent} />
@@ -8489,7 +8720,7 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
             </TouchableOpacity>
           </View>
         ) : (
-          <View style={{ paddingVertical: 14, paddingHorizontal: 14 }}>
+          <View style={[styles.settingsCardInner, { borderBottomColor: T.border }]}>
             <Text style={[styles.settingRowLabel, { color: T.text, fontFamily: jks('600') }]}>Back up &amp; sync your data</Text>
             <Text style={{ color: T.textMute, fontSize: 12, fontFamily: jks('400'), marginTop: 6, lineHeight: 17 }}>
               Sign in with Google to keep your tasks, lists, and settings safe across reinstalls and devices. Your data is private to your account.
@@ -8506,14 +8737,11 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
             </TouchableOpacity>
           </View>
         )}
-      </View>
-
-      <SettingsSection title="Calendar" />
-      <View style={[cardStyle, { marginBottom: 16 }]}>
         <SettingRow
-          label="Conflict Checks"
-          subtitle="Read-only Google Calendar busy-time check for task reminders. Triority never creates calendar events."
+          label="Calendar conflict checks"
+          subtitle="Marks reminder tasks that overlap your Google Calendar. Triority never adds events."
           right={<Toggle value={calendarConflictsEnabled} onChange={toggleCalendarConflicts} accent={accent} />}
+          noBorder
         />
       </View>
 
@@ -8653,15 +8881,8 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
         )}
       </View>
 
-      <SettingsSection title="Help" />
-      <View style={[cardStyle, { marginBottom: 16 }]}>
-        <SettingRow label="Show walkthrough again" subtitle="Replay the intro tour" noBorder
-          onPress={onReplayOnboarding}
-          right={<Text style={[styles.clearLabel, { color: accent, fontFamily: jks('400') }]}>Show</Text>} />
-      </View>
-
       <SettingsSection title="AI Triage" />
-      <View style={[cardStyle, { marginBottom: 40 }]}>
+      <View style={[cardStyle, { marginBottom: 16 }]}>
         <View style={[styles.settingsCardInner, { borderBottomColor: T.border }]}>
           <View style={styles.apiKeyHeader}>
             <Text style={[styles.settingRowLabel, { color: T.text, fontFamily: jks('500') }]}>Claude API Key</Text>
@@ -8702,18 +8923,25 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
             style={[styles.contextInput, { backgroundColor: T.s2, color: T.text, borderColor: T.border, fontFamily: jks('400') }]} />
         </View>
       </View>
-      {/* Step 15: replaces the old Restore Purchase row. Hidden only if every
-          donation URL is empty, so configured support links show automatically. */}
-      {(!!TRIORITY_PATREON_URL || !!TRIORITY_BMAC_URL) && (
-        <View style={[styles.settingsSection, { marginBottom: insets.bottom + 12 }]}>
+
+      <SettingsSection title="Help" />
+      <View style={[cardStyle, { marginBottom: 16 }]}>
+        <SettingRow label="Show walkthrough again" subtitle="Replay the intro tour" noBorder
+          onPress={onReplayOnboarding}
+          right={<Text style={[styles.clearLabel, { color: accent, fontFamily: jks('400') }]}>Show</Text>} />
+      </View>
+
+      {hasSupportLink && (
+        <>
+          <SettingsSection title="Support" />
           <TouchableOpacity
             onPress={() => setShowDonate(true)}
-            style={[styles.settingsCard, { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 14 }]}
+            style={[styles.settingsCard, styles.supportSettingsRow, { backgroundColor: T.s1, borderColor: T.border, marginBottom: insets.bottom + 24 }]}
             activeOpacity={0.7}>
-            <Text style={[styles.settingRowLabel, { color: T.text, fontFamily: jks('500') }]}>Support Triority</Text>
+            <Text numberOfLines={1} style={[styles.settingRowLabel, styles.supportSettingsLabel, { color: T.text, fontFamily: jks('600') }]}>Support Triority</Text>
             <Icon name="heart" size={14} color={accent} />
           </TouchableOpacity>
-        </View>
+        </>
       )}
     </ScrollView>
     {confirmNode}
@@ -8787,44 +9015,216 @@ interface OnboardingStep {
   icon: string;
   title: string;
   body: string;
-  example?: string;
-  exampleSub?: string;
+  demo: 'capture' | 'ai' | 'share' | 'grocery' | 'reminders' | 'privacy';
 }
 
 const ONBOARDING_STEPS: OnboardingStep[] = [
   {
-    icon: 'list',
-    title: 'Welcome to Triority',
-    body: 'A focused task manager built around three priority tiers — High, Medium, Low. Swipe right on any task to complete it. Swipe left to reveal the trash, then tap to delete. Tap the pencil to edit. Long-press a task to drag it to a new spot within its tier.',
-  },
-  {
-    icon: 'layers',
-    title: 'Multiple lists',
-    body: 'Create as many lists as you need — Work, Home, Errands, whatever. Tap a list pill to switch. Long-press a list pill to drag and reorder. Tap the list name to manage the active list.',
-  },
-  {
-    icon: 'shopping-bag',
-    title: 'Built-in grocery list',
-    body: 'Tap Groceries in the bottom bar to switch to your grocery list. Items are grouped by category. Swipe right on an item when you grab it — it moves to the "Got it" section. Tap Clear to clean up when you\'re done.',
+    icon: 'mic',
+    title: 'Quick capture',
+    body: 'Type or talk from the bottom bar, choose a priority, and the task lands in the list you are already viewing.',
+    demo: 'capture',
   },
   {
     icon: 'sparkles',
-    title: 'AI routes everything',
-    body: 'Add your Claude API key in Settings and dump your whole brain in one shot. Triority splits it into tasks (with priorities), grocery items (with categories), and sets reminders for anything time-sensitive.',
-    example: '"Remind me to call my doctor Friday at 3pm, pick up milk and eggs, and fix the leaky faucet"',
-    exampleSub: 'tasks go to your active list, groceries go to the grocery list — all in one tap',
+    title: 'AI understands loose notes',
+    body: 'Add your Claude key and Personal Context, then speak casually. A brain dump can become tasks, reminders, groceries, or recipe ingredients in the right place.',
+    demo: 'ai',
+  },
+  {
+    icon: 'users',
+    title: 'Lists can be shared',
+    body: 'Share task lists or the grocery page by code. Everyone can add items, and shared rows keep the group feeling like one list.',
+    demo: 'share',
+  },
+  {
+    icon: 'shopping-bag',
+    title: 'Store runs, not just groceries',
+    body: 'Use Groceries for food, recipes, hardware, materials, and quick shopping runs. Items group by category so the list stays scannable.',
+    demo: 'grocery',
   },
   {
     icon: 'bell',
-    title: 'Reminders that actually nag',
-    body: 'Tap the pencil on any task to optionally set a reminder. If you do, choose how often — once, every hour, or daily until done. Completing the task cancels it.',
+    title: 'Reminder alerts',
+    body: 'Set one-time, hourly, or daily reminders. On shared lists, everyone sees the reminder; people who allow notifications get alerted on their own phone.',
+    demo: 'reminders',
   },
   {
-    icon: 'sun',
-    title: 'Themes & custom colors',
-    body: 'Choose from 8 built-in themes in Settings — or build your own. Three custom slots let you dial in canvas, surface, text, and accent colors with color sliders. Long-press a custom card to clear it.',
+    icon: 'home',
+    title: 'Private by default',
+    body: 'No analytics, no hosted AI account, and no surprise data trail. Google handles sign-in; Triority never sees your Google password or broader account data.',
+    demo: 'privacy',
   },
 ];
+
+function OnboardingDemo({ kind, accentColor }: { kind: OnboardingStep['demo']; accentColor: string }) {
+  const T = useT();
+  const intro = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    intro.setValue(0);
+    const introAnim = Animated.timing(intro, { toValue: 1, duration: 2400, useNativeDriver: true });
+    introAnim.start();
+    return () => introAnim.stop();
+  }, [intro, kind]);
+
+  const appear = (at: number) => ({
+    opacity: intro.interpolate({ inputRange: [0, at, at + 0.16, 1], outputRange: [0, 0, 1, 1], extrapolate: 'clamp' }),
+    transform: [{ translateY: intro.interpolate({ inputRange: [0, at, at + 0.16, 1], outputRange: [8, 8, 0, 0], extrapolate: 'clamp' }) }],
+  });
+  const slide = (at: number) => ({
+    opacity: intro.interpolate({ inputRange: [0, at, at + 0.16, 1], outputRange: [0, 0, 1, 1], extrapolate: 'clamp' }),
+    transform: [{ translateX: intro.interpolate({ inputRange: [0, at, at + 0.16, 1], outputRange: [-14, -14, 0, 0], extrapolate: 'clamp' }) }],
+  });
+  const Line = ({ text, color, at = 0.1, icon }: { text: string; color?: string; at?: number; icon?: string }) => (
+    <Animated.View style={[styles.onbDemoLine, { backgroundColor: T.s1, borderColor: T.border }, appear(at)]}>
+      <View style={[styles.onbDemoDot, { backgroundColor: color || accentColor }]} />
+      <Text style={[styles.onbDemoLineText, { color: T.text, fontFamily: jks('600') }]} numberOfLines={1}>{text}</Text>
+      {icon ? <Icon name={icon} size={13} color={color || accentColor} /> : null}
+    </Animated.View>
+  );
+  const SharedLine = ({ text, initials, color, at = 0.1, icon }: { text: string; initials: string; color: string; at?: number; icon?: string }) => (
+    <Animated.View style={[styles.onbDemoSharedLine, { backgroundColor: T.s1, borderColor: T.border }, appear(at)]}>
+      <View style={[styles.onbDemoAvatar, { backgroundColor: `${color}28`, borderColor: `${color}66` }]}>
+        <Text style={[styles.onbDemoAvatarText, { color, fontFamily: jks('800') }]}>{initials}</Text>
+      </View>
+      <Text style={[styles.onbDemoLineText, { color: T.text, fontFamily: jks('600') }]} numberOfLines={1}>{text}</Text>
+      {icon ? <Icon name={icon} size={13} color={color} /> : null}
+    </Animated.View>
+  );
+
+  return (
+    <View style={[styles.onbDemoShell, { backgroundColor: T.s2, borderColor: T.borderMid }]}>
+      <View style={styles.onbDemoTop}>
+        <View style={[styles.onbDemoTinyDot, { backgroundColor: T.high }]} />
+        <View style={[styles.onbDemoTinyDot, { backgroundColor: T.med }]} />
+        <View style={[styles.onbDemoTinyDot, { backgroundColor: T.low }]} />
+      </View>
+
+      <View style={styles.onbDemoStage}>
+      {kind === 'capture' && (
+        <>
+          <Text style={[styles.onbDemoSectionLabel, { color: T.textMute, fontFamily: jks('800') }]}>Medium</Text>
+          <Line text="Order filters" color={T.med} at={0.06} />
+          <Animated.View style={[styles.onbDemoTaskGhost, { backgroundColor: T.s1, borderColor: `${T.med}66` }, appear(0.5)]}>
+            <View style={[styles.onbDemoDot, { backgroundColor: T.med }]} />
+            <Text style={[styles.onbDemoLineText, { color: T.text, fontFamily: jks('700') }]}>Walk the dog</Text>
+          </Animated.View>
+          <View style={styles.onbDemoChips}>
+            {['High', 'Medium', 'Low'].map((label, i) => (
+              <Animated.View key={label} style={[styles.onbDemoChip, { borderColor: i === 1 ? accentColor : T.border, backgroundColor: i === 1 ? `${accentColor}22` : T.s1 }, appear(0.22 + i * 0.08)]}>
+                <Text style={[styles.onbDemoChipText, { color: i === 1 ? accentColor : T.textSub, fontFamily: jks('700') }]}>{label}</Text>
+              </Animated.View>
+            ))}
+          </View>
+          <View style={[styles.onbDemoInput, { backgroundColor: T.bg, borderColor: T.border }]}>
+            <Icon name="mic" size={13} color={accentColor} />
+            <Animated.Text style={[styles.onbDemoInputText, { color: T.textSub, fontFamily: jks('600'), opacity: intro.interpolate({ inputRange: [0, 0.15, 1], outputRange: [0.35, 1, 1] }) }]}>Walk the dog</Animated.Text>
+            <View style={[styles.onbDemoSend, { backgroundColor: accentColor }]}><Icon name="plus" size={12} color="#fff" /></View>
+          </View>
+        </>
+      )}
+
+      {kind === 'ai' && (
+        <>
+          <View style={[styles.onbDemoPrompt, { backgroundColor: T.bg, borderColor: `${accentColor}44` }]}>
+            <Icon name="sparkles" size={14} color={accentColor} />
+            <Text style={[styles.onbDemoPromptText, { color: T.text, fontFamily: jks('600') }]} numberOfLines={2}>ingredients for banana bread, get bacon eggs and bread, call doctor at 2</Text>
+          </View>
+          <Line text="Call doctor at 2" color={T.high} at={0.22} icon="bell" />
+          <Line text="Walk the dog" color={T.med} at={0.36} />
+          <Animated.View style={[styles.onbDemoGroceryRow, { backgroundColor: T.s1, borderColor: T.border }, slide(0.5)]}>
+            <Icon name="shopping-bag" size={14} color={accentColor} />
+            <Text style={[styles.onbDemoLineText, { color: T.text, fontFamily: jks('600') }]}>Bacon, eggs, bread</Text>
+          </Animated.View>
+          <Animated.View style={[styles.onbDemoNotice, styles.onbDemoNoticeTight, { backgroundColor: `${accentColor}14`, borderColor: `${accentColor}38` }, appear(0.66)]}>
+            <Text numberOfLines={1} style={[styles.onbDemoSmall, { color: T.textSub, fontFamily: jks('600') }]}>Context helps triage.</Text>
+          </Animated.View>
+        </>
+      )}
+
+      {kind === 'share' && (
+        <>
+          <View style={styles.onbDemoPills}>
+            {['Personal', 'House', 'Errands'].map((label, i) => (
+              <Animated.View key={label} style={[styles.onbDemoListPill, { backgroundColor: i === 1 ? `${accentColor}22` : T.s1, borderColor: i === 1 ? accentColor : T.border }, appear(0.08 + i * 0.08)]}>
+                {i === 1 ? <Icon name="users" size={10} color={accentColor} /> : null}
+                <Text style={[styles.onbDemoPillText, { color: i === 1 ? accentColor : T.textSub, fontFamily: jks('700') }]}>{label}</Text>
+              </Animated.View>
+            ))}
+          </View>
+          <SharedLine text="Buy dog food" initials="R" color={accentColor} at={0.3} />
+          <SharedLine text="Call vet at 4" initials="K" color={T.high} at={0.46} icon="bell" />
+          <SharedLine text="Check grocery list" initials="R" color={T.low} at={0.62} />
+        </>
+      )}
+
+      {kind === 'grocery' && (
+        <>
+          <View style={styles.onbDemoGroceryHeader}>
+            <Text style={[styles.onbDemoScreenTitle, { color: T.text, fontFamily: jks('800') }]}>Groceries</Text>
+            <Text style={[styles.onbDemoSmall, { color: T.textMute, fontFamily: jks('700') }]}>3 items</Text>
+          </View>
+          <Animated.View style={appear(0.16)}>
+            <Text style={[styles.onbDemoSectionLabel, { color: T.textMute, fontFamily: jks('800') }]}>Dairy</Text>
+            <View style={[styles.onbDemoGroceryItem, { backgroundColor: T.s1, borderColor: T.border }]}>
+              <Text style={[styles.onbDemoLineText, { color: T.text, fontFamily: jks('600') }]}>Eggs</Text>
+            </View>
+          </Animated.View>
+          <Animated.View style={appear(0.36)}>
+            <Text style={[styles.onbDemoSectionLabel, { color: T.textMute, fontFamily: jks('800') }]}>Hardware</Text>
+            <View style={[styles.onbDemoGroceryItem, { backgroundColor: T.s1, borderColor: T.border }]}>
+              <Text style={[styles.onbDemoLineText, { color: T.text, fontFamily: jks('600') }]}>Deck screws</Text>
+            </View>
+          </Animated.View>
+          <Animated.View style={appear(0.56)}>
+            <Text style={[styles.onbDemoSectionLabel, { color: T.textMute, fontFamily: jks('800') }]}>Baking</Text>
+            <View style={[styles.onbDemoGroceryItem, { backgroundColor: T.s1, borderColor: T.border }]}>
+              <Text style={[styles.onbDemoLineText, { color: T.text, fontFamily: jks('600') }]}>Baking powder</Text>
+              <Text style={[styles.onbDemoSmall, { color: T.textMute, fontFamily: jks('600') }]}>(3 oz box)</Text>
+            </View>
+          </Animated.View>
+        </>
+      )}
+
+      {kind === 'reminders' && (
+        <>
+          <Animated.View style={[styles.onbDemoReminderTask, { backgroundColor: T.s1, borderColor: T.border }, appear(0.12)]}>
+            <View style={[styles.onbDemoDot, { backgroundColor: T.high }]} />
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.onbDemoLineText, { color: T.text, fontFamily: jks('700') }]}>Call doctor</Text>
+              <View style={styles.onbDemoReminderDue}>
+                <Icon name="bell" size={11} color={accentColor} />
+                <Text style={[styles.onbDemoSmall, { color: T.textSub, fontFamily: jks('600') }]}>Today at 2:00 PM</Text>
+              </View>
+            </View>
+            <Icon name="bell" size={13} color={accentColor} />
+            <Icon name="pencil" size={13} color={T.textSub} />
+          </Animated.View>
+          <Animated.View style={[styles.onbDemoReminderInfo, { backgroundColor: `${accentColor}14`, borderColor: `${accentColor}38` }, appear(0.38)]}>
+            <Icon name="users" size={14} color={accentColor} />
+            <View style={{ flex: 1 }}>
+              <Text numberOfLines={1} style={[styles.onbDemoSmall, { color: T.textSub, fontFamily: jks('700') }]}>Shared reminders stay on the task</Text>
+              <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.82} style={[styles.onbDemoTinyText, { color: T.textMute, fontFamily: jks('600') }]}>Alerts fire on phones with notifications on</Text>
+            </View>
+          </Animated.View>
+        </>
+      )}
+
+      {kind === 'privacy' && (
+        <>
+          <Line text="No analytics" color={T.low} at={0.08} icon="check" />
+          <Line text="Claude key stays local" color={accentColor} at={0.24} icon="sparkles" />
+          <Line text="Google sign-in stays with Google" color={T.med} at={0.4} icon="home" />
+          <Animated.View style={[styles.onbDemoNotice, { backgroundColor: T.bg, borderColor: T.border }, appear(0.58)]}>
+            <Text style={[styles.onbDemoSmall, { color: T.textMute, fontFamily: jks('600') }]}>Replay this tour anytime in Settings</Text>
+          </Animated.View>
+        </>
+      )}
+      </View>
+    </View>
+  );
+}
 
 function Onboarding({ onDone, accentColor }: { onDone: () => void; accentColor: string }) {
   const T = useT();
@@ -8849,8 +9249,8 @@ function Onboarding({ onDone, accentColor }: { onDone: () => void; accentColor: 
   const prev = () => { if (step > 0) setStep(s => s - 1); };
 
   return (
-    <Modal transparent visible animationType="fade" onRequestClose={onDone}>
-      <View style={[styles.onbBackdrop, { backgroundColor: T.bg, paddingTop: insets.top + 24, paddingBottom: insets.bottom + 24 }]}>
+    <Modal transparent visible animationType="fade" statusBarTranslucent navigationBarTranslucent onRequestClose={onDone}>
+      <View style={[styles.onbBackdrop, { backgroundColor: T.bg, paddingTop: insets.top + 12, paddingBottom: insets.bottom + 24 }]}>
         {/* Skip button */}
         <View style={styles.onbTopBar}>
           <TouchableOpacity onPress={onDone} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
@@ -8860,20 +9260,12 @@ function Onboarding({ onDone, accentColor }: { onDone: () => void; accentColor: 
 
         {/* Content */}
         <Animated.View style={[styles.onbContent, { opacity: fadeAnim, transform: [{ translateY: slideAnim }] }]}>
+          <OnboardingDemo kind={cur.demo} accentColor={accentColor} />
           <View style={[styles.onbIconWrap, { backgroundColor: `${accentColor}18`, borderColor: `${accentColor}40` }]}>
-            <Icon name={cur.icon} size={32} color={accentColor} />
+            <Icon name={cur.icon} size={18} color={accentColor} />
           </View>
           <Text style={[styles.onbTitle, { color: T.text, fontFamily: jks('800') }]}>{cur.title}</Text>
           <Text style={[styles.onbBody, { color: T.textSub, fontFamily: jks('400') }]}>{cur.body}</Text>
-
-          {cur.example && (
-            <View style={[styles.onbExampleCard, { backgroundColor: T.s1, borderColor: `${accentColor}30` }]}>
-              <Text style={[styles.onbExampleText, { color: T.text, fontFamily: jks('500') }]}>{cur.example}</Text>
-              {cur.exampleSub && (
-                <Text style={[styles.onbExampleSub, { color: T.textMute, fontFamily: jks('400') }]}>{cur.exampleSub}</Text>
-              )}
-            </View>
-          )}
         </Animated.View>
 
         {/* Pagination dots */}
@@ -9221,6 +9613,7 @@ function TriorityApp() {
   const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
   const [calendarConflictsEnabled, setCalendarConflictsEnabledState] = useState(false);
   const [calendarConflictKeys, setCalendarConflictKeys] = useState<Set<string>>(new Set());
+  const [calendarConflictNotice, setCalendarConflictNotice] = useState<string | null>(null);
   const activeReminderFiredRef = useRef<Set<string>>(new Set());
   const openedReminderTargetsRef = useRef<{ target: ReminderNavTarget; openedAt: number }[]>([]);
 
@@ -9548,6 +9941,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
 
   const sliceRef = useRef(syncedSlice);
   useEffect(() => { sliceRef.current = syncedSlice; }, [syncedSlice]);
+  const [syncWriteReady, setSyncWriteReady] = useState(false);
 
   // Suppress writes for a brief window after we restore remote → local, so
   // the watcher doesn't immediately echo the restore back as a write.
@@ -9559,18 +9953,33 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   const writeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Track which uid this effect cycle is bound to, so a sign-out cleanly halts.
   const activeUidRef = useRef<string | null>(null);
+  const saveAccountCache = useCallback(async (uid: string, data: SyncedState) => {
+    const cache: AccountCache = { savedAt: Date.now(), data: stripUndefined(data) };
+    await AsyncStorage.setItem(syncAccountCacheKey(uid), JSON.stringify(cache));
+  }, []);
+  const loadAccountCache = useCallback(async (uid: string): Promise<AccountCache | null> => {
+    const raw = await AsyncStorage.getItem(syncAccountCacheKey(uid));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as AccountCache;
+    return parsed?.data ? parsed : null;
+  }, []);
 
   useEffect(() => {
     // Wait for AsyncStorage hydration before any sync activity.
     if (!ready) return;
+    const priorActiveUid = activeUidRef.current;
     const uid = syncUser?.uid ?? null;
     activeUidRef.current = uid;
+    setSyncWriteReady(false);
 
     // Signed out: cancel any pending write, do nothing else. Local state stays.
     if (!uid) {
       if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
       writeTimerRef.current = null;
       lastSyncedAtRef.current = 0;
+      if (priorActiveUid) {
+        saveAccountCache(priorActiveUid, sliceRef.current).catch(() => {});
+      }
       return;
     }
 
@@ -9580,36 +9989,68 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       try {
         const db = getFirestore(getApp());
         const ref = doc(db, 'users', uid);
+        const previousUid = await AsyncStorage.getItem(SYNC_CURRENT_UID_KEY);
+        const isAccountSwitch = !!previousUid && previousUid !== uid;
+        if (priorActiveUid && priorActiveUid !== uid) {
+          await saveAccountCache(priorActiveUid, sliceRef.current).catch(() => {});
+        }
         const snap = await getDoc(ref);
         if (cancelled || activeUidRef.current !== uid) return;
 
-        const localLastWrittenRaw = await AsyncStorage.getItem(SYNC_LAST_LOCAL_KEY);
+        const legacyLocalLastWrittenRaw = !previousUid ? await AsyncStorage.getItem(SYNC_LAST_LOCAL_KEY) : null;
+        const localLastWrittenRaw = await AsyncStorage.getItem(syncLastLocalKey(uid)) || legacyLocalLastWrittenRaw;
         const localLastWritten = localLastWrittenRaw ? parseInt(localLastWrittenRaw, 10) : 0;
+        const cachedAccount = await loadAccountCache(uid).catch(() => null);
+
+        const finishRestore = async (baselineAt: number) => {
+          await AsyncStorage.setItem(SYNC_CURRENT_UID_KEY, uid).catch(() => {});
+          lastSyncedAtRef.current = baselineAt;
+          setTimeout(() => {
+            if (!cancelled && activeUidRef.current === uid) {
+              justRestoredRef.current = false;
+              setSyncWriteReady(true);
+            }
+          }, 1500);
+        };
 
         if (snap.exists()) {
           const remote = snap.data() as { updatedAt?: number; data?: SyncedState; schemaVersion?: number };
           const remoteAt = typeof remote?.updatedAt === 'number' ? remote.updatedAt : 0;
           const remoteData = remote?.data;
           const sameSchema = remote?.schemaVersion === SYNC_SCHEMA_VERSION;
-          if (remoteData && sameSchema && remoteAt > localLastWritten) {
+          if (remoteData && sameSchema && (isAccountSwitch || remoteAt > localLastWritten)) {
             // Remote is newer than what we last wrote — restore.
             justRestoredRef.current = true;
             applyRestoredState(remoteData);
+            await AsyncStorage.setItem(syncLastRemoteKey(uid), String(remoteAt));
+            await AsyncStorage.setItem(syncLastLocalKey(uid), String(remoteAt));
             await AsyncStorage.setItem(SYNC_LAST_REMOTE_KEY, String(remoteAt));
             await AsyncStorage.setItem(SYNC_LAST_LOCAL_KEY, String(remoteAt));
-            lastSyncedAtRef.current = remoteAt;
+            await saveAccountCache(uid, remoteData).catch(() => {});
             // Drop the suppression flag a tick later — long enough for the
             // state-applied effects to settle and trigger one watcher pass.
-            setTimeout(() => { justRestoredRef.current = false; }, 1500);
+            await finishRestore(remoteAt);
             return;
           }
         }
         // No remote, or local is at least as fresh — establish baseline and
         // let the watcher push local up on next change.
+        if (isAccountSwitch) {
+          justRestoredRef.current = true;
+          const fallbackState = cachedAccount?.data ?? emptySyncedState();
+          applyRestoredState(fallbackState);
+          const fallbackAt = cachedAccount?.savedAt ?? Date.now();
+          await AsyncStorage.setItem(syncLastLocalKey(uid), String(fallbackAt));
+          await finishRestore(fallbackAt);
+          return;
+        }
         lastSyncedAtRef.current = localLastWritten;
+        await AsyncStorage.setItem(SYNC_CURRENT_UID_KEY, uid).catch(() => {});
+        setSyncWriteReady(true);
       } catch {
         // Network or rules error — don't block local use. The next state change
         // will retry via the watcher; the cold-start restore is best-effort.
+        setSyncWriteReady(!cancelled && activeUidRef.current === uid);
       }
     })();
 
@@ -9618,11 +10059,12 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
       writeTimerRef.current = null;
     };
-  }, [ready, syncUser?.uid]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [loadAccountCache, ready, saveAccountCache, syncUser?.uid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Watcher: debounce-write the slice on change.
   useEffect(() => {
     if (!ready) return;
+    if (!syncWriteReady) return;
     if (!syncUser?.uid) return;
     if (justRestoredRef.current) return;
 
@@ -9636,8 +10078,12 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
         const db = getFirestore(getApp());
         await setDoc(doc(db, 'users', uid), blob);
         lastSyncedAtRef.current = updatedAt;
+        await AsyncStorage.setItem(syncLastLocalKey(uid), String(updatedAt));
+        await AsyncStorage.setItem(syncLastRemoteKey(uid), String(updatedAt));
         await AsyncStorage.setItem(SYNC_LAST_LOCAL_KEY, String(updatedAt));
         await AsyncStorage.setItem(SYNC_LAST_REMOTE_KEY, String(updatedAt));
+        await AsyncStorage.setItem(SYNC_CURRENT_UID_KEY, uid);
+        await saveAccountCache(uid, sliceRef.current).catch(() => {});
       } catch {
         // Permission denied, network failure, etc. Local data is fine; we'll
         // retry on the next state change. Persistence is not gated on Firestore.
@@ -9647,7 +10093,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     return () => {
       if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
     };
-  }, [ready, syncUser?.uid, syncedSlice]);
+  }, [ready, saveAccountCache, syncUser?.uid, syncWriteReady, syncedSlice]);
 
   // Apply a restored remote slice back into local state + AsyncStorage. Mirrors
   // the writes that loadAll() does so the local cache stays consistent.
@@ -9942,10 +10388,12 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
   useEffect(() => {
     if (!ready || !calendarConflictsEnabled || !syncUser?.uid) {
       setCalendarConflictKeys(new Set());
+      setCalendarConflictNotice(null);
       return;
     }
 
     let cancelled = false;
+    let showedFailure = false;
     const checkCalendarConflicts = async () => {
       const now = Date.now();
       const candidates = reminderTasksForScheduling
@@ -9968,7 +10416,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
       }
 
       const token = await getCalendarFreeBusyAccessToken();
-      if (!token) return;
+      if (!token) throw new Error('Calendar access needs attention');
 
       const min = Math.min(...candidates.map((candidate) => candidate.start));
       const max = Math.max(...candidates.map((candidate) => candidate.end));
@@ -9980,13 +10428,23 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
         }
       }
       if (!cancelled) setCalendarConflictKeys(nextKeys);
+      if (!cancelled) setCalendarConflictNotice(null);
     };
 
-    checkCalendarConflicts().catch(() => {
-      if (!cancelled) setCalendarConflictKeys(new Set());
+    checkCalendarConflicts().catch((error) => {
+      if (!cancelled) {
+        setCalendarConflictKeys(new Set());
+        const message = calendarCheckErrorMessage(error);
+        if (!showedFailure) {
+          showedFailure = true;
+          setCalendarConflictNotice(message);
+        }
+      }
     });
     const interval = setInterval(() => {
-      checkCalendarConflicts().catch(() => {});
+      checkCalendarConflicts().catch(() => {
+        if (!cancelled) setCalendarConflictKeys(new Set());
+      });
     }, 5 * 60 * 1000);
 
     return () => {
@@ -10279,7 +10737,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
         <PortalHost>
           <BackButtonManager screen={screen} setScreen={setScreen} />
           <View style={{ flex: 1, overflow: 'hidden' }}>
-            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} calendarConflictKeys={calendarConflictKeys} />}
+            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} calendarConflictKeys={calendarConflictKeys} calendarConflictNotice={calendarConflictNotice} />}
             {screen === 'grocery' && (
               <StandaloneGrocery
                 groceryItems={groceryItemsForScreen}
@@ -10689,20 +11147,61 @@ const styles = StyleSheet.create({
   onbBackdrop: { flex: 1, paddingHorizontal: 24 },
   onbTopBar: { flexDirection: 'row', justifyContent: 'flex-end', paddingHorizontal: 4, paddingTop: 4, paddingBottom: 12 },
   onbSkip: { fontSize: 13, letterSpacing: 0.4 },
-  onbContent: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 8 },
-  onbIconWrap: { width: 80, height: 80, borderRadius: 24, borderWidth: 1.5, alignItems: 'center', justifyContent: 'center', marginBottom: 28 },
-  onbTitle: { fontSize: 28, letterSpacing: -0.5, textAlign: 'center', marginBottom: 14, lineHeight: 34 },
-  onbBody: { fontSize: 15, lineHeight: 23, textAlign: 'center', maxWidth: 360 },
+  onbContent: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4 },
+  onbIconWrap: { width: 40, height: 40, borderRadius: 12, borderWidth: 1.2, alignItems: 'center', justifyContent: 'center', marginTop: 22, marginBottom: 14 },
+  onbTitle: { fontSize: 26, textAlign: 'center', marginBottom: 10, lineHeight: 32 },
+  onbBody: { fontSize: 15, lineHeight: 22, textAlign: 'center', maxWidth: 350 },
   onbExampleCard: { marginTop: 22, padding: 16, borderRadius: 14, borderWidth: 1, maxWidth: 380 },
   onbExampleText: { fontSize: 14, lineHeight: 21, fontStyle: 'italic' },
   onbExampleSub: { fontSize: 12, lineHeight: 18, marginTop: 10 },
-  onbDots: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, marginVertical: 24 },
+  onbDots: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, marginVertical: 20 },
   onbDot: { height: 6, borderRadius: 3 },
   onbButtonRow: { flexDirection: 'row', gap: 10, paddingHorizontal: 4 },
   onbBackBtn: { flex: 1, height: 50, borderRadius: 12, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   onbBackLabel: { fontSize: 15 },
   onbNextBtn: { flex: 2, height: 50, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   onbNextLabel: { fontSize: 15, color: '#fff' },
+  onbDemoShell: { width: '100%', maxWidth: 350, height: 238, borderRadius: 16, borderWidth: 1, padding: 12, overflow: 'hidden', position: 'relative' },
+  onbDemoTop: { flexDirection: 'row', alignItems: 'center', gap: 5, marginBottom: 10 },
+  onbDemoTinyDot: { width: 6, height: 6, borderRadius: 3 },
+  onbDemoStage: { flex: 1, overflow: 'hidden' },
+  onbDemoSectionLabel: { fontSize: 10, letterSpacing: 1.1, textTransform: 'uppercase', marginBottom: 6 },
+  onbDemoInput: { height: 38, borderRadius: 10, borderWidth: 1, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10 },
+  onbDemoInputText: { flex: 1, fontSize: 13 },
+  onbDemoSend: { width: 23, height: 23, borderRadius: 7, alignItems: 'center', justifyContent: 'center' },
+  onbDemoChips: { flexDirection: 'row', gap: 7, marginBottom: 8 },
+  onbDemoChip: { flex: 1, height: 28, borderRadius: 8, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  onbDemoChipText: { fontSize: 11 },
+  onbDemoLine: { minHeight: 34, borderRadius: 10, borderWidth: 1, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 7 },
+  onbDemoTaskGhost: { minHeight: 34, borderRadius: 10, borderWidth: 1, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
+  onbDemoDot: { width: 7, height: 22, borderRadius: 4 },
+  onbDemoLineText: { flex: 1, fontSize: 13 },
+  onbDemoPrompt: { borderRadius: 11, borderWidth: 1, paddingVertical: 8, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginBottom: 7 },
+  onbDemoPromptText: { flex: 1, fontSize: 11, lineHeight: 15 },
+  onbDemoGroceryRow: { minHeight: 34, borderRadius: 10, borderWidth: 1, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  onbDemoGroceryHeader: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 8 },
+  onbDemoScreenTitle: { fontSize: 16, lineHeight: 20 },
+  onbDemoGroceryItem: { minHeight: 28, borderRadius: 8, borderWidth: 1, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 6 },
+  onbDemoPills: { flexDirection: 'row', gap: 7, marginBottom: 12 },
+  onbDemoListPill: { height: 30, borderRadius: 10, borderWidth: 1, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4 },
+  onbDemoPillText: { fontSize: 11 },
+  onbDemoShareCard: { minHeight: 62, borderRadius: 12, borderWidth: 1, padding: 12, flexDirection: 'row', alignItems: 'center', gap: 10 },
+  onbDemoSharedHeader: { minHeight: 38, borderRadius: 11, borderWidth: 1, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
+  onbDemoSharedCount: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  onbDemoSharedLine: { minHeight: 34, borderRadius: 10, borderWidth: 1, paddingHorizontal: 9, flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 7 },
+  onbDemoAvatar: { width: 22, height: 22, borderRadius: 11, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  onbDemoAvatarText: { fontSize: 9, lineHeight: 12 },
+  onbDemoSmall: { fontSize: 11, lineHeight: 15 },
+  onbDemoCategory: { borderRadius: 10, borderWidth: 1, paddingVertical: 9, paddingHorizontal: 10 },
+  onbDemoReminderTask: { minHeight: 52, borderRadius: 10, borderWidth: 1, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
+  onbDemoReminderDue: { flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 3 },
+  onbDemoReminderCard: { minHeight: 42, borderRadius: 12, borderWidth: 1, paddingHorizontal: 12, flexDirection: 'row', alignItems: 'center', gap: 9, marginBottom: 8 },
+  onbDemoNotice: { borderRadius: 10, borderWidth: 1, paddingVertical: 9, paddingHorizontal: 10, alignItems: 'center' },
+  onbDemoNoticeTight: { paddingVertical: 7 },
+  onbDemoReminderInfo: { minHeight: 54, borderRadius: 10, borderWidth: 1, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  onbDemoTinyText: { fontSize: 10, lineHeight: 14, marginTop: 2 },
+  supportSettingsRow: { minHeight: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 14 },
+  supportSettingsLabel: { flex: 1, marginRight: 12 },
 
 
   hsbSliderGroup: { gap: 10 },
