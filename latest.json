@@ -1,8 +1,8 @@
 {
-  "versionName": "1.4.5",
-  "versionCode": 21,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.5/Triority-v1.4.5.apk",
-  "releaseNotes": "Polish release with shared reminders, read-only calendar conflict checks, safer account switching, contextual AI grocery quantity/package handling, replayable onboarding, and Settings cleanup.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.5",
+  "versionName": "1.4.6",
+  "versionCode": 22,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.6/Triority-v1.4.6.apk",
+  "releaseNotes": "Polish release with safer AI list routing, easier-to-find AI-created rows, recipe seasoning improvements, Archive Day view, clearer archive timestamps, and Settings context scroll cleanup.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.6",
   "required": false
 }
