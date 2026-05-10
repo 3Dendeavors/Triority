@@ -2,19 +2,33 @@
 
 Triority is a private-first Android task, grocery, reminder, and AI triage app. It is built around quick capture, three practical priority tiers, optional Google sync, shared household-style lists, and bring-your-own Claude API access.
 
-## Download
+The app is distributed as a signed Android APK through GitHub Releases. It is not currently distributed through the Play Store, so installation is a normal Android sideload.
+
+## Install
 
 The current public beta APK is published on GitHub Releases:
 
 - Latest release: https://github.com/3Dendeavors/Triority/releases/latest
 - Current beta: `v1.4.6`
 - Android package id: `com.triority`
+- Current APK: `Triority-v1.4.6.apk`
+- SHA-256: `2256AD51E40999141D78704E4D945FCD41604DDA9CC3238CED6588E24D7D10C7`
 
-Install the APK on Android by downloading it from the latest release and accepting Android's sideload/install prompt. Future installed builds check this repo's `latest.json` and prompt when a newer APK is available.
+To install:
 
-Use the release APK asset for installs. Source-code archives attached to GitHub tags are not Android installers.
+1. Open the latest release page on your Android device.
+2. Under **Assets**, download `Triority-v1.4.6.apk`.
+3. If Android asks, allow your browser or file manager to install unknown apps.
+4. Open the downloaded APK and tap **Install**.
+5. Launch Triority from your app drawer.
+
+Use the APK asset for installs. The source-code `.zip` and `.tar.gz` files attached to GitHub tags are for developers and will not install the Android app.
+
+Future installed builds check this repo's `latest.json` and prompt when a newer APK is available. Installing a newer signed APK over the old one should preserve local app data as long as the package id and signing key match.
 
 ## What It Does
+
+Triority is meant for practical daily planning rather than project-management ceremony:
 
 - Tasks organized into High, Medium, and Low tiers.
 - Multiple task lists with drag reorder inside each tier, archive/restore support, and a short shine on newly added rows.
