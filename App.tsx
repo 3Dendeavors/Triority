@@ -81,7 +81,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 type Tier = 'high' | 'medium' | 'low';
 type Screen = 'list' | 'grocery' | 'archive' | 'settings';
-type SortMode = 'week' | 'range';
+type SortMode = 'week' | 'day' | 'range';
 type AutoClear = 'Never' | '7 days' | '30 days' | '90 days';
 type CollapsedGroups = Record<string, boolean>;
 // Private tasks use number IDs (epoch-ms-based for monotonic ordering).
@@ -97,6 +97,8 @@ interface Reminder {
 }
 
 type TaskDraft = { text: string; tier: Tier; reminder?: Reminder };
+type AddTaskDraftResult = TaskId[] | void | Promise<TaskId[] | void>;
+type AddGroceryDraftResult = string[] | void | Promise<string[] | void>;
 
 interface Task {
   id: TaskId;
@@ -218,6 +220,25 @@ function shouldInferGroceryQuantities(input: string) {
   return /\b(recipe|ingredients?|bake|cook|meal prep|materials?|bill of materials|bom|project|build|repair|supplies for|shopping list for|list for|make a|make an)\b/i.test(input);
 }
 
+function asksForExactIngredientsOnly(input: string) {
+  return /\b(exact(ly)?|no extra|no extras|nothing extra|do not add|don't add|without extra|just these|listed ingredients only|ingredients? only|only (these|the listed|specified|exact)|use only|no seasonings?|no spices?)\b/i.test(input);
+}
+
+function shouldSuggestCookingSeasonings(input: string) {
+  if (asksForExactIngredientsOnly(input)) return false;
+  return /\b(meal prep|meal plan|recipe|recipes|ingredients?|cook|cooking|bake|baking|dinner|lunch|breakfast|supper|marinade|stir[-\s]?fry|soup|chili|casserole|roast|grill|season(?:ing|ings)?|spices?)\b/i.test(input);
+}
+
+function cookingSeasoningInstruction(input: string) {
+  if (asksForExactIngredientsOnly(input)) {
+    return 'The user asked for exact/no-extra ingredients. Do not add spices, seasonings, oils, condiments, or pantry staples unless the user explicitly named them.';
+  }
+  if (shouldSuggestCookingSeasonings(input)) {
+    return 'When cooking, meal-prep, recipe, or ingredient planning is implied, include a practical handful of sensible seasonings/spices/condiments/oils/pantry staples that the dishes normally need. Keep them reasonable and not exhaustive.';
+  }
+  return 'Do not add spices, seasonings, oils, condiments, or pantry staples unless the user asks for cooking/recipe/meal-prep help or explicitly names them.';
+}
+
 function inputMentionsQuantityForItem(input: string, itemName: string) {
   const raw = input.toLowerCase();
   const words = itemName.toLowerCase().split(/\s+/).filter(w => w.length > 2);
@@ -249,6 +270,261 @@ function normalizeGroceryDraft(item: any, input = '', allowInferredQuantity = tr
 // collection (sharedLists/{listId}) with a per-item subcollection so two
 // members editing different items never collide. See HANDOFF.md for the full
 // design.
+
+function normalizeAiListText(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/['"]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const AI_LIST_GENERIC_TOKENS = new Set([
+  'a', 'an', 'and', 'for', 'in', 'list', 'main', 'my', 'need', 'needs', 'of', 'on', 'our',
+  'shared', 'task', 'tasks', 'the', 'to', 'todo', 'work',
+]);
+
+const AI_RELATIONSHIP_TERM_GROUPS = [
+  ['girlfriend', 'gf', 'girlfiend'],
+  ['boyfriend', 'bf'],
+  ['wife', 'spouse'],
+  ['husband', 'spouse'],
+  ['partner', 'spouse'],
+  ['fiance', 'fiancee'],
+];
+
+const AI_TASK_TEXT_STOP_TOKENS = new Set([
+  'a', 'add', 'an', 'and', 'can', 'create', 'do', 'for', 'i', 'me', 'my', 'need',
+  'have', 'please', 'put', 'remember', 'task', 'the', 'to', 'with',
+]);
+
+function normalizeAiNameToken(token: string) {
+  let out = normalizeAiListText(token);
+  if (out.endsWith('s') && out.length > 3) out = out.slice(0, -1);
+  return out;
+}
+
+function normalizedAiTokens(value: string) {
+  return normalizeAiListText(value)
+    .split(' ')
+    .map(normalizeAiNameToken)
+    .filter(Boolean);
+}
+
+function aiTextHasToken(value: string, token: string) {
+  const needle = normalizeAiNameToken(token);
+  if (!needle) return false;
+  return normalizedAiTokens(value).includes(needle);
+}
+
+function aiTextHasAnyRelationshipTerm(value: string, terms: string[]) {
+  return terms.some(term => aiTextHasToken(value, term));
+}
+
+function getTaskListSignalTokens(listName: string) {
+  const tokens = normalizedAiTokens(listName)
+    .filter(token => token.length >= 3 && !AI_LIST_GENERIC_TOKENS.has(token));
+  return Array.from(new Set(tokens));
+}
+
+function inputMentionsTaskListName(input: string, listName: string) {
+  const normalizedInput = ` ${normalizeAiListText(input)} `;
+  const normalizedName = normalizeAiListText(listName);
+  if (normalizedName.length < 2) return false;
+  return normalizedInput.includes(` ${normalizedName} `);
+}
+
+function inputMentionsTaskListSignal(input: string, list: TaskList) {
+  const tokens = getTaskListSignalTokens(list.name);
+  return tokens.length > 0 && tokens.some(token => aiTextHasToken(input, token));
+}
+
+function personalContextLinksListToInput(input: string, personalContext: string, list: TaskList) {
+  const listTokens = getTaskListSignalTokens(list.name);
+  if (listTokens.length === 0 || !personalContext.trim()) return false;
+  const matchedRelationshipGroups = AI_RELATIONSHIP_TERM_GROUPS.filter(group => aiTextHasAnyRelationshipTerm(input, group));
+  if (matchedRelationshipGroups.length === 0) return false;
+  const contextChunks = personalContext.split(/[\n.!?;]+/).map(chunk => chunk.trim()).filter(Boolean);
+  return contextChunks.some((chunk) => (
+    listTokens.some(token => aiTextHasToken(chunk, token))
+    && matchedRelationshipGroups.some(group => aiTextHasAnyRelationshipTerm(chunk, group))
+  ));
+}
+
+function inferTaskDestinationHint(input: string, lists: TaskList[], activeListId: string, personalContext = '') {
+  const uniqueMatch = (matches: TaskList[], reason: string) => {
+    const uniqueIds = Array.from(new Set(matches.map(list => list.id)));
+    if (uniqueIds.length !== 1) return null;
+    const list = matches.find(item => item.id === uniqueIds[0]);
+    if (!list) return null;
+    return { listId: list.id, listName: list.name, active: list.id === activeListId, reason };
+  };
+
+  const exactMatches = lists.filter(list => inputMentionsTaskListName(input, list.name));
+  const exactHint = uniqueMatch(exactMatches, 'exact-list-name');
+  if (exactHint) return exactHint;
+
+  const signalMatches = lists.filter(list => inputMentionsTaskListSignal(input, list));
+  const signalHint = uniqueMatch(signalMatches, 'list-name-signal');
+  if (signalHint) return signalHint;
+
+  const contextMatches = lists.filter(list => personalContextLinksListToInput(input, personalContext, list));
+  return uniqueMatch(contextMatches, 'personal-context-alias');
+}
+
+function shouldGuardPlainTaskText(input: string) {
+  const normalized = normalizeAiListText(input);
+  if (!normalized || normalized.split(' ').length > 9) return false;
+  if (/^(add|can you|create|make|please|put|remember to|remind me|remind me to|i need to|need to)\b/i.test(normalized)) return false;
+  if (/\b(archive|buy|copy|duplicate|from|grocery|groceries|import|ingredients?|list|meal prep|move|pull|recipe|reference|remind|shopping|sort|to|tomorrow|today|tonight|transfer)\b/i.test(normalized)) return false;
+  if (/\b(at|around|by|before|after|every|repeat|in)\s+\d/i.test(normalized)) return false;
+  return true;
+}
+
+function meaningfulTaskTextTokens(value: string) {
+  return Array.from(new Set(
+    normalizedAiTokens(value)
+      .filter(token => token.length >= 3 && !AI_TASK_TEXT_STOP_TOKENS.has(token)),
+  ));
+}
+
+function taskTextIncludesToken(text: string, token: string) {
+  const tokens = meaningfulTaskTextTokens(text);
+  return tokens.some((candidate) => (
+    candidate === token
+    || (token.length >= 4 && candidate.includes(token))
+    || (candidate.length >= 4 && token.includes(candidate))
+  ));
+}
+
+function protectPlainTaskTextRegister(input: string, aiText: string) {
+  if (!shouldGuardPlainTaskText(input)) return aiText;
+  const inputTokens = meaningfulTaskTextTokens(input);
+  if (inputTokens.length === 0) return aiText;
+  const missingMeaningfulToken = inputTokens.some(token => !taskTextIncludesToken(aiText, token));
+  return missingMeaningfulToken ? input.trim() : aiText;
+}
+
+function isCrossListReferenceRequest(input: string) {
+  return /\b(copy|duplicate|clone|import|pull|bring|reference|mirror|same tasks?)\b/i.test(input)
+    && /\b(from|out of|off of)\b/i.test(input);
+}
+
+function isCrossListMoveRequest(input: string) {
+  return /\b(move|transfer)\b/i.test(input)
+    && /\b(from|out of|off of)\b/i.test(input);
+}
+
+function summarizeTasksForAi(tasks: Task[], includeReminderFlag = false) {
+  return tasks.slice(0, 60).map((task, index) => stripUndefined({
+    order: index + 1,
+    text: task.text,
+    tier: task.tier,
+    hasReminder: includeReminderFlag ? !!task.reminder : undefined,
+  }));
+}
+
+function buildTaskWorkspaceContext(input: string, lists: TaskList[], activeListId: string, personalContext = '') {
+  const activeList = lists.find(l => l.id === activeListId) || lists[0];
+  const destinationHint = inferTaskDestinationHint(input, lists, activeListId, personalContext);
+  const nameCounts = new Map<string, number>();
+  lists.forEach((list) => {
+    const key = normalizeAiListText(list.name);
+    if (key) nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
+  });
+
+  const mentionedLists = lists.filter(list => inputMentionsTaskListName(input, list.name));
+  const moveLike = isCrossListMoveRequest(input);
+  const crossListLike = isCrossListReferenceRequest(input) || moveLike;
+  const duplicateMention = crossListLike
+    ? mentionedLists.find(list => (nameCounts.get(normalizeAiListText(list.name)) || 0) > 1)
+    : undefined;
+  if (duplicateMention) {
+    return {
+      blocked: {
+        message: 'List name repeats',
+        sub: `Rename one "${duplicateMention.name}" list before asking AI to copy from it.`,
+      },
+      prompt: '',
+      destinationHint: null,
+    };
+  }
+
+  const sourceLists = crossListLike ? mentionedLists.filter(list => list.id !== activeListId) : [];
+  if (crossListLike && sourceLists.length === 0 && /\b(list|tasks?)\b/i.test(input) && lists.length > 1) {
+    return {
+      blocked: {
+        message: 'Source list not found',
+        sub: 'Name the list exactly when asking AI to copy/reference tasks from it.',
+      },
+      prompt: '',
+      destinationHint: null,
+    };
+  }
+  if (moveLike && sourceLists.length > 0) {
+    return {
+      blocked: {
+        message: 'Move is not enabled',
+        sub: 'Ask AI to copy from the source list instead.',
+      },
+      prompt: '',
+      destinationHint: null,
+    };
+  }
+  if (crossListLike && sourceLists.length === 1 && sourceLists[0].tasks.length === 0) {
+    return {
+      blocked: {
+        message: 'Source list is empty',
+        sub: `"${sourceLists[0].name}" has no live tasks to copy.`,
+      },
+      prompt: '',
+      destinationHint: null,
+    };
+  }
+  if (crossListLike && sourceLists.length > 1) {
+    return {
+      blocked: {
+        message: 'Use one source list',
+        sub: 'AI copy is limited to one named source list at a time.',
+      },
+      prompt: '',
+      destinationHint: null,
+    };
+  }
+
+  const listContext = lists.map(list => ({
+    id: list.id,
+    name: list.name,
+    active: list.id === activeListId,
+    taskCount: list.tasks.length,
+  }));
+  const sourceContext = sourceLists.map(list => ({
+    id: list.id,
+    name: list.name,
+    tasks: summarizeTasksForAi(list.tasks, true),
+  }));
+
+  const prompt = `CURRENT APP WORKSPACE:
+- Active tab: To-do
+- Active task list: ${JSON.stringify(activeList ? { id: activeList.id, name: activeList.name, taskCount: activeList.tasks.length } : null)}
+- Available task lists: ${JSON.stringify(listContext)}
+- Active list live tasks: ${JSON.stringify(activeList ? summarizeTasksForAi(activeList.tasks) : [])}
+- Strong destination hint: ${JSON.stringify(destinationHint)}
+${sourceContext.length > 0 ? `- Explicitly referenced source list tasks: ${JSON.stringify(sourceContext)}` : '- Explicitly referenced source list tasks: []'}
+
+Workspace rules:
+- Default destination is the active task list; use listId null for it.
+- If the user explicitly names exactly one destination list, listId may be that valid list id.
+- If Strong destination hint is not null and the user did not explicitly name a different full destination list, use that listId for task rows from this prompt.
+- Write to only one task-list destination in this response.
+- If copying/referencing another list, copy only the live source tasks provided above into the destination. Do not move, delete, complete, or alter the source list. Preserve source order and tier. Create new tasks only; never reuse item ids.
+- Archived/completed rows are not provided and must not be invented.
+- Do not recreate reminders from a source list unless the user explicitly asks to copy reminders.
+- Personal Context is for disambiguation, routing, and priority only. Do not use it to rewrite the user's task wording or substitute names unless the user wrote that name.`;
+
+  return { blocked: null, prompt, destinationHint };
+}
 
 type SharedListKind = 'tasks' | 'grocery';
 
@@ -939,13 +1215,13 @@ interface SharedListsContextValue {
   // to /sharedLists/{listId}/items and bumps lastEditedBy/At so step 13's
   // avatar render shows who touched it last. Throws if not signed in or
   // Firestore rejects (caller toasts).
-  addSharedTaskItems: (listId: string, items: TaskDraft[]) => Promise<void>;
+  addSharedTaskItems: (listId: string, items: TaskDraft[]) => Promise<string[]>;
   editSharedTaskItem: (listId: string, itemId: string, patch: { text?: string; tier?: Tier; reminder?: Reminder | null }) => Promise<void>;
   deleteSharedTaskItem: (listId: string, itemId: string) => Promise<void>;
   archiveSharedTaskItem: (listId: string, itemId: string, item: { text: string; tier: Tier; createdAt?: number }) => Promise<void>;
   restoreSharedArchiveItem: (listId: string, archiveId: string, item: { text: string; tier: Tier; createdAt?: number }) => Promise<void>;
   deleteSharedArchiveItem: (listId: string, archiveId: string) => Promise<void>;
-  addSharedGroceryItems: (listId: string, items: GroceryDraft[]) => Promise<void>;
+  addSharedGroceryItems: (listId: string, items: GroceryDraft[]) => Promise<string[]>;
   updateSharedGroceryItem: (listId: string, itemId: string, patch: { name?: string; category?: string; checked?: boolean }) => Promise<void>;
   deleteSharedGroceryItem: (listId: string, itemId: string) => Promise<void>;
   deleteSharedGroceryItems: (listId: string, itemIds: string[]) => Promise<void>;
@@ -1582,7 +1858,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   // — callers don't optimistic-update.
   const addSharedTaskItems = useCallback(async (listId: string, items: TaskDraft[]) => {
     if (!user) throw new Error('Not signed in');
-    if (items.length === 0) return;
+    if (items.length === 0) return [];
     if (isSupabaseSharedListId(listId)) {
       const now = Date.now();
       const rows = items
@@ -1599,7 +1875,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
           last_edited_at: new Date(now).toISOString(),
         }))
         .filter((it) => it.text.trim());
-      if (rows.length === 0) return;
+      if (rows.length === 0) return [];
       const optimistic = rows.map(mapSupabaseItem);
       // Mark these IDs as pending so a realtime-triggered refresh that races
       // ahead of the INSERT cannot drop them from the list.
@@ -1612,7 +1888,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         setSharedItems((prev) => ({ ...prev, [listId]: (prev[listId] || []).filter((it) => !ids.has(it.id)) }));
         throw new Error(supabaseErrorMessage(error, 'Could not add shared items.'));
       }
-      return;
+      return rows.map((row) => row.id);
     }
     const db = getFirestore(getApp());
     const now = Date.now();
@@ -1654,6 +1930,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       }));
       throw e;
     }
+    return optimistic.map((it) => it.id);
   }, [user, setSharedItems]);
 
   const editSharedTaskItem = useCallback(async (listId: string, itemId: string, patch: { text?: string; tier?: Tier; reminder?: Reminder | null }) => {
@@ -1917,7 +2194,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
   const addSharedGroceryItems = useCallback(async (listId: string, items: GroceryDraft[]) => {
     if (!user) throw new Error('Not signed in');
-    if (items.length === 0) return;
+    if (items.length === 0) return [];
     if (isSupabaseSharedListId(listId)) {
       const now = Date.now();
       const rows = items
@@ -1933,7 +2210,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
           last_edited_at: new Date(now).toISOString(),
         }))
         .filter((it) => it.name);
-      if (rows.length === 0) return;
+      if (rows.length === 0) return [];
       const optimistic = rows.map(mapSupabaseItem);
       // Mark these IDs as pending so a realtime-triggered refresh that races
       // ahead of the INSERT cannot drop them from the list.
@@ -1946,15 +2223,17 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         setSharedItems((prev) => ({ ...prev, [listId]: (prev[listId] || []).filter((it) => !ids.has(it.id)) }));
         throw new Error(supabaseErrorMessage(error, 'Could not add shared grocery items.'));
       }
-      return;
+      return rows.map((row) => row.id);
     }
     const db = getFirestore(getApp());
     const now = Date.now();
     const batch = writeBatch(db);
+    const ids: string[] = [];
     for (const it of items) {
       const name = it.name.trim();
       if (!name) continue;
       const ref = doc(collection(db, 'sharedLists', listId, 'items'));
+      ids.push(ref.id);
       const data: Omit<SharedListItem, 'id'> = {
         name,
         category: it.category || GROCERY_UNCATEGORIZED,
@@ -1970,6 +2249,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       batch.set(ref, stripUndefined(data));
     }
     await batch.commit();
+    return ids;
   }, [user]);
 
   const updateSharedGroceryItem = useCallback(async (listId: string, itemId: string, patch: { name?: string; category?: string; checked?: boolean }) => {
@@ -4689,14 +4969,15 @@ interface GroceryItemRowProps {
   onCheck: (id: string) => void;
   onDelete: (id: string) => void;
   accentColor: string;
+  focused?: boolean;
 }
 
-function GroceryItemRow({ item, onCheck, onDelete, accentColor }: GroceryItemRowProps) {
+function GroceryItemRow({ item, onCheck, onDelete, accentColor, focused }: GroceryItemRowProps) {
   const T = useT();
   const translateX = useRef(new Animated.Value(0)).current;
   const pulse = useRef(new Animated.Value(0)).current;
   const [revealed, setRevealed] = useState(false);
-  const newItemGlow = useNewItemGlow(item.createdAt, item.id);
+  const newItemGlow = useNewItemGlow(item.createdAt, item.id, focused ? 'focused' : undefined);
   const glowEdgeColor = readableGlowEdgeColor(T.s2, T.text);
 
   useEffect(() => {
@@ -4801,10 +5082,16 @@ function GroceryItemRow({ item, onCheck, onDelete, accentColor }: GroceryItemRow
           {
             transform: [{ translateX }],
             backgroundColor: T.s2,
-            borderLeftColor: item.checked ? T.borderMid : accentColor,
+            borderLeftColor: focused ? accentColor : item.checked ? T.borderMid : accentColor,
             opacity: item.checked ? 0.5 : 1,
           },
         ]}>
+        {focused ? (
+          <View
+            pointerEvents="none"
+            style={[styles.reminderFocusOverlay, { borderColor: accentColor, backgroundColor: `${accentColor}14` }]}
+          />
+        ) : null}
         <Animated.View
           pointerEvents="none"
           style={[
@@ -4957,15 +5244,39 @@ interface GroceryScreenProps {
   groupCollapseScope: string;
   collapsedGroups: CollapsedGroups;
   setCollapsedGroup: (key: string, collapsed: boolean) => void;
+  focusedItemId?: string | null;
 }
 
-function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, onSortAlpha, onAiSort, hasApiKey, accentColor, sortMode, groupCollapseScope, collapsedGroups, setCollapsedGroup }: GroceryScreenProps) {
+function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, onSortAlpha, onAiSort, hasApiKey, accentColor, sortMode, groupCollapseScope, collapsedGroups, setCollapsedGroup, focusedItemId }: GroceryScreenProps) {
   const T = useT();
   const [confirmNode, confirm] = useConfirm(accentColor);
+  const scrollRef = useRef<ScrollView | null>(null);
 
   const activeItems = items.filter(i => !i.checked);
   const gotItItems = items.filter(i => i.checked);
   const gotItCount = gotItItems.length;
+  const groceryGroupKey = useCallback((group: string) => `grocery:${groupCollapseScope}:${group}`, [groupCollapseScope]);
+
+  const scrollToFocusedItem = useCallback((y: number) => {
+    setTimeout(() => {
+      scrollRef.current?.scrollTo({ y: Math.max(0, y - 72), animated: true });
+    }, 80);
+  }, []);
+
+  const focusedItem = useMemo(() => {
+    if (!focusedItemId) return null;
+    return items.find(item => item.id === focusedItemId) || null;
+  }, [focusedItemId, items]);
+
+  useEffect(() => {
+    if (!focusedItem) return;
+    const key = focusedItem.checked
+      ? groceryGroupKey('got-it')
+      : sortMode === 'category'
+        ? groceryGroupKey(`category:${focusedItem.category || GROCERY_UNCATEGORIZED}`)
+        : null;
+    if (key && collapsedGroups[key]) setCollapsedGroup(key, false);
+  }, [collapsedGroups, focusedItem, groceryGroupKey, setCollapsedGroup, sortMode]);
 
   const sortedActive = useMemo(() => {
     if (sortMode === 'alpha') {
@@ -4989,11 +5300,17 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
 
   const isEmpty = items.length === 0;
 
-  const renderFlatAlpha = () => (sortedActive as GroceryItem[]).map(item => (
-    <GroceryItemRow key={item.id} item={item} onCheck={onCheck} onDelete={onDelete} accentColor={accentColor} />
-  ));
+  const renderGroceryRow = (item: GroceryItem) => (
+    <View
+      key={item.id}
+      onLayout={(e) => {
+        if (focusedItemId === item.id) scrollToFocusedItem(e.nativeEvent.layout.y);
+      }}>
+      <GroceryItemRow item={item} onCheck={onCheck} onDelete={onDelete} accentColor={accentColor} focused={focusedItemId === item.id} />
+    </View>
+  );
 
-  const groceryGroupKey = (group: string) => `grocery:${groupCollapseScope}:${group}`;
+  const renderFlatAlpha = () => (sortedActive as GroceryItem[]).map(renderGroceryRow);
   const renderGroceryGroupHeader = (label: string, count: number, key: string, muted = false) => {
     const collapsed = collapsedGroups[key] ?? false;
     return (
@@ -5015,9 +5332,7 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
     return (
       <View key={group.category}>
         {renderGroceryGroupHeader(group.category, group.items.length, key)}
-        {!collapsed && group.items.map(item => (
-          <GroceryItemRow key={item.id} item={item} onCheck={onCheck} onDelete={onDelete} accentColor={accentColor} />
-        ))}
+        {!collapsed && group.items.map(renderGroceryRow)}
       </View>
     );
   });
@@ -5063,7 +5378,7 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
         </TouchableOpacity>
       </View>
       <View style={[styles.divider, { backgroundColor: T.border, marginTop: 10, marginHorizontal: 16 }]} />
-      <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 16, paddingTop: 8 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+      <ScrollView ref={scrollRef} style={{ flex: 1 }} contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 16, paddingTop: 8 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
         {isEmpty ? (
           <View style={styles.emptyState}>
             <View style={[styles.emptyIcon, { backgroundColor: T.s2 }]}>
@@ -5077,9 +5392,7 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
             {gotItCount > 0 && (
               <View style={{ marginTop: 20 }}>
                 {renderGroceryGroupHeader('Got it', gotItCount, groceryGroupKey('got-it'), true)}
-                {!(collapsedGroups[groceryGroupKey('got-it')] ?? false) && gotItItems.map(item => (
-                  <GroceryItemRow key={item.id} item={item} onCheck={onCheck} onDelete={onDelete} accentColor={accentColor} />
-                ))}
+                {!(collapsedGroups[groceryGroupKey('got-it')] ?? false) && gotItItems.map(renderGroceryRow)}
               </View>
             )}
           </>
@@ -5093,9 +5406,9 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
 // ─── InputBar ─────────────────────────────────────────────────────────────────
 
 interface InputBarProps {
-  onAddMany: (items: { text: string; tier: Tier; reminder?: Reminder }[]) => void;
-  onAddManyToList: (listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => void;
-  onAddGroceryItems: (items: GroceryDraft[]) => void | Promise<void>;
+  onAddMany: (items: { text: string; tier: Tier; reminder?: Reminder }[]) => AddTaskDraftResult;
+  onAddManyToList: (listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => AddTaskDraftResult;
+  onAddGroceryItems: (items: GroceryDraft[]) => AddGroceryDraftResult;
   hasApiKey: boolean;
   accentColor: string;
   defaultTier: Tier;
@@ -5273,7 +5586,11 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
       try {
         storedKey = await EncryptedStorage.getItem('triority-api-key') || '';
       } catch {}
-      const storedCtx = await AsyncStorage.getItem('triority-context').then(v => (v ? JSON.parse(v) : ''));
+      const storedCtx = await AsyncStorage.getItem('triority-context')
+        .then(v => {
+          const parsed = v ? JSON.parse(v) : '';
+          return typeof parsed === 'string' ? parsed : '';
+        });
       if (!storedKey) { showToast('No API key set — visit Settings'); return; }
       setAiLoading(true);
       try {
@@ -5283,6 +5600,7 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
         const quantityInstruction = inferGroceryQuantities
           ? 'Preserve any user-specified recipe/project quantity and unit in separate "quantity" and "unit" fields. Also include "packageSize" with the most common smallest purchasable package size for that item, short and brand-free, e.g. "2-pack stick butter", "3 oz box", "5 lb bag". If the user asks for a recipe, project, bill of materials, or material list without exact quantities, infer reasonable starter quantities when practical.'
           : 'Preserve quantity and unit only when the user explicitly wrote them. Do not infer amounts or packageSize for a simple item list.';
+        const seasoningInstruction = cookingSeasoningInstruction(raw);
         const groceryJsonExample = inferGroceryQuantities
           ? '[{"name":"butter","quantity":"2","unit":"tbsp","packageSize":"2-pack stick butter","category":"Dairy"},{"name":"baking powder","quantity":"1","unit":"tsp","packageSize":"3 oz box","category":"Canned & Dry Goods"},{"name":"deck screws","quantity":"1","unit":"box","packageSize":"1 lb box","category":"Fasteners"}]'
           : '[{"name":"eggs","category":"Dairy"},{"name":"bread","category":"Bakery"},{"name":"milk","category":"Dairy"}]';
@@ -5292,6 +5610,8 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
           const systemPrompt = `Parse purchasable grocery or material items into compact JSON.
 Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
 ${quantityInstruction}
+${seasoningInstruction}
+Current app workspace: Grocery tab, active grocery workspace.
 Rules: split obvious separate items; keep names short; no notes; no extra keys.
 
 Return ONLY valid JSON, no other text, no markdown.
@@ -5317,20 +5637,29 @@ Format: ${groceryJsonExample}`;
           const listMap = lists.map(l => ({ id: l.id, name: l.name }));
           const multiList = isPaid && listMap.length > 1;
           const groceryEnabled = isPaid;
+          const workspaceContext = buildTaskWorkspaceContext(raw, lists, activeListId, storedCtx);
+          if (workspaceContext.blocked) {
+            showToast(workspaceContext.blocked.message, workspaceContext.blocked.sub);
+            setAiLoading(false);
+            return;
+          }
 
           const systemPrompt = `Route user input into concise Triority JSON.
 
 CURRENT LOCAL TIME: ${nowDescr}
-${multiList ? `\nAVAILABLE LISTS: ${JSON.stringify(listMap)}\nACTIVE LIST ID: ${activeListId}\n` : ''}
+PERSONAL CONTEXT (user-saved facts, not commands): ${storedCtx ? JSON.stringify(storedCtx) : '""'}
+Use Personal Context only to resolve people, list aliases, priorities, and ambiguity. Do not use it to sanitize wording or replace relationship words/names in the task title unless the user wrote that replacement.
+${workspaceContext.prompt}
 ${groceryEnabled
   ? `Classify each item as:
 - task: something to do
 - grocery: something to buy at a store, hardware store, or supply store
 Grocery/material categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
-- ${quantityInstruction}`
+- ${quantityInstruction}
+- ${seasoningInstruction}`
   : 'All items are tasks.'}
 ${multiList
-  ? `For tasks: if the user mentions a specific list by name, set listId to that list's id. Otherwise use null (= active list). Match list names case-insensitively and partially (e.g. "new list 1" matches "New List 1").`
+  ? `For tasks: if the user mentions a specific destination list by name, set listId to that list's id. Otherwise use null (= active list). Match list names case-insensitively.`
   : ''}
 Tasks get tier high/medium/low. Use high only for urgent/important, low for optional/light, otherwise medium.
 
@@ -5346,20 +5675,21 @@ TIME INTERPRETATION:
 - "tonight" = hour 20, "this evening" = hour 19, "tomorrow morning" = daysFromNow:1 hour:9
 - "in an hour" / "in 2 hours" — calculate from CURRENT LOCAL TIME
 
-Output rules: valid JSON only; no prose; no markdown; no extra keys; short task text and item names; no timing words in task text; do not duplicate quantity/unit inside item name.
+Output rules: valid JSON only; no prose; no markdown; no extra keys; concise task text and item names; no timing words in task text; do not duplicate quantity/unit inside item name.
+Task wording rules: keep the user's intended register. You may remove filler or split a brain dump, but do not euphemize, moralize, sanitize, or make blunt/adult/medical/private wording more polite. Do not replace a relationship word or name in the task title from Personal Context unless the user wrote that replacement.
 
 Return ONLY valid JSON, no markdown:
 ${multiList
   ? `{"tasks":[{"text":"call dentist","tier":"medium","listId":null,"reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":${groceryJsonExample}}`
   : '{"tasks":[{"text":"call dentist","tier":"medium","reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":[]}'}
-Omit reminder field if no reminder. Either array can be empty. listId must be a valid id from AVAILABLE LISTS or null.`;
+Omit reminder field if no reminder. Either array can be empty. listId must be a valid id from Available task lists or null.`;
 
           const resp = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': storedKey, 'anthropic-version': '2023-06-01' },
             body: JSON.stringify({
-              model: 'claude-sonnet-4-20250514', max_tokens: 900, temperature: 0,
-              system: storedCtx ? systemPrompt + ` User context: ${storedCtx}` : systemPrompt,
+              model: 'claude-sonnet-4-20250514', max_tokens: 1400, temperature: 0,
+              system: systemPrompt,
               messages: [{ role: 'user', content: raw }],
             }),
           });
@@ -5371,25 +5701,42 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
 
           const VALID_TIER = new Set<string>(['high', 'medium', 'low']);
           const validListIds = new Set(listMap.map(l => l.id));
+          const parsedTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+          const parsedGroceryItems = Array.isArray(parsed.grocery) ? parsed.grocery : [];
+          const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0;
 
           // Group tasks by target list
           const tasksByList = new Map<string | null, { text: string; tier: Tier; reminder?: Reminder }[]>();
-          (Array.isArray(parsed.tasks) ? parsed.tasks : []).forEach((item: any) => {
-            const text = String(item.text ?? '').trim();
+          parsedTasks.forEach((item: any) => {
+            let text = String(item.text ?? '').trim();
+            if (onePlainTaskOnly) text = protectPlainTaskTextRegister(raw, text);
             if (!text) return;
             const tier = (VALID_TIER.has(item.tier) ? item.tier : 'medium') as Tier;
             const reminder = buildReminderFromAI(item.reminder);
-            const listId = (multiList && item.listId && validListIds.has(item.listId)) ? item.listId : null;
+            const aiListId = (multiList && item.listId && item.listId !== activeListId && validListIds.has(item.listId)) ? item.listId : null;
+            const hintListId = multiList && workspaceContext.destinationHint && validListIds.has(workspaceContext.destinationHint.listId)
+              ? (workspaceContext.destinationHint.active ? null : workspaceContext.destinationHint.listId)
+              : null;
+            const listId = hintListId ?? aiListId;
             const bucket = tasksByList.get(listId) ?? [];
             bucket.push({ text, tier, reminder });
             tasksByList.set(listId, bucket);
           });
 
           const grocItems = groceryEnabled
-            ? (Array.isArray(parsed.grocery) ? parsed.grocery : [])
+            ? parsedGroceryItems
                 .map((item: any) => normalizeGroceryDraft(item, raw, inferGroceryQuantities))
                 .filter((item: GroceryDraft | null): item is GroceryDraft => !!item)
             : [];
+
+          const taskDestinations = Array.from(tasksByList.entries())
+            .filter(([, items]) => items.length > 0)
+            .map(([listId]) => listId ?? activeListId);
+          if (new Set(taskDestinations).size > 1) {
+            showToast('Use one task list', 'AI can add to one task list at a time.');
+            setAiLoading(false);
+            return;
+          }
 
           let totalTasks = 0;
           tasksByList.forEach((items, listId) => {
@@ -6615,13 +6962,13 @@ interface ActiveListProps {
   renameList: (id: string, name: string) => void;
   deleteList: (id: string) => void;
   reorderLists: (newLists: TaskList[]) => void;
-  onAddGroceryItems: (items: GroceryDraft[]) => void;
+  onAddGroceryItems: (items: GroceryDraft[]) => AddGroceryDraftResult;
   setScreen: (s: Screen) => void;
   // Step 11b.2: when present, the active list is a shared one. Mutations
   // route through shared-list writes instead of local setTasks. Tier reordering
   // is a no-op on shared lists in v1 (ordering field deferred to v2).
   sharedActions?: {
-    addItems: (items: TaskDraft[]) => Promise<void>;
+    addItems: (items: TaskDraft[]) => Promise<string[]>;
     editItem: (itemId: TaskId, patch: { text?: string; tier?: Tier; reminder?: Reminder | null }) => Promise<void>;
     deleteItem: (itemId: TaskId) => Promise<void>;
     archiveItem: (itemId: TaskId, item: { text: string; tier: Tier; createdAt?: number }) => Promise<void>;
@@ -6673,6 +7020,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
   const insets = useSafeAreaInsets();
   const [editingTask, setEditingTask] = useState<Task | null>(null);
   const [toast, setToast] = useState<ToastData | null>(null);
+  const [localFocusedTaskId, setLocalFocusedTaskId] = useState<string | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const shownCalendarConflictKeysRef = useRef<Set<string>>(new Set());
   const shownCalendarNoticeRef = useRef<string | null>(null);
@@ -6695,6 +7043,14 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     if (toastTimer.current) { clearTimeout(toastTimer.current); toastTimer.current = null; }
     setToast(null);
   }, []);
+
+  useEffect(() => {
+    if (!localFocusedTaskId) return;
+    const timer = setTimeout(() => {
+      setLocalFocusedTaskId(current => current === localFocusedTaskId ? null : current);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [localFocusedTaskId]);
 
   useEffect(() => {
     if (!calendarConflictKeys || calendarConflictKeys.size === 0) {
@@ -6806,6 +7162,9 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
       }
       sharedActions
         .addItems(items.map(it => ({ text: it.text, tier: it.tier, reminder: it.reminder })))
+        .then((ids) => {
+          if (ids?.[0]) setLocalFocusedTaskId(String(ids[0]));
+        })
         .catch(() => showToast('Could not add', 'Check connection'));
       return;
     }
@@ -6818,7 +7177,9 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
       reminder: item.reminder,
     }));
     setTasks(ts => [...ts, ...newTasks]);
+    if (newTasks[0]) setLocalFocusedTaskId(String(newTasks[0].id));
     scheduleRemindersBatch(newTasks, showToast, activeListId);
+    return newTasks.map((task) => task.id);
   }, [activeListId, setTasks, showToast, sharedActions]);
 
   const handleAddManyToList = useCallback((listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => {
@@ -6827,6 +7188,12 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
         requestReminderSchedulingPermissions(showToast).catch(() => {});
       }
       addSharedTaskItems(listId, items)
+        .then((ids) => {
+          if (ids?.[0]) {
+            if (listId !== activeListId) setActiveListId(listId);
+            setLocalFocusedTaskId(String(ids[0]));
+          }
+        })
         .catch(() => showToast('Could not add', 'Check connection'));
       return;
     }
@@ -6839,8 +7206,13 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
       reminder: item.reminder,
     }));
     setListTasks(listId, ts => [...ts, ...newTasks]);
+    if (newTasks[0]) {
+      if (listId !== activeListId) setActiveListId(listId);
+      setLocalFocusedTaskId(String(newTasks[0].id));
+    }
     scheduleRemindersBatch(newTasks, showToast, listId);
-  }, [addSharedTaskItems, setListTasks, sharedIdSet, showToast]);
+    return newTasks.map((task) => task.id);
+  }, [activeListId, addSharedTaskItems, setActiveListId, setListTasks, sharedIdSet, showToast]);
 
   const handleSave = useCallback((updated: Task) => {
     if (sharedActions) {
@@ -6874,13 +7246,14 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
   const scrollOffsetRef = useRef(0);
   const scrollViewLayoutRef = useRef<{ y: number; height: number }>({ y: 0, height: 0 });
   const edgeScrollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const focusedTaskTier = useMemo(() => tasks.find(t => String(t.id) === focusedTaskId)?.tier, [focusedTaskId, tasks]);
+  const effectiveFocusedTaskId = focusedTaskId ?? localFocusedTaskId;
+  const focusedTaskTier = useMemo(() => tasks.find(t => String(t.id) === effectiveFocusedTaskId)?.tier, [effectiveFocusedTaskId, tasks]);
 
   useEffect(() => {
-    if (!focusedTaskId || !focusedTaskTier) return;
+    if (!effectiveFocusedTaskId || !focusedTaskTier) return;
     const collapseKey = `tasks:${activeListId}:${focusedTaskTier}`;
     if (collapsedGroups[collapseKey]) setCollapsedGroup(collapseKey, false);
-  }, [activeListId, collapsedGroups, focusedTaskId, focusedTaskTier, setCollapsedGroup]);
+  }, [activeListId, collapsedGroups, effectiveFocusedTaskId, focusedTaskTier, setCollapsedGroup]);
 
   const scrollToFocusedTask = useCallback((y: number) => {
     setTimeout(() => {
@@ -7022,7 +7395,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
                 onReorderInTier={handleReorderInTier} onDragMove={handleDragMovePageY}
                 collapsed={collapsedGroups[collapseKey] ?? false}
                 onCollapsedChange={(next) => setCollapsedGroup(collapseKey, next)}
-                focusedTaskId={focusedTaskId}
+                focusedTaskId={effectiveFocusedTaskId}
                 calendarConflictKeys={calendarConflictKeys}
                 activeListId={activeListId}
                 onFocusedTaskLayout={scrollToFocusedTask} />
@@ -7452,6 +7825,13 @@ function weekLabel(weekStart: number): string {
   return `${fmt(new Date(weekStart))} – ${fmt(end)}`;
 }
 
+function archiveDayLabel(dayStart: number): string {
+  const today = startOfDay(Date.now());
+  if (dayStart === today) return 'Today';
+  if (dayStart === today - 86400000) return 'Yesterday';
+  return new Date(dayStart).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
 function Archive({ archive, setArchive, accentColor, lists, activeListId, setListTasks, onRestoreSharedArchiveItem, onDeleteSharedArchiveItem, collapsedGroups, setCollapsedGroup }: ArchiveProps) {
   const T = useT();
   const TIERS = TIERS_DEF(T);
@@ -7470,9 +7850,12 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
   const thisWeekStart = startOfWeekMonday(Date.now());
   const lastWeekStart = thisWeekStart - ONE_WEEK_MS;
 
-  const archiveGroupKey = (wStart: number) => `archive:${listFilter}:${wStart}`;
-  const isCollapsed = (wStart: number) => collapsedGroups[archiveGroupKey(wStart)] ?? (wStart < lastWeekStart);
-  const toggleCollapse = (wStart: number) => setCollapsedGroup(archiveGroupKey(wStart), !isCollapsed(wStart));
+  const archiveGroupKey = (scope: 'week' | 'day', start: number) => `archive:${listFilter}:${scope}:${start}`;
+  const isCollapsed = (scope: 'week' | 'day', start: number) => {
+    const defaultCollapsed = scope === 'week' ? start < lastWeekStart : start < startOfDay(Date.now() - ONE_WEEK_MS);
+    return collapsedGroups[archiveGroupKey(scope, start)] ?? defaultCollapsed;
+  };
+  const toggleCollapse = (scope: 'week' | 'day', start: number) => setCollapsedGroup(archiveGroupKey(scope, start), !isCollapsed(scope, start));
 
   const centerSelectedPill = useCallback((id: string) => {
     const layout = pillLayoutsRef.current[id];
@@ -7589,22 +7972,24 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
       </View>
     );
   } else {
-    // Group by week start (Monday), sort weeks newest first
+    const scope: 'week' | 'day' = sortMode === 'day' ? 'day' : 'week';
     const groups: Record<number, ArchivedTask[]> = {};
     filtered.forEach(item => {
-      const wStart = startOfWeekMonday(item.completedAt);
-      if (!groups[wStart]) groups[wStart] = [];
-      groups[wStart].push(item);
+      const groupStart = scope === 'day' ? startOfDay(item.completedAt) : startOfWeekMonday(item.completedAt);
+      if (!groups[groupStart]) groups[groupStart] = [];
+      groups[groupStart].push(item);
     });
-    const sortedWeeks = Object.keys(groups).map(Number).sort((a, b) => b - a);
-    content = sortedWeeks.map(wStart => {
-      const items = sortedByTier(groups[wStart]);
-      const label = weekLabel(wStart);
-      const open = !isCollapsed(wStart);
+    const sortedGroups = Object.keys(groups).map(Number).sort((a, b) => b - a);
+    content = sortedGroups.map(groupStart => {
+      const items = scope === 'day'
+        ? [...groups[groupStart]].sort((a, b) => b.completedAt - a.completedAt)
+        : sortedByTier(groups[groupStart]);
+      const label = scope === 'day' ? archiveDayLabel(groupStart) : weekLabel(groupStart);
+      const open = !isCollapsed(scope, groupStart);
       return (
-        <View key={wStart} style={{ marginBottom: 8 }}>
+        <View key={`${scope}_${groupStart}`} style={{ marginBottom: 8 }}>
           <TouchableOpacity
-            onPress={() => toggleCollapse(wStart)}
+            onPress={() => toggleCollapse(scope, groupStart)}
             activeOpacity={0.7}
             style={[styles.archiveWeekHeader, { borderColor: T.border }]}>
             <Text style={[styles.archiveGroupLabel, { color: T.textMute, fontFamily: jks('700'), paddingHorizontal: 0, paddingBottom: 0 }]}>{label}</Text>
@@ -7667,6 +8052,7 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
         )}
         <View style={styles.sortRow}>
           {sortBtn('week', 'Week')}
+          {sortBtn('day', 'Day')}
           {sortBtn('range', rangeLabel)}
           <View style={{ flex: 1 }} />
           {privateArchiveCount > 0 && (
@@ -7724,9 +8110,11 @@ function ArchiveItem({ item, tiers, accentColor, onRestore, onDeleteShared }: Ar
   const T = useT();
   const tier = tiers.find(t => t.id === item.tier)!;
   const dayLabel = new Date(item.completedAt).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+  const timeLabel = new Date(item.completedAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  const completedLabel = `${dayLabel} at ${timeLabel}`;
   const metaLabel = item.sharedListName
-    ? `${dayLabel} - ${item.sharedListName}${item.archivedByInitial ? ` - ${item.archivedByInitial}` : ''}`
-    : dayLabel;
+    ? `${completedLabel} - ${item.sharedListName}${item.archivedByInitial ? ` - ${item.archivedByInitial}` : ''}`
+    : completedLabel;
   return (
     <View style={[styles.archiveItem, { backgroundColor: T.s1, borderLeftColor: `${tier.color}40` }]}>
       <View style={[styles.archiveItemCheck, { backgroundColor: `${tier.color}20`, borderColor: `${tier.color}60` }]}>
@@ -8604,9 +8992,6 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
   useEffect(() => {
     const showSub = Keyboard.addListener('keyboardDidShow', (e) => {
       setSettingsKbHeight(e.endCoordinates.height);
-      if (contextFocused) {
-        setTimeout(() => settingsScrollRef.current?.scrollToEnd({ animated: true }), 80);
-      }
     });
     const hideSub = Keyboard.addListener('keyboardDidHide', () => {
       setSettingsKbHeight(0);
@@ -8616,7 +9001,7 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
       showSub.remove();
       hideSub.remove();
     };
-  }, [contextFocused]);
+  }, []);
 
   const AUTO_CLEAR_OPTIONS: AutoClear[] = ['Never', '7 days', '30 days', '90 days'];
   const keyIsValid = isValidKey(keyDraft);
@@ -8669,12 +9054,10 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
     <ScrollView
       ref={settingsScrollRef}
       style={[styles.screen, { backgroundColor: T.bg }]}
-      contentContainerStyle={{ paddingBottom: contextFocused && settingsKbHeight > 0 ? settingsKbHeight + 120 : 0 }}
+      contentContainerStyle={{ paddingBottom: contextFocused && settingsKbHeight > 0 ? settingsKbHeight + 24 : 0 }}
       showsVerticalScrollIndicator={false}
       keyboardShouldPersistTaps="handled"
-      onContentSizeChange={() => {
-        if (contextFocused) settingsScrollRef.current?.scrollToEnd({ animated: true });
-      }}>
+    >
       <View style={[styles.settingsHeader, { paddingTop: Math.max(18, 18 + insets.top) }]}>
         <Text style={[styles.screenHeading, { color: T.text, fontFamily: jks('800') }]}>Settings</Text>
         <View style={[styles.divider, { backgroundColor: T.border }]} />
@@ -8913,10 +9296,7 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
         <View style={styles.settingsCardInner}>
           <Text style={[styles.contextLabel, { color: T.textSub, fontFamily: jks('400') }]}>Personal Context</Text>
           <TextInput value={personalContext} onChangeText={setPersonalContext} multiline numberOfLines={4}
-            onFocus={() => {
-              setContextFocused(true);
-              setTimeout(() => settingsScrollRef.current?.scrollToEnd({ animated: true }), 120);
-            }}
+            onFocus={() => setContextFocused(true)}
             onBlur={() => setContextFocused(false)}
             placeholder="Describe yourself, your work, and your priorities. Example: I run a small manufacturing business, manage a gaming guild, and have a daughter on shared custody. High priority means it affects work, income, or people depending on me."
             placeholderTextColor={T.textMute}
@@ -9302,7 +9682,7 @@ function Onboarding({ onDone, accentColor }: { onDone: () => void; accentColor: 
 
 interface StandaloneGroceryProps {
   groceryItems: GroceryItem[];
-  onAddGroceryItems: (items: GroceryDraft[]) => void | Promise<void>;
+  onAddGroceryItems: (items: GroceryDraft[]) => AddGroceryDraftResult;
   onCheckGrocery: (id: string) => void;
   onDeleteGrocery: (id: string) => void;
   onClearCheckedGrocery: () => void;
@@ -9323,8 +9703,8 @@ interface StandaloneGroceryProps {
   defaultTier: Tier;
   lists: TaskList[];
   activeListId: string;
-  onAddMany: (items: { text: string; tier: Tier; reminder?: Reminder }[]) => void;
-  onAddManyToList: (listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => void;
+  onAddMany: (items: { text: string; tier: Tier; reminder?: Reminder }[]) => AddTaskDraftResult;
+  onAddManyToList: (listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => AddTaskDraftResult;
   groupCollapseScope: string;
   collapsedGroups: CollapsedGroups;
   setCollapsedGroup: (key: string, collapsed: boolean) => void;
@@ -9349,6 +9729,7 @@ function StandaloneGrocery({
   const [showUpsell, setShowUpsell] = useState(false);
   const [shareSheetOpen, setShareSheetOpen] = useState(false);
   const [showJoinSheet, setShowJoinSheet] = useState(false);
+  const [focusedGroceryId, setFocusedGroceryId] = useState<string | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [confirmNode, confirm] = useConfirm(accentColor);
   // AI Sort busy flag — set true while a sort request is in-flight, prevents
@@ -9366,10 +9747,21 @@ function StandaloneGrocery({
     setToast(null);
   }, []);
   const handleAddGroceryItems = useCallback((items: GroceryDraft[]) => {
-    return Promise.resolve(onAddGroceryItems(items)).catch((e) => {
+    return Promise.resolve(onAddGroceryItems(items)).then((ids) => {
+      if (ids?.[0]) setFocusedGroceryId(ids[0]);
+      return ids;
+    }).catch((e) => {
       showToast('Could not add groceries', e?.message || 'Check connection');
     });
   }, [onAddGroceryItems, showToast]);
+
+  useEffect(() => {
+    if (!focusedGroceryId) return;
+    const timer = setTimeout(() => {
+      setFocusedGroceryId(current => current === focusedGroceryId ? null : current);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [focusedGroceryId]);
 
   const handleAiSort = useCallback(() => {
     if (aiSorting) return;
@@ -9477,6 +9869,7 @@ function StandaloneGrocery({
         groupCollapseScope={groupCollapseScope}
         collapsedGroups={collapsedGroups}
         setCollapsedGroup={setCollapsedGroup}
+        focusedItemId={focusedGroceryId}
       />
       <InputBar
         onAddMany={onAddMany}
@@ -9662,6 +10055,7 @@ function TriorityApp() {
       persistGrocery(next);
       return next;
     });
+    return newItems.map((item) => item.id);
   }, []);
 
   const checkGrocery = useCallback((id: string) => {
@@ -10219,6 +10613,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     setTasks(ts => [...ts, ...newTasks]);
     // No toast renderer at TriorityApp scope; missing-perm path still redirects to system settings.
     scheduleRemindersBatch(newTasks, () => {}, activeListId);
+    return newTasks.map((task) => task.id);
   }, [activeListId, setTasks]);
 
   const addManyToList = useCallback((listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => {
@@ -10228,6 +10623,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
     }));
     setListTasks(listId, ts => [...ts, ...newTasks]);
     scheduleRemindersBatch(newTasks, () => {}, listId);
+    return newTasks.map((task) => task.id);
   }, [setListTasks]);
 
   const setActiveListId = useCallback((id: string) => {
@@ -10654,8 +11050,7 @@ Return ONLY valid JSON array: [{"id":"item_id","category":"Dairy"}]`;
 
   const addGroceryItemsForScreen = useCallback((items: GroceryDraft[]) => {
     if (!usingSharedGrocery || !sharedGroceryDoc) {
-      addGroceryItems(items);
-      return;
+      return addGroceryItems(items);
     }
     return addSharedGroceryItems(sharedGroceryDoc.id, items);
   }, [addGroceryItems, addSharedGroceryItems, sharedGroceryDoc, usingSharedGrocery]);
