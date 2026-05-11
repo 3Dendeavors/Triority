@@ -42,5 +42,41 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
       </activity>
+      <activity
+        android:name=".TriorityQuickCaptureActivity"
+        android:theme="@style/WidgetQuickCaptureTheme"
+        android:excludeFromRecents="true"
+        android:noHistory="true"
+        android:launchMode="singleTop"
+        android:taskAffinity=""
+        android:finishOnTaskLaunch="true"
+        android:exported="false" />
+      <receiver
+        android:name=".TriorityQuickCaptureWidgetProvider"
+        android:label="@string/widget_voice_name"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            <action android:name="com.triority.widget.REFRESH" />
+        </intent-filter>
+        <meta-data
+            android:name="android.appwidget.provider"
+            android:resource="@xml/triority_quick_capture_widget" />
+      </receiver>
+      <receiver
+        android:name=".TriorityNextUpWidgetProvider"
+        android:label="@string/widget_next_up_name"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            <action android:name="com.triority.widget.REFRESH" />
+            <action android:name="com.triority.widget.ROTATE_NEXT_UP" />
+        </intent-filter>
+        <meta-data
+            android:name="android.appwidget.provider"
+            android:resource="@xml/triority_next_up_widget" />
+      </receiver>
     </application>
 </manifest>

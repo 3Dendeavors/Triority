@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-Nothing yet.
+## v1.4.7 - 2026-05-10
+
+- Added native Android voice-first home-screen widgets. `Triority Voice` renders idle as a compact mic button in a 1x5 slot, while `Triority Next Up` uses the rail for a rotating task/reminder preview with list, color-coded priority, and reminder metadata. Google Speech handles capture, the widget only shows final transcript review with Cancel and Organize/Add, queued captures import through the existing AI/manual paths, preview taps open the app to the shown task, and Appearance now includes widget theme plus left/right mic placement. Widget custom-theme color export now maps app control/accent/text roles correctly instead of misreading React Native alpha hex colors.
+- Updated AI triage to Anthropic `claude-sonnet-4-6`, replaced the custom rotating submit spinner with the native loading indicator, moved AI task/grocery/category calls to forced Anthropic tool responses instead of prompt-only JSON, and changed AI failures to show the actual key/billing/model/network cause when available.
+- Polished widget preview timing and task focus feedback: next-up previews rotate about every 18 seconds, preview metadata sits at the bottom left, the title area can use two lines, same-task widget taps replay the shine, right-side mic placement anchors the bubble to the mic and expands leftward, and the row shine no longer carries a separate lingering border.
+- Added a one-time widget onboarding card for this release. Existing users see the widget card once after updating; future updates stay quiet unless a new release-specific onboarding key is intentionally added.
+- Fixed two late beta issues: switching between task lists no longer trips the focused-row shine hook order, and AI task routing no longer treats the currently open list as the default destination. Generic tasks fall back to the normal To-do list unless a list is named, strongly implied, or matched through Personal Context.
 
 ## v1.4.5 - 2026-05-09
 

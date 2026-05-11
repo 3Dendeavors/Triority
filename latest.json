@@ -1,8 +1,8 @@
 {
-  "versionName": "1.4.6",
-  "versionCode": 22,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.6/Triority-v1.4.6.apk",
-  "releaseNotes": "Polish release with safer AI list routing, easier-to-find AI-created rows, recipe seasoning improvements, Archive Day view, clearer archive timestamps, and Settings context scroll cleanup.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.6",
+  "versionName": "1.4.7",
+  "versionCode": 23,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.7/Triority-v1.4.7.apk",
+  "releaseNotes": "AI reliability fixes plus new voice-first Android widgets, next-up previews, widget appearance controls, safer default AI list routing, and task-focus fixes.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.7",
   "required": false
 }
