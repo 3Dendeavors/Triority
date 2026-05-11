@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">Triority</string>
+    <string name="widget_voice_name">Triority Voice</string>
+    <string name="widget_next_up_name">Triority Next Up</string>
+    <string name="widget_quick_capture_description">Capture thoughts by voice and organize them with Triority.</string>
+    <string name="widget_next_up_description">Capture by voice with a rotating next-up task preview.</string>
 </resources>
