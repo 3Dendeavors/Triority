@@ -29,6 +29,9 @@ class TriorityWidgetModule(private val reactContext: ReactApplicationContext) : 
     if (payload.hasKey("hasApiKey") && !payload.isNull("hasApiKey")) {
       editor.putBoolean("hasApiKey", payload.getBoolean("hasApiKey"))
     }
+    if (payload.hasKey("clear") && !payload.isNull("clear")) {
+      editor.putBoolean("clear", payload.getBoolean("clear"))
+    }
     editor.commit()
     TriorityQuickCaptureWidgetProvider.updateAll(reactContext)
   }

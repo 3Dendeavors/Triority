@@ -14,6 +14,7 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.SystemClock
 import android.util.TypedValue
 import android.view.View
@@ -29,6 +30,10 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
 
   override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
     appWidgetIds.forEach { updateWidget(context, appWidgetManager, it, false) }
+  }
+
+  override fun onAppWidgetOptionsChanged(context: Context, appWidgetManager: AppWidgetManager, appWidgetId: Int, newOptions: Bundle) {
+    updateWidget(context, appWidgetManager, appWidgetId, false)
   }
 
   companion object {
@@ -209,6 +214,8 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
       val textSub = parseColor(prefs.getString("textSub", null), Color.rgb(196, 178, 220))
       val hasApiKey = prefs.getBoolean("hasApiKey", false)
       val micSide = prefs.getString("micSide", "left") ?: "left"
+      val clear = prefs.getBoolean("clear", false)
+      val widgetWidthDp = widgetWidthDp(appWidgetManager, appWidgetId)
 
       var state = prefs.getString(KEY_STATE, STATE_IDLE) ?: STATE_IDLE
       val resultUntil = prefs.getLong(KEY_RESULT_UNTIL, 0L)
@@ -236,20 +243,51 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
       val previewPriority = nextUpItem?.optString("priorityLabel", "")?.trim().orEmpty()
       val previewPriorityColor = parseColor(nextUpItem?.optString("priorityColor", ""), accent)
       val previewReminder = nextUpItem?.optString("reminderText", "")?.trim().orEmpty()
-      val previewWidthDp = if (isPreview) previewWidthDp(bubbleText, previewList.ifBlank { bubbleMeta }, previewPriority, previewReminder) else 260
-      val previewInnerWidthPx = dpToPx(context, (previewWidthDp - 32).coerceAtLeast(88))
+      val compactPreview = isPreview && widgetWidthDp < 178
+      val previewListLabel = previewList.ifBlank { bubbleMeta }
+      val previewReminderLabel = if (compactPreview) "" else previewReminder
+      val micWidthDp = if (compactPreview) 44 else 58
+      val bubbleGapDp = if (compactPreview) 2 else 7
+      val railMaxWidthDp = (widgetWidthDp - micWidthDp - bubbleGapDp - 8).coerceIn(42, 318)
+      val previewPaddingDp = if (compactPreview) 9 else 15
+      val previewTopPaddingDp = if (compactPreview) 6 else 8
+      val previewBottomPaddingDp = if (compactPreview) 6 else 9
+      val previewWidthDp = if (isPreview) {
+        previewWidthDp(bubbleText, previewListLabel, previewPriority, previewReminderLabel, railMaxWidthDp, compactPreview)
+      } else {
+        minOf(260, railMaxWidthDp.coerceAtLeast(58))
+      }
+      val previewInnerWidthPx = dpToPx(context, (previewWidthDp - (previewPaddingDp * 2)).coerceAtLeast(38))
       val bubbleColor = when {
         state == STATE_ERROR -> Color.rgb(255, 118, 110)
+        clear && isPreview -> text
         isPreview -> withAlpha(text, 218)
         else -> text
       }
       val submitLabel = if (hasApiKey) "\u2728 Organize" else "Add"
+      val panelFill = if (clear) Color.TRANSPARENT else withAlpha(surface, 242)
+      val panelStroke = if (clear) Color.TRANSPARENT else withAlpha(accent, 170)
+      val previewFill = if (clear) Color.TRANSPARENT else withAlpha(surface, 150)
+      val previewStroke = if (clear) Color.TRANSPARENT else withAlpha(accent, 90)
+      val controlFill = if (clear) Color.TRANSPARENT else withAlpha(control, 238)
+      val controlStroke = if (clear) Color.TRANSPARENT else if (isListening) textSub else accent
+      val cancelFill = if (clear) Color.TRANSPARENT else withAlpha(control, 210)
+      val cancelStroke = if (clear) Color.TRANSPARENT else withAlpha(textSub, 100)
+      val submitFill = if (clear) Color.TRANSPARENT else withAlpha(accent, 225)
+      val submitStroke = if (clear) Color.TRANSPARENT else withAlpha(Color.WHITE, 80)
+      val submitTextColor = if (clear) accent else Color.WHITE
+      val micStrokeWidth = if (clear) 0f else 1.5f
+      val panelStrokeWidth = if (clear) 0f else 1.3f
+      val previewStrokeWidth = if (clear) 0f else 1f
+      val buttonStrokeWidth = if (clear) 0f else 1f
 
       val widgetDirection = if (micSide == "right") View.LAYOUT_DIRECTION_RTL else View.LAYOUT_DIRECTION_LTR
       views.setInt(R.id.widget_root, "setLayoutDirection", widgetDirection)
       views.setInt(R.id.widget_bubble, "setLayoutDirection", widgetDirection)
       views.setInt(R.id.widget_preview_panel, "setLayoutDirection", View.LAYOUT_DIRECTION_LTR)
       views.setInt(R.id.widget_review_panel, "setLayoutDirection", View.LAYOUT_DIRECTION_LTR)
+      setLayoutWidthDp(views, R.id.widget_mic_button, micWidthDp)
+      setLayoutMarginDp(views, R.id.widget_bubble, RemoteViews.MARGIN_START, bubbleGapDp)
       views.setViewVisibility(R.id.widget_bubble, if (isExpanded) View.VISIBLE else View.INVISIBLE)
       views.setViewVisibility(R.id.widget_preview_panel, if (isPreview) View.VISIBLE else View.GONE)
       views.setViewVisibility(R.id.widget_review_panel, if (isExpanded && !isPreview) View.VISIBLE else View.GONE)
@@ -258,9 +296,16 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
       views.setTextViewText(R.id.widget_bubble_text, bubbleText)
       views.setTextViewText(R.id.widget_bubble_meta, bubbleMeta)
       views.setTextViewText(R.id.widget_preview_title, bubbleText)
-      views.setTextViewText(R.id.widget_preview_list, previewList.ifBlank { bubbleMeta })
+      views.setTextViewText(R.id.widget_preview_list, previewListLabel)
       views.setTextViewText(R.id.widget_preview_priority, previewPriority)
       views.setTextViewText(R.id.widget_preview_reminder, previewReminder)
+      views.setViewPadding(
+        R.id.widget_preview_text_stack,
+        dpToPx(context, previewPaddingDp),
+        dpToPx(context, previewTopPaddingDp),
+        dpToPx(context, previewPaddingDp),
+        dpToPx(context, previewBottomPaddingDp),
+      )
       views.setTextColor(R.id.widget_bubble_text, bubbleColor)
       views.setTextColor(R.id.widget_bubble_meta, withAlpha(textSub, 230))
       views.setTextColor(R.id.widget_preview_title, bubbleColor)
@@ -269,38 +314,49 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
       views.setTextColor(R.id.widget_preview_meta_sep_2, withAlpha(textSub, 165))
       views.setTextColor(R.id.widget_preview_priority, previewPriorityColor)
       views.setTextColor(R.id.widget_preview_reminder, withAlpha(textSub, 235))
-      views.setViewVisibility(R.id.widget_preview_meta_row, if (previewList.isNotBlank() || previewPriority.isNotBlank() || previewReminder.isNotBlank()) View.VISIBLE else View.GONE)
-      views.setViewVisibility(R.id.widget_preview_meta_sep_1, if (previewList.isNotBlank() && previewPriority.isNotBlank()) View.VISIBLE else View.GONE)
-      views.setViewVisibility(R.id.widget_preview_priority, if (previewPriority.isNotBlank()) View.VISIBLE else View.GONE)
-      views.setViewVisibility(R.id.widget_preview_meta_sep_2, if (previewReminder.isNotBlank() && (previewList.isNotBlank() || previewPriority.isNotBlank())) View.VISIBLE else View.GONE)
-      views.setViewVisibility(R.id.widget_preview_reminder, if (previewReminder.isNotBlank()) View.VISIBLE else View.GONE)
+      val showPreviewReminder = !compactPreview && previewReminder.isNotBlank()
+      val showPreviewMeta = previewListLabel.isNotBlank() || previewPriority.isNotBlank() || showPreviewReminder
+      views.setViewVisibility(R.id.widget_preview_meta_row, if (showPreviewMeta) View.VISIBLE else View.GONE)
+      views.setViewVisibility(R.id.widget_preview_list, if (showPreviewMeta && previewListLabel.isNotBlank()) View.VISIBLE else View.GONE)
+      views.setViewVisibility(R.id.widget_preview_meta_sep_1, if (showPreviewMeta && previewListLabel.isNotBlank() && previewPriority.isNotBlank()) View.VISIBLE else View.GONE)
+      views.setViewVisibility(R.id.widget_preview_priority, if (showPreviewMeta && previewPriority.isNotBlank()) View.VISIBLE else View.GONE)
+      views.setViewVisibility(R.id.widget_preview_meta_sep_2, if (showPreviewReminder && (previewListLabel.isNotBlank() || previewPriority.isNotBlank())) View.VISIBLE else View.GONE)
+      views.setViewVisibility(R.id.widget_preview_reminder, if (showPreviewReminder) View.VISIBLE else View.GONE)
       views.setTextViewText(R.id.widget_submit_text, submitLabel)
       views.setTextColor(R.id.widget_cancel_text, textSub)
-      views.setTextColor(R.id.widget_submit_text, Color.WHITE)
+      views.setTextColor(R.id.widget_submit_text, submitTextColor)
       views.setTextViewTextSize(R.id.widget_bubble_text, TypedValue.COMPLEX_UNIT_SP, 13f)
-      views.setTextViewTextSize(R.id.widget_preview_title, TypedValue.COMPLEX_UNIT_SP, 15.5f)
+      views.setTextViewTextSize(R.id.widget_preview_title, TypedValue.COMPLEX_UNIT_SP, if (compactPreview) 13.2f else 15.5f)
+      views.setTextViewTextSize(R.id.widget_preview_list, TypedValue.COMPLEX_UNIT_SP, if (compactPreview) 9.7f else 11.5f)
+      views.setTextViewTextSize(R.id.widget_preview_priority, TypedValue.COMPLEX_UNIT_SP, if (compactPreview) 9.7f else 11.5f)
+      views.setTextViewTextSize(R.id.widget_preview_reminder, TypedValue.COMPLEX_UNIT_SP, 11.5f)
+      views.setTextViewTextSize(R.id.widget_preview_meta_sep_1, TypedValue.COMPLEX_UNIT_SP, if (compactPreview) 9.5f else 11f)
+      views.setTextViewTextSize(R.id.widget_preview_meta_sep_2, TypedValue.COMPLEX_UNIT_SP, 11f)
       views.setInt(R.id.widget_bubble_text, "setMaxLines", if (isPreview) 1 else 2)
-      views.setInt(R.id.widget_preview_title, "setMaxLines", 2)
+      views.setInt(R.id.widget_preview_title, "setMaxLines", if (compactPreview && showPreviewMeta) 1 else 2)
+      setLayoutWidthDp(views, R.id.widget_preview_panel, previewWidthDp)
+      setLayoutWidthDp(views, R.id.widget_preview_bg, previewWidthDp)
       views.setInt(R.id.widget_preview_title, "setMaxWidth", previewInnerWidthPx)
-      views.setInt(R.id.widget_preview_list, "setMaxWidth", dpToPx(context, (previewWidthDp * 0.45f).toInt().coerceIn(72, 140)))
+      views.setInt(R.id.widget_preview_list, "setMaxWidth", dpToPx(context, (previewWidthDp * (if (compactPreview) 0.52f else 0.45f)).toInt().coerceIn(if (compactPreview) 34 else 72, if (compactPreview) 96 else 140)))
+      views.setInt(R.id.widget_preview_priority, "setMaxWidth", dpToPx(context, (previewWidthDp * (if (compactPreview) 0.34f else 0.28f)).toInt().coerceIn(34, 82)))
       views.setInt(R.id.widget_preview_reminder, "setMaxWidth", dpToPx(context, (previewWidthDp * 0.38f).toInt().coerceIn(62, 118)))
 
-      views.setImageViewBitmap(R.id.widget_mic_bg, roundedRectBitmap(context, withAlpha(control, 238), if (isListening) textSub else accent, 20f, 1.5f, 64, 64))
+      views.setImageViewBitmap(R.id.widget_mic_bg, roundedRectBitmap(context, controlFill, controlStroke, 20f, micStrokeWidth, 64, 64))
       views.setImageViewBitmap(
         R.id.widget_preview_bg,
         roundedRectBitmap(
           context,
-          withAlpha(surface, 150),
-          withAlpha(accent, 90),
+          previewFill,
+          previewStroke,
           20f,
-          1f,
+          previewStrokeWidth,
           previewWidthDp,
           64,
         )
       )
-      views.setImageViewBitmap(R.id.widget_bubble_bg, roundedRectBitmap(context, withAlpha(surface, 242), withAlpha(accent, 170), 20f, 1.3f, 260, 64))
-      views.setImageViewBitmap(R.id.widget_cancel_bg, roundedRectBitmap(context, withAlpha(control, 210), withAlpha(textSub, 100), 14f, 1f, 80, 30))
-      views.setImageViewBitmap(R.id.widget_submit_bg, roundedRectBitmap(context, withAlpha(accent, 225), withAlpha(Color.WHITE, 80), 14f, 1f, 102, 30))
+      views.setImageViewBitmap(R.id.widget_bubble_bg, roundedRectBitmap(context, panelFill, panelStroke, 20f, panelStrokeWidth, 260, 64))
+      views.setImageViewBitmap(R.id.widget_cancel_bg, roundedRectBitmap(context, cancelFill, cancelStroke, 14f, buttonStrokeWidth, 80, 30))
+      views.setImageViewBitmap(R.id.widget_submit_bg, roundedRectBitmap(context, submitFill, submitStroke, 14f, buttonStrokeWidth, 102, 30))
       views.setInt(R.id.widget_mic_icon, "setColorFilter", if (isListening) textSub else text)
       views.setInt(R.id.widget_sparkle_icon, "setColorFilter", if (isListening) textSub else accent)
 
@@ -457,24 +513,51 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
       return Color.argb(alpha.coerceIn(0, 255), Color.red(color), Color.green(color), Color.blue(color))
     }
 
-    private fun previewWidthDp(title: String, listName: String, priority: String, reminder: String): Int {
+    private fun widgetWidthDp(manager: AppWidgetManager, appWidgetId: Int): Int {
+      val options = manager.getAppWidgetOptions(appWidgetId)
+      val reportedWidth = maxOf(
+        options.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_WIDTH, 0),
+        options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH, 0),
+      )
+      return (if (reportedWidth > 0) reportedWidth else 320).coerceIn(110, 390)
+    }
+
+    private fun previewWidthDp(title: String, listName: String, priority: String, reminder: String, maxWidthDp: Int, compact: Boolean): Int {
       val cleanTitle = title.replace(Regex("\\s+"), " ").trim()
       val metaLength = listName.length + priority.length + reminder.length +
         (if (listName.isNotBlank() && priority.isNotBlank()) 3 else 0) +
         (if (reminder.isNotBlank() && (listName.isNotBlank() || priority.isNotBlank())) 3 else 0)
+      val longestWord = cleanTitle.split(Regex("\\s+")).maxOfOrNull { it.length } ?: 0
+      val estimatedTitleWidth = (cleanTitle.length * (if (compact) 6.8f else 8.2f)).toInt() + (if (compact) 24 else 48)
+      val longestWordWidth = (longestWord * (if (compact) 7.4f else 9.2f)).toInt() + (if (compact) 20 else 28)
       val titleWidth = when {
-        cleanTitle.length <= 10 -> 118
-        cleanTitle.length <= 18 -> 156
-        cleanTitle.length <= 28 -> 214
-        cleanTitle.length <= 40 -> 270
-        else -> 318
+        compact -> maxOf(58, minOf(maxWidthDp, maxOf(estimatedTitleWidth, longestWordWidth)))
+        cleanTitle.length <= 10 -> maxOf(128, minOf(maxWidthDp, maxOf(estimatedTitleWidth, longestWordWidth)))
+        cleanTitle.length <= 18 -> maxOf(176, minOf(maxWidthDp, maxOf(estimatedTitleWidth, longestWordWidth)))
+        cleanTitle.length <= 28 -> maxOf(220, minOf(maxWidthDp, maxOf(estimatedTitleWidth, longestWordWidth)))
+        else -> maxWidthDp
       }
-      val metaWidth = (metaLength * 6) + 34
-      return maxOf(120, minOf(318, maxOf(titleWidth, metaWidth)))
+      val metaWidth = (metaLength * (if (compact) 5 else 6)) + (if (compact) 24 else 34)
+      val minWidth = if (compact) 58 else 120
+      return maxOf(minWidth, minOf(maxWidthDp.coerceAtLeast(minWidth), maxOf(titleWidth, metaWidth)))
     }
 
     private fun dpToPx(context: Context, dp: Int): Int {
       return (dp * context.resources.displayMetrics.density).toInt()
+    }
+
+    private fun setLayoutWidthDp(views: RemoteViews, viewId: Int, widthDp: Int) {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        views.setViewLayoutWidth(viewId, widthDp.toFloat(), TypedValue.COMPLEX_UNIT_DIP)
+      } else {
+        views.setInt(viewId, "setMinimumWidth", widthDp)
+      }
+    }
+
+    private fun setLayoutMarginDp(views: RemoteViews, viewId: Int, marginType: Int, marginDp: Int) {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        views.setViewLayoutMargin(viewId, marginType, marginDp.toFloat(), TypedValue.COMPLEX_UNIT_DIP)
+      }
     }
 
     private fun roundedRectBitmap(
@@ -518,5 +601,9 @@ class TriorityNextUpWidgetProvider : AppWidgetProvider() {
 
   override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
     TriorityQuickCaptureWidgetProvider.updateAll(context)
+  }
+
+  override fun onAppWidgetOptionsChanged(context: Context, appWidgetManager: AppWidgetManager, appWidgetId: Int, newOptions: Bundle) {
+    TriorityQuickCaptureWidgetProvider.updateNextUp(context)
   }
 }
