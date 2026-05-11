@@ -9,15 +9,15 @@ The app is distributed as a signed Android APK through GitHub Releases. It is no
 The current public beta APK is published on GitHub Releases:
 
 - Latest release: https://github.com/3Dendeavors/Triority/releases/latest
-- Current beta: `v1.4.7`
+- Current beta: `v1.4.8`
 - Android package id: `com.triority`
-- Current APK: `Triority-v1.4.7.apk`
-- SHA-256: `7F52C846ED90398DE6AA445AB7D4C92D63D10CE17D1A1834F5AD67D401A44110`
+- Current APK: `Triority-v1.4.8.apk`
+- SHA-256: `1AEB9210BAE70D2EE9F2CB93618D0B91E73D8B29B3A9E4EF68CD44B65D0D690B`
 
 To install:
 
 1. Open the latest release page on your Android device.
-2. Under **Assets**, download `Triority-v1.4.7.apk`.
+2. Under **Assets**, download `Triority-v1.4.8.apk`.
 3. If Android asks, allow your browser or file manager to install unknown apps.
 4. Open the downloaded APK and tap **Install**.
 5. Launch Triority from your app drawer.
@@ -68,4 +68,4 @@ Release signing files and Firebase config are intentionally not committed. See `
 
 ## Current Status
 
-The current public beta is `v1.4.7` / `versionCode 23`, an AI and widget release with voice-first Android widgets, widget appearance controls, safer default AI list routing, and task-focus fixes. Public releases should include an APK asset before `latest.json` is updated.
+The current public beta is `v1.4.8` / `versionCode 24`, a widget and reminder-stability release. It polishes the `Triority Next Up` launcher widget for compact sizes, adds metadata-row arrow controls for cycling tasks, keeps task taps focused on opening the displayed task, improves short widget text, and fixes a reminder-edit persistence issue. Public releases should include an APK asset before `latest.json` is updated.

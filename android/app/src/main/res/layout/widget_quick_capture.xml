@@ -98,6 +98,8 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="2dp"
+                    android:clickable="true"
+                    android:focusable="true"
                     android:gravity="start|center_vertical"
                     android:orientation="horizontal">
 
@@ -163,6 +165,38 @@
                         android:text=""
                         android:textSize="11.5sp"
                         android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/widget_preview_prev_button"
+                        android:layout_width="30dp"
+                        android:layout_height="28dp"
+                        android:layout_marginStart="12dp"
+                        android:layout_marginEnd="6dp"
+                        android:background="@android:color/transparent"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:fontFamily="sans"
+                        android:gravity="center"
+                        android:includeFontPadding="false"
+                        android:text="&lt;"
+                        android:textSize="15sp"
+                        android:textStyle="bold"
+                        android:visibility="gone" />
+
+                    <TextView
+                        android:id="@+id/widget_preview_next_button"
+                        android:layout_width="30dp"
+                        android:layout_height="28dp"
+                        android:background="@android:color/transparent"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:fontFamily="sans"
+                        android:gravity="center"
+                        android:includeFontPadding="false"
+                        android:text="&gt;"
+                        android:textSize="15sp"
+                        android:textStyle="bold"
+                        android:visibility="gone" />
                 </LinearLayout>
             </LinearLayout>
         </FrameLayout>
@@ -171,6 +205,8 @@
             android:id="@+id/widget_review_panel"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
+            android:clickable="true"
+            android:focusable="true"
             android:visibility="gone">
 
             <ImageView
@@ -228,7 +264,7 @@
 
                 <LinearLayout
                     android:id="@+id/widget_action_row"
-                    android:layout_width="138dp"
+                    android:layout_width="172dp"
                     android:layout_height="match_parent"
                     android:baselineAligned="false"
                     android:gravity="center_vertical"
@@ -237,9 +273,9 @@
 
                     <FrameLayout
                         android:id="@+id/widget_cancel_button"
-                        android:layout_width="56dp"
-                        android:layout_height="34dp"
-                        android:layout_marginEnd="6dp"
+                        android:layout_width="68dp"
+                        android:layout_height="38dp"
+                        android:layout_marginEnd="8dp"
                         android:clickable="true"
                         android:focusable="true">
 
@@ -258,14 +294,14 @@
                             android:includeFontPadding="false"
                             android:maxLines="1"
                             android:text="Cancel"
-                            android:textSize="10sp"
+                            android:textSize="12sp"
                             android:textStyle="bold" />
                     </FrameLayout>
 
                     <FrameLayout
                         android:id="@+id/widget_submit_button"
-                        android:layout_width="76dp"
-                        android:layout_height="34dp"
+                        android:layout_width="96dp"
+                        android:layout_height="38dp"
                         android:clickable="true"
                         android:focusable="true">
 
@@ -285,7 +321,7 @@
                             android:includeFontPadding="false"
                             android:maxLines="1"
                             android:text="Organize"
-                            android:textSize="10sp"
+                            android:textSize="12sp"
                             android:textStyle="bold" />
                     </FrameLayout>
                 </LinearLayout>

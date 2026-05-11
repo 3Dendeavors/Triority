@@ -3798,8 +3798,8 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 23;
-const CURRENT_APP_VERSION_NAME = '1.4.7';
+const CURRENT_APP_VERSION_CODE = 24;
+const CURRENT_APP_VERSION_NAME = '1.4.8';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {
@@ -8123,12 +8123,15 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     }
     setTasks(ts => ts.map(t => (t.id === updated.id ? updated : t)));
     // Re-schedule (or cancel) when the reminder changes via edit
-    if (updated.reminder) {
-      scheduleRemindersBatch([updated], showToast, activeListId);
-    } else {
-      cancelReminder(updated.id).catch(() => {});
-    }
     setEditingTask(null);
+    const reminderListId = activeListId;
+    setTimeout(() => {
+      if (updated.reminder) {
+        scheduleRemindersBatch([updated], showToast, reminderListId);
+      } else {
+        cancelReminder(updated.id).catch(() => {});
+      }
+    }, 0);
   }, [activeListId, setTasks, showToast, sharedActions]);
 
   const total = tasks.length;
@@ -11856,23 +11859,21 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
     }
   }, []);
 
-  const setTasks = useCallback((fn: (prev: Task[]) => Task[]) => {
+  const applyListTasks = useCallback((listId: string, fn: (prev: Task[]) => Task[]) => {
     const now = Date.now();
-    setListsState(prevLists => {
-      const next = prevLists.map(l => l.id === activeListId ? { ...l, tasks: fn(l.tasks), updatedAt: now } : l);
-      persistLists(next);
-      return next;
-    });
-  }, [activeListId]);
+    const next = listsRef.current.map(l => l.id === listId ? { ...l, tasks: fn(l.tasks), updatedAt: now } : l);
+    listsRef.current = next;
+    setListsState(next);
+    persistLists(next);
+  }, []);
+
+  const setTasks = useCallback((fn: (prev: Task[]) => Task[]) => {
+    applyListTasks(activeListId, fn);
+  }, [activeListId, applyListTasks]);
 
   const setListTasks = useCallback((listId: string, fn: (prev: Task[]) => Task[]) => {
-    const now = Date.now();
-    setListsState(prevLists => {
-      const next = prevLists.map(l => l.id === listId ? { ...l, tasks: fn(l.tasks), updatedAt: now } : l);
-      persistLists(next);
-      return next;
-    });
-  }, []);
+    applyListTasks(listId, fn);
+  }, [applyListTasks]);
 
   const addManyToActiveList = useCallback((items: TaskDraft[]) => {
     const now = Date.now();
