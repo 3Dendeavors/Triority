@@ -98,12 +98,13 @@ interface Reminder {
   repeatDaily: boolean;  // if true, re-notify daily at same time until archived/deleted
 }
 
-type TaskDraft = { text: string; tier: Tier; reminder?: Reminder };
+type TaskDraft = { text: string; tier: Tier; reminder?: Reminder; widgetLabel?: string };
 type AddTaskDraftResult = TaskId[] | void | Promise<TaskId[] | void>;
 type AddGroceryDraftResult = string[] | void | Promise<string[] | void>;
 type WidgetCaptureMode = 'manual' | 'ai' | 'voice';
 type WidgetThemeId = 'match_app' | string;
 type WidgetMicSide = 'left' | 'right';
+type WidgetCustomColors = { text: string; accent: string };
 
 interface WidgetPendingCapture {
   id?: string;
@@ -134,6 +135,7 @@ type WidgetAiCaptureDraft = {
 interface Task {
   id: TaskId;
   text: string;
+  widgetLabel?: string;
   tier: Tier;
   createdAt: number;
   reminder?: Reminder;
@@ -599,6 +601,125 @@ function buildReminderFromAIResult(r: any): Reminder | undefined {
   return { remindAt, repeatHourly: !!r.repeatHourly, repeatDaily: !!r.repeatDaily };
 }
 
+function normalizeWidgetLabel(value: unknown, fallbackText: string): string | undefined {
+  const fallback = fallbackText.replace(/\s+/g, ' ').trim();
+  if (typeof value !== 'string') return undefined;
+  const cleaned = value.replace(/\s+/g, ' ').trim();
+  if (!fallback || !cleaned) return undefined;
+  const words = cleaned.split(/\s+/).slice(0, 5);
+  while (words.length > 1 && words.join(' ').length > 44) {
+    words.pop();
+  }
+  const label = words.join(' ');
+  if (!label || label.length > 44 || widgetLabelLooksCut(label, fallback)) return undefined;
+  if (label.toLowerCase() === fallback.toLowerCase()) return undefined;
+  return label;
+}
+
+const WIDGET_CONNECTOR_WORDS = new Set([
+  '&', 'and', 'or', 'to', 'of', 'for', 'with', 'without', 'from', 'into', 'onto', 'on', 'in', 'at', 'by', 'under', 'over',
+]);
+const WIDGET_SOFT_START_WORDS = new Set(['a', 'an', 'the', 'this', 'that', 'my', 'our', 'your', 'his', 'her', 'their']);
+const WIDGET_ACTION_PREFIX_WORDS = new Set([
+  'ask', 'book', 'build', 'buy', 'call', 'clean', 'create', 'do', 'draft', 'email', 'finish', 'get', 'grab', 'make',
+  'message', 'order', 'pay', 'pick', 'schedule', 'send', 'set', 'submit', 'tell', 'text', 'wash', 'write',
+]);
+
+function widgetWords(text: string): string[] {
+  return text
+    .replace(/[.,;:!?]+$/g, '')
+    .split(/\s+/)
+    .map(word => word.trim())
+    .filter(Boolean);
+}
+
+function widgetWordKey(word: string): string {
+  return word.replace(/^[^\w&]+|[^\w&]+$/g, '').toLowerCase();
+}
+
+function widgetStartsWithSoftWord(text: string): boolean {
+  const first = widgetWords(text)[0];
+  return first ? WIDGET_SOFT_START_WORDS.has(widgetWordKey(first)) : false;
+}
+
+function widgetLabelDropsActionPrefix(label: string, fullText: string): boolean {
+  const labelWords = widgetWords(label);
+  const fullWords = widgetWords(fullText);
+  if (labelWords.length === 0 || fullWords.length < 2) return false;
+  const compactFull = fullText.replace(/\s+/g, ' ').trim();
+  if (compactFull.length > 58 || fullWords.length > 8) return false;
+  const firstFull = widgetWordKey(fullWords[0]);
+  if (!WIDGET_ACTION_PREFIX_WORDS.has(firstFull)) return false;
+  const firstLabel = widgetWordKey(labelWords[0]);
+  const secondFull = widgetWordKey(fullWords[1]);
+  return firstLabel === secondFull || WIDGET_SOFT_START_WORDS.has(firstLabel);
+}
+
+function widgetLabelLooksCut(label: string, fullText: string): boolean {
+  if (/(\.{2,}|…)\s*$/.test(label.trim())) return true;
+  if (widgetLabelDropsActionPrefix(label, fullText)) return true;
+  const labelWords = widgetWords(label);
+  const fullWords = widgetWords(fullText);
+  if (labelWords.length === 0 || fullWords.length === 0) return false;
+  const tail = widgetWordKey(labelWords[labelWords.length - 1]);
+  if (WIDGET_CONNECTOR_WORDS.has(tail)) return true;
+  if (labelWords.length >= fullWords.length) return false;
+  const isPrefix = labelWords.every((word, index) => widgetWordKey(word) === widgetWordKey(fullWords[index] ?? ''));
+  if (!isPrefix) return false;
+  const nextFull = widgetWordKey(fullWords[labelWords.length] ?? '');
+  return WIDGET_CONNECTOR_WORDS.has(nextFull);
+}
+
+function localWidgetShorthand(text: string): string {
+  const original = text.replace(/\s+/g, ' ').trim();
+  if (!original) return '';
+  let cleaned = original
+    .replace(/^[•*-]\s*/, '')
+    .replace(/\b(today|tonight|tomorrow|tmr|this morning|this afternoon|this evening)\b/ig, ' ')
+    .replace(/\b(next|this)\s+(mon(day)?|tue(sday)?|wed(nesday)?|thu(rsday)?|fri(day)?|sat(urday)?|sun(day)?)\b/ig, ' ')
+    .replace(/\b(at|by|around)\s+\d{1,2}(:\d{2})?\s*(am|pm|a|p)?\b/ig, ' ')
+    .replace(/\bin\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)\b/ig, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const cleanedWords = widgetWords(cleaned);
+  if (cleaned && cleaned.length <= 72 && cleanedWords.length <= 10) return cleaned;
+  const leadingPatterns = [
+    /^(please\s+)?(remind me to|remember to|i need to|need to|gotta|have to)\s+/i,
+  ];
+  for (let pass = 0; pass < 2; pass += 1) {
+    for (const pattern of leadingPatterns) {
+      const next = cleaned.replace(pattern, '').trim();
+      if (next && next !== cleaned && !widgetStartsWithSoftWord(next)) {
+        cleaned = next;
+        break;
+      }
+    }
+  }
+  const words = widgetWords(cleaned);
+  let end = Math.min(words.length, 6);
+  while (end < words.length && end < 10) {
+    const current = words.slice(0, end).join(' ');
+    const next = widgetWordKey(words[end]);
+    if (!widgetLabelLooksCut(current, cleaned) && !WIDGET_CONNECTOR_WORDS.has(next)) break;
+    end += 1;
+  }
+  let clipped = words.slice(0, end).join(' ');
+  if (!clipped) return original;
+  while (end > 1 && clipped.length > 58) {
+    end -= 1;
+    clipped = words.slice(0, end).join(' ');
+  }
+  return clipped || original;
+}
+
+function widgetDisplayLabel(task: Pick<Task, 'text' | 'widgetLabel'>): string {
+  const fullText = task.text.replace(/\s+/g, ' ').trim();
+  const local = localWidgetShorthand(fullText);
+  const stored = typeof task.widgetLabel === 'string' ? task.widgetLabel.replace(/\s+/g, ' ').trim() : '';
+  if (stored && !widgetLabelLooksCut(stored, fullText)) return stored;
+  return local || stored || fullText;
+}
+
 function fallbackWidgetCapture(raw: string, defaultTier: Tier, listId: string | null = null): WidgetAiCaptureDraft {
   return { listId, tasks: [{ text: raw, tier: defaultTier }], grocery: [] };
 }
@@ -612,6 +733,7 @@ async function parseWidgetAiCapture({
   hasApiKey,
   personalContext,
   isPaid,
+  widgetShorthand,
 }: {
   raw: string;
   lists: TaskList[];
@@ -621,6 +743,7 @@ async function parseWidgetAiCapture({
   hasApiKey: boolean;
   personalContext: string;
   isPaid: boolean;
+  widgetShorthand: boolean;
 }): Promise<WidgetAiCaptureDraft> {
   const fallbackListId = defaultTaskDestinationListId(lists);
   if (!hasApiKey || !apiKey) return fallbackWidgetCapture(raw, defaultTier, fallbackListId);
@@ -669,6 +792,7 @@ ${multiList
   ? `For tasks: set listId to the destination list id. If no specific list is clearly mentioned or strongly implied, use the Normal default task list id from workspace context, not the active list. Use null only when no valid list id is available. Match list names case-insensitively.`
   : ''}
 Tasks get tier high/medium/low. Use high only for urgent/important, low for optional/light, otherwise medium.
+${widgetShorthand ? 'For each task, set widgetLabel to a short 1-5 word widget display label. Keep the full meaning/register, skip timing words, and keep the final noun/object when possible. If the task text is already short, use the full task text; do not drop leading action verbs from short tasks.' : 'Do not include widgetLabel.'}
 
 If the user wants a reminder, include reminder:
 - daysFromNow: integer (0=today, 1=tomorrow, etc.)
@@ -682,13 +806,13 @@ TIME INTERPRETATION:
 - "tonight" = hour 20, "this evening" = hour 19, "tomorrow morning" = daysFromNow:1 hour:9
 - "in an hour" / "in 2 hours" - calculate from CURRENT LOCAL TIME
 
-Output rules: valid JSON only; no prose; no markdown; no extra keys; concise task text and item names; no timing words in task text; do not duplicate quantity/unit inside item name.
+Output rules: valid JSON only; no prose; no markdown; no extra keys; concise task text${widgetShorthand ? ', widgetLabel,' : ''} and item names; no timing words in task text${widgetShorthand ? ' or widgetLabel' : ''}; do not duplicate quantity/unit inside item name.
 Task wording rules: keep the user's intended register. You may remove filler or split a brain dump, but do not euphemize, moralize, sanitize, or make blunt/adult/medical/private wording more polite. Do not replace a relationship word or name in the task title from Personal Context unless the user wrote that replacement.
 
 Return ONLY valid JSON. The first character must be { and the last character must be }. No prose, no markdown:
 ${multiList
-  ? `{"tasks":[{"text":"call dentist","tier":"medium","listId":${JSON.stringify(fallbackListId)},"reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":${groceryJsonExample}}`
-  : `{"tasks":[{"text":"call dentist","tier":"medium","reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":[]}`}
+  ? `{"tasks":[{"text":"call dentist"${widgetShorthand ? ',"widgetLabel":"dentist"' : ''},"tier":"medium","listId":${JSON.stringify(fallbackListId)},"reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":${groceryJsonExample}}`
+  : `{"tasks":[{"text":"call dentist"${widgetShorthand ? ',"widgetLabel":"dentist"' : ''},"tier":"medium","reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":[]}`}
 Omit reminder field if no reminder. Either array can be empty. listId must be a valid id from Available task lists or null.`;
 
     const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -700,7 +824,7 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
         temperature: 0,
         system: systemPrompt,
         messages: [{ role: 'user', content: raw }],
-        tools: [aiRouteInputTool(multiList)],
+        tools: [aiRouteInputTool(multiList, widgetShorthand)],
         tool_choice: { type: 'tool', name: AI_ROUTE_INPUT_TOOL_NAME },
       }),
     });
@@ -727,7 +851,12 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
         : undefined;
       const listId = hintListId ?? aiListId ?? defaultRouteListId;
       const bucket = tasksByList.get(listId) ?? [];
-      bucket.push({ text, tier, reminder: buildReminderFromAIResult(item?.reminder) });
+      bucket.push({
+        text,
+        widgetLabel: normalizeWidgetLabel(item?.widgetLabel, text),
+        tier,
+        reminder: buildReminderFromAIResult(item?.reminder),
+      });
       tasksByList.set(listId, bucket);
     });
 
@@ -775,6 +904,7 @@ interface SharedListItem {
   id: string;
   // Tasks-shape fields (kind === 'tasks')
   text?: string;
+  widgetLabel?: string;
   tier?: Tier;
   completed?: boolean;
   reminder?: Reminder;
@@ -824,6 +954,7 @@ const { TriorityWidget } = NativeModules as {
       accent: string;
       text: string;
       textSub: string;
+      clear: boolean;
       activeListName: string;
       activeListId: string;
       hasApiKey: boolean;
@@ -859,12 +990,15 @@ function aiReminderSchema() {
   };
 }
 
-function aiTaskSchema(includeListId: boolean) {
+function aiTaskSchema(includeListId: boolean, includeWidgetLabel: boolean = true) {
   const properties: Record<string, any> = {
     text: aiStringSchema('Concise task title.'),
     tier: { type: 'string', enum: ['high', 'medium', 'low'] },
     reminder: aiReminderSchema(),
   };
+  if (includeWidgetLabel) {
+    properties.widgetLabel = aiStringSchema('Short 1-5 word launcher-widget display label. Preserve meaning/register, omit timing words, keep the final noun/object when possible, and do not drop leading action verbs from short tasks.');
+  }
   if (includeListId) {
     properties.listId = {
       type: ['string', 'null'],
@@ -875,7 +1009,7 @@ function aiTaskSchema(includeListId: boolean) {
     type: 'object',
     additionalProperties: false,
     properties,
-    required: ['text', 'tier'],
+    required: includeWidgetLabel ? ['text', 'widgetLabel', 'tier'] : ['text', 'tier'],
   };
 }
 
@@ -894,7 +1028,7 @@ function aiGroceryItemSchema() {
   };
 }
 
-function aiWidgetTaskTool(includeListId: boolean) {
+function aiWidgetTaskTool(includeListId: boolean, includeWidgetLabel: boolean = true) {
   return {
     name: AI_WIDGET_TASK_TOOL_NAME,
     description: 'Capture quick widget text as Triority tasks.',
@@ -904,7 +1038,7 @@ function aiWidgetTaskTool(includeListId: boolean) {
       properties: {
         tasks: {
           type: 'array',
-          items: aiTaskSchema(includeListId),
+          items: aiTaskSchema(includeListId, includeWidgetLabel),
         },
       },
       required: ['tasks'],
@@ -912,7 +1046,7 @@ function aiWidgetTaskTool(includeListId: boolean) {
   };
 }
 
-function aiRouteInputTool(includeListId: boolean) {
+function aiRouteInputTool(includeListId: boolean, includeWidgetLabel: boolean = true) {
   return {
     name: AI_ROUTE_INPUT_TOOL_NAME,
     description: 'Route mixed Triority user input into tasks and grocery/material items.',
@@ -922,7 +1056,7 @@ function aiRouteInputTool(includeListId: boolean) {
       properties: {
         tasks: {
           type: 'array',
-          items: aiTaskSchema(includeListId),
+          items: aiTaskSchema(includeListId, includeWidgetLabel),
         },
         grocery: {
           type: 'array',
@@ -1007,9 +1141,15 @@ const SHARED_CACHE_KEY = 'tri_shared_cache_v1';
 const COLLAPSED_GROUPS_KEY = 'tri_collapsed_groups_v1';
 const CALENDAR_CONFLICTS_ENABLED_KEY = 'tri_calendar_conflicts_enabled_v1';
 const WIDGET_THEME_KEY = 'tri_widget_theme_v1';
+const WIDGET_CLEAR_KEY = 'tri_widget_clear_v1';
+const WIDGET_SHORTHAND_KEY = 'tri_widget_shorthand_v1';
+const WIDGET_CUSTOM_COLORS_KEY = 'tri_widget_custom_colors_v1';
 const WIDGET_MIC_SIDE_KEY = 'tri_widget_mic_side_v1';
 const WIDGET_ONBOARDING_RELEASE_KEY = 'tri_widget_onboarding_v147_seen';
 const WIDGET_THEME_MATCH_APP = 'match_app';
+const WIDGET_THEME_CUSTOM = 'widget_custom';
+const WIDGET_THEME_LEGACY_CLEAR = 'clear';
+const DEFAULT_WIDGET_CUSTOM_COLORS: WidgetCustomColors = { text: '#FFFFFF', accent: '#B985FF' };
 const GOOGLE_CALENDAR_FREEBUSY_SCOPE = 'https://www.googleapis.com/auth/calendar.freebusy';
 const GOOGLE_CALENDAR_LIST_SCOPE = 'https://www.googleapis.com/auth/calendar.calendarlist.readonly';
 const CALENDAR_CONFLICT_WINDOW_MS = 30 * 60 * 1000;
@@ -1327,6 +1467,7 @@ function mapSupabaseItem(row: any): SharedListItem {
   return stripUndefined({
     id: String(row.id),
     text: row.text ?? undefined,
+    widgetLabel: row.widget_label ?? row.widgetLabel ?? undefined,
     tier: row.tier === 'high' || row.tier === 'medium' || row.tier === 'low' ? row.tier : undefined,
     completed: false,
     reminder: row.reminder ?? undefined,
@@ -3780,7 +3921,7 @@ async function loadAll() {
     await AsyncStorage.multiRemove(['tri_tasks', 'tri_archive', 'tri_lists', 'tri_active_list_id']);
     await AsyncStorage.setItem('tri_version', APP_VERSION);
   }
-  const [listsRaw, legacyTasks, archive, activeIdRaw, legacyAccent, accentLightRaw, accentDarkRaw, themeRaw, darkMode, defaultTier, autoClear, context, onboarded, widgetOnboardingSeenRaw, listOrderRaw, customThemeRaw, customThemesRaw, groceryRaw, collapsedGroupsRaw, widgetThemeRaw, widgetMicSideRaw] = await Promise.all([
+  const [listsRaw, legacyTasks, archive, activeIdRaw, legacyAccent, accentLightRaw, accentDarkRaw, themeRaw, darkMode, defaultTier, autoClear, context, onboarded, widgetOnboardingSeenRaw, listOrderRaw, customThemeRaw, customThemesRaw, groceryRaw, collapsedGroupsRaw, widgetThemeRaw, widgetClearRaw, widgetShorthandRaw, widgetCustomColorsRaw, widgetMicSideRaw] = await Promise.all([
     AsyncStorage.getItem('tri_lists'),
     AsyncStorage.getItem('tri_tasks'),
     AsyncStorage.getItem('tri_archive'),
@@ -3801,6 +3942,9 @@ async function loadAll() {
     AsyncStorage.getItem('tri_grocery'),
     AsyncStorage.getItem(COLLAPSED_GROUPS_KEY),
     AsyncStorage.getItem(WIDGET_THEME_KEY),
+    AsyncStorage.getItem(WIDGET_CLEAR_KEY),
+    AsyncStorage.getItem(WIDGET_SHORTHAND_KEY),
+    AsyncStorage.getItem(WIDGET_CUSTOM_COLORS_KEY),
     AsyncStorage.getItem(WIDGET_MIC_SIDE_KEY),
   ]);
   // API key is stored encrypted for security
@@ -3926,7 +4070,31 @@ async function loadAll() {
 
   const groceryItems: GroceryItem[] = groceryRaw ? (JSON.parse(groceryRaw) as GroceryItem[]) : [];
   const widgetThemeParsed = widgetThemeRaw ? JSON.parse(widgetThemeRaw) as string : WIDGET_THEME_MATCH_APP;
-  const widgetThemeId = widgetThemeParsed === WIDGET_THEME_MATCH_APP ? WIDGET_THEME_MATCH_APP : resolveThemeId(widgetThemeParsed);
+  const widgetLegacyClear = widgetThemeParsed === WIDGET_THEME_LEGACY_CLEAR;
+  const widgetThemeId = widgetThemeParsed === WIDGET_THEME_MATCH_APP || widgetLegacyClear
+    ? WIDGET_THEME_MATCH_APP
+    : widgetThemeParsed === WIDGET_THEME_CUSTOM
+      ? WIDGET_THEME_CUSTOM
+      : resolveThemeId(widgetThemeParsed);
+  const widgetClear = widgetLegacyClear || widgetClearRaw === '1' || widgetClearRaw === 'true';
+  const widgetShorthand = widgetShorthandRaw == null ? true : (widgetShorthandRaw === '1' || widgetShorthandRaw === 'true');
+  let widgetCustomColors = DEFAULT_WIDGET_CUSTOM_COLORS;
+  if (widgetCustomColorsRaw) {
+    try {
+      const parsed = JSON.parse(widgetCustomColorsRaw) as Partial<WidgetCustomColors>;
+      const text = typeof parsed.text === 'string' && /^#[0-9a-fA-F]{6}$/.test(parsed.text)
+        ? parsed.text
+        : DEFAULT_WIDGET_CUSTOM_COLORS.text;
+      const customAccent = typeof parsed.accent === 'string' && /^#[0-9a-fA-F]{6}$/.test(parsed.accent)
+        ? parsed.accent
+        : DEFAULT_WIDGET_CUSTOM_COLORS.accent;
+      widgetCustomColors = { text, accent: customAccent };
+    } catch {}
+  }
+  if (widgetLegacyClear) {
+    AsyncStorage.setItem(WIDGET_THEME_KEY, JSON.stringify(WIDGET_THEME_MATCH_APP)).catch(() => {});
+    AsyncStorage.setItem(WIDGET_CLEAR_KEY, '1').catch(() => {});
+  }
   const widgetMicSideParsed = widgetMicSideRaw ? JSON.parse(widgetMicSideRaw) as string : 'left';
   const widgetMicSide: WidgetMicSide = widgetMicSideParsed === 'right' ? 'right' : 'left';
 
@@ -3948,6 +4116,9 @@ async function loadAll() {
     groceryItems,
     collapsedGroups: parseCollapsedGroups(collapsedGroupsRaw),
     widgetThemeId,
+    widgetClear,
+    widgetShorthand,
+    widgetCustomColors,
     widgetMicSide,
   };
 }
@@ -4016,6 +4187,26 @@ function formatReminderTime(ts: number): string {
   if (dayDiff === 1) return `Tomorrow · ${timeStr}`;
   if (dayDiff < 7) return `${due.toLocaleDateString('en-US', { weekday: 'long' })} · ${timeStr}`;
   return `${due.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} · ${timeStr}`;
+}
+
+function formatWidgetReminderTime(ts: number): string {
+  const now = new Date();
+  const due = new Date(ts);
+  const diffMs = ts - now.getTime();
+  const hour = due.getHours() % 12 || 12;
+  const mins = due.getMinutes();
+  const suffix = due.getHours() >= 12 ? 'p' : 'a';
+  const timeStr = mins === 0 ? `${hour}${suffix}` : `${hour}:${String(mins).padStart(2, '0')}${suffix}`;
+  if (diffMs < 0) return `Late ${timeStr}`;
+  const diffMins = Math.ceil(diffMs / 60000);
+  if (diffMins < 60) return `${diffMins}m ${timeStr}`;
+  const today0 = new Date(now); today0.setHours(0, 0, 0, 0);
+  const due0 = new Date(due); due0.setHours(0, 0, 0, 0);
+  const dayDiff = Math.round((due0.getTime() - today0.getTime()) / 86400000);
+  if (dayDiff === 0) return `Today ${timeStr}`;
+  if (dayDiff === 1) return `Tmr ${timeStr}`;
+  if (dayDiff < 7) return `${due.toLocaleDateString('en-US', { weekday: 'short' })} ${timeStr}`;
+  return `${due.getMonth() + 1}/${due.getDate()} ${timeStr}`;
 }
 
 function reminderRepeatLabel(r: Reminder): string {
@@ -4847,7 +5038,7 @@ function EditSheet({ task, onSave, onCancel, accentColor, showToast }: EditSheet
     const trimmed = textRef.current.trim();
     if (!trimmed) return;
     Keyboard.dismiss();
-    onSave({ ...task, text: trimmed, tier, reminder });
+    onSave({ ...task, text: trimmed, widgetLabel: trimmed === task.text.trim() ? task.widgetLabel : undefined, tier, reminder });
   };
 
   const handleChangeText = (next: string) => {
@@ -6050,8 +6241,8 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
 // ─── InputBar ─────────────────────────────────────────────────────────────────
 
 interface InputBarProps {
-  onAddMany: (items: { text: string; tier: Tier; reminder?: Reminder }[]) => AddTaskDraftResult;
-  onAddManyToList: (listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => AddTaskDraftResult;
+  onAddMany: (items: TaskDraft[]) => AddTaskDraftResult;
+  onAddManyToList: (listId: string, items: TaskDraft[]) => AddTaskDraftResult;
   onAddGroceryItems: (items: GroceryDraft[]) => AddGroceryDraftResult;
   hasApiKey: boolean;
   accentColor: string;
@@ -6061,10 +6252,11 @@ interface InputBarProps {
   groceryMode: boolean;
   lists: TaskList[];
   activeListId: string;
+  widgetShorthand: boolean;
   onGroceryOnlyAdded?: (ids: string[]) => void;
 }
 
-function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, accentColor, defaultTier, showToast, dismissToast, groceryMode, lists, activeListId, onGroceryOnlyAdded }: InputBarProps) {
+function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, accentColor, defaultTier, showToast, dismissToast, groceryMode, lists, activeListId, widgetShorthand, onGroceryOnlyAdded }: InputBarProps) {
   const T = useT();
   const isPaid = useIsPaid();
   const inputRef = useRef<TextInput | null>(null);
@@ -6334,6 +6526,7 @@ ${multiList
   ? `For tasks: set listId to the destination list id. If no specific list is clearly mentioned or strongly implied, use the Normal default task list id from workspace context, not the active list. Use null only when no valid list id is available. Match list names case-insensitively.`
   : ''}
 Tasks get tier high/medium/low. Use high only for urgent/important, low for optional/light, otherwise medium.
+${widgetShorthand ? 'For each task, set widgetLabel to a short 1-5 word widget display label. Keep the full meaning/register, skip timing words, and keep the final noun/object when possible. If the task text is already short, use the full task text; do not drop leading action verbs from short tasks.' : 'Do not include widgetLabel.'}
 
 If the user wants a reminder, include reminder:
 - daysFromNow: integer (0=today, 1=tomorrow, etc.)
@@ -6347,13 +6540,13 @@ TIME INTERPRETATION:
 - "tonight" = hour 20, "this evening" = hour 19, "tomorrow morning" = daysFromNow:1 hour:9
 - "in an hour" / "in 2 hours" — calculate from CURRENT LOCAL TIME
 
-Output rules: valid JSON only; no prose; no markdown; no extra keys; concise task text and item names; no timing words in task text; do not duplicate quantity/unit inside item name.
+Output rules: valid JSON only; no prose; no markdown; no extra keys; concise task text${widgetShorthand ? ', widgetLabel,' : ''} and item names; no timing words in task text${widgetShorthand ? ' or widgetLabel' : ''}; do not duplicate quantity/unit inside item name.
 Task wording rules: keep the user's intended register. You may remove filler or split a brain dump, but do not euphemize, moralize, sanitize, or make blunt/adult/medical/private wording more polite. Do not replace a relationship word or name in the task title from Personal Context unless the user wrote that replacement.
 
 Return ONLY valid JSON. The first character must be { and the last character must be }. No prose, no markdown:
 ${multiList
-  ? `{"tasks":[{"text":"call dentist","tier":"medium","listId":${JSON.stringify(defaultListId)},"reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":${groceryJsonExample}}`
-  : '{"tasks":[{"text":"call dentist","tier":"medium","reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":[]}'}
+  ? `{"tasks":[{"text":"call dentist"${widgetShorthand ? ',"widgetLabel":"dentist"' : ''},"tier":"medium","listId":${JSON.stringify(defaultListId)},"reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":${groceryJsonExample}}`
+  : `{"tasks":[{"text":"call dentist"${widgetShorthand ? ',"widgetLabel":"dentist"' : ''},"tier":"medium","reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":[]}`}
 Omit reminder field if no reminder. Either array can be empty. listId must be a valid id from Available task lists or null.`;
 
           const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -6363,7 +6556,7 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
               model: ANTHROPIC_MODEL, max_tokens: 1400, temperature: 0,
               system: systemPrompt,
               messages: [{ role: 'user', content: raw }],
-              tools: [aiRouteInputTool(multiList)],
+              tools: [aiRouteInputTool(multiList, widgetShorthand)],
               tool_choice: { type: 'tool', name: AI_ROUTE_INPUT_TOOL_NAME },
             }),
           });
@@ -6379,20 +6572,20 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
           const defaultRouteListId = multiList ? defaultListId : null;
 
           // Group tasks by target list
-          const tasksByList = new Map<string | null, { text: string; tier: Tier; reminder?: Reminder }[]>();
+          const tasksByList = new Map<string | null, TaskDraft[]>();
           parsedTasks.forEach((item: any) => {
-            let text = String(item.text ?? '').trim();
+            let text = String(item?.text ?? '').trim();
             if (onePlainTaskOnly) text = protectPlainTaskTextRegister(raw, text);
             if (!text) return;
-            const tier = (VALID_TIER.has(item.tier) ? item.tier : 'medium') as Tier;
-            const reminder = buildReminderFromAI(item.reminder);
-            const aiListId = (multiList && item.listId && validListIds.has(item.listId)) ? item.listId as string : undefined;
+            const tier = (VALID_TIER.has(item?.tier) ? item.tier : 'medium') as Tier;
+            const reminder = buildReminderFromAI(item?.reminder);
+            const aiListId = (multiList && item?.listId && validListIds.has(item.listId)) ? item.listId as string : undefined;
             const hintListId = multiList && workspaceContext.destinationHint && validListIds.has(workspaceContext.destinationHint.listId)
               ? workspaceContext.destinationHint.listId
               : undefined;
             const listId = hintListId ?? aiListId ?? defaultRouteListId;
             const bucket = tasksByList.get(listId) ?? [];
-            bucket.push({ text, tier, reminder });
+            bucket.push({ text, widgetLabel: normalizeWidgetLabel(item?.widgetLabel, text), tier, reminder });
             tasksByList.set(listId, bucket);
           });
 
@@ -7644,6 +7837,7 @@ interface ActiveListProps {
   accentColor: string;
   hasApiKey: boolean;
   defaultTier: Tier;
+  widgetShorthand: boolean;
   setArchive: (fn: (prev: ArchivedTask[]) => ArchivedTask[]) => void;
   activeListId: string;
   lists: TaskList[];
@@ -7680,7 +7874,7 @@ interface ActiveListProps {
   calendarConflictNotice?: string | null;
 }
 
-function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, defaultTier, setArchive, activeListId, lists, setActiveListId, addList, renameList, deleteList, reorderLists, onAddGroceryItems, setScreen, onGroceryOnlyAdded, sharedActions, sharedIdSet, collapsedGroups, setCollapsedGroup, focusedTaskId, focusedTaskNonce = 0, onFocusedTaskSeen, calendarConflictKeys, calendarConflictNotice }: ActiveListProps) {
+function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, defaultTier, widgetShorthand, setArchive, activeListId, lists, setActiveListId, addList, renameList, deleteList, reorderLists, onAddGroceryItems, setScreen, onGroceryOnlyAdded, sharedActions, sharedIdSet, collapsedGroups, setCollapsedGroup, focusedTaskId, focusedTaskNonce = 0, onFocusedTaskSeen, calendarConflictKeys, calendarConflictNotice }: ActiveListProps) {
   const isPaid = useIsPaid();
   const { user: syncUser } = useSync();
   const {
@@ -7853,7 +8047,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     handleComplete(id);
   }, [handleComplete]);
 
-  const handleAddMany = useCallback((items: { text: string; tier: Tier; reminder?: Reminder }[]) => {
+  const handleAddMany = useCallback((items: TaskDraft[]) => {
     if (sharedActions) {
       // Shared reminders are stored on the row; each device schedules locally
       // only when that user has granted reminder permissions.
@@ -7861,7 +8055,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
         requestReminderSchedulingPermissions(showToast).catch(() => {});
       }
       sharedActions
-        .addItems(items.map(it => ({ text: it.text, tier: it.tier, reminder: it.reminder })))
+        .addItems(items.map(it => ({ text: it.text, tier: it.tier, reminder: it.reminder, widgetLabel: it.widgetLabel })))
         .then((ids) => {
           if (ids?.[0]) armLocalTaskFocus(String(ids[0]));
         })
@@ -7872,6 +8066,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     const newTasks: Task[] = items.map((item, i) => ({
       id: now + i,
       text: item.text,
+      widgetLabel: item.widgetLabel,
       tier: item.tier,
       createdAt: now + i,
       reminder: item.reminder,
@@ -7882,7 +8077,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     return newTasks.map((task) => task.id);
   }, [activeListId, setTasks, showToast, sharedActions]);
 
-  const handleAddManyToList = useCallback((listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => {
+  const handleAddManyToList = useCallback((listId: string, items: TaskDraft[]) => {
     if (sharedIdSet?.has(listId)) {
       if (items.some(it => it.reminder)) {
         requestReminderSchedulingPermissions(showToast).catch(() => {});
@@ -7901,6 +8096,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     const newTasks: Task[] = items.map((item, i) => ({
       id: now + i,
       text: item.text,
+      widgetLabel: item.widgetLabel,
       tier: item.tier,
       createdAt: now + i,
       reminder: item.reminder,
@@ -8139,6 +8335,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
         groceryMode={false}
         lists={lists}
         activeListId={activeListId}
+        widgetShorthand={widgetShorthand}
         onGroceryOnlyAdded={onGroceryOnlyAdded}
       />
       {editingTask && <EditSheet task={editingTask} onSave={handleSave} onCancel={() => setEditingTask(null)} accentColor={accentColor} showToast={showToast} />}
@@ -8882,6 +9079,9 @@ interface SettingsProps {
   setAccentLight: (v: string | null) => void; setAccentDark: (v: string | null) => void;
   themeId: string; setThemeId: (v: string) => void;
   widgetThemeId: WidgetThemeId; setWidgetThemeId: (v: WidgetThemeId) => void;
+  widgetClear: boolean; setWidgetClear: (v: boolean) => void;
+  widgetShorthand: boolean; setWidgetShorthand: (v: boolean) => void;
+  widgetCustomColors: WidgetCustomColors; setWidgetCustomColors: (v: WidgetCustomColors) => void;
   widgetMicSide: WidgetMicSide; setWidgetMicSide: (v: WidgetMicSide) => void;
   customThemeDrafts: (CustomThemeDraft | null)[]; setCustomThemeDrafts: (drafts: (CustomThemeDraft | null)[]) => void;
   onClearArchive: () => void;
@@ -9696,7 +9896,123 @@ function CustomThemeSheet({ initialDraft, onSave, onClose }: CustomThemeSheetPro
   );
 }
 
-function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personalContext, setPersonalContext, autoClear, setAutoClear, darkMode, setDarkMode, accentLight, accentDark, setAccentLight, setAccentDark, themeId, setThemeId, widgetThemeId, setWidgetThemeId, widgetMicSide, setWidgetMicSide, customThemeDrafts, setCustomThemeDrafts, onClearArchive, onReplayOnboarding, calendarConflictsEnabled, setCalendarConflictsEnabled, onRequestCalendarConflictAccess }: SettingsProps) {
+type WidgetColorGroup = 'text' | 'accent';
+
+const WIDGET_COLOR_LABELS: Record<WidgetColorGroup, string> = {
+  text: 'Text',
+  accent: 'Accent',
+};
+
+function WidgetColorPreview({ colors, clear }: { colors: WidgetCustomColors; clear: boolean }) {
+  const T = useT();
+  return (
+    <View style={{ marginHorizontal: 16, marginTop: 12, marginBottom: 16, borderRadius: 12, borderWidth: 1, borderColor: T.borderMid, backgroundColor: T.bg, padding: 12 }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, height: 70 }}>
+        <View style={{ width: 52, height: 62, borderRadius: 18, borderWidth: clear ? 0 : 1.4, borderColor: colors.accent, backgroundColor: clear ? 'transparent' : T.s2, alignItems: 'center', justifyContent: 'center' }}>
+          <Feather name="mic" size={24} color={colors.text} />
+          <Ionicons name="sparkles" size={12} color={colors.accent} style={{ position: 'absolute', top: 8, right: 8 }} />
+        </View>
+        <View style={{ flex: 1, minHeight: 62, borderRadius: 18, borderWidth: clear ? 0 : 1, borderColor: `${colors.accent}88`, backgroundColor: clear ? 'transparent' : `${T.s2}DD`, paddingHorizontal: 14, paddingVertical: 9, justifyContent: 'space-between' }}>
+          <Text numberOfLines={2} style={{ color: colors.text, fontFamily: jks('800'), fontSize: 15, lineHeight: 18 }}>Take product photo</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+            <Text numberOfLines={1} style={{ color: colors.accent, fontFamily: jks('800'), fontSize: 11 }}>Biomed</Text>
+            <Text style={{ color: `${colors.accent}AA`, fontFamily: jks('800'), fontSize: 11 }}>/</Text>
+            <Text style={{ color: colors.accent, fontFamily: jks('800'), fontSize: 11 }}>Tmr 8:30p</Text>
+          </View>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+function WidgetColorSheet({ initialColors, clear, onSave, onClose }: { initialColors: WidgetCustomColors; clear: boolean; onSave: (colors: WidgetCustomColors) => void; onClose: () => void }) {
+  const T = useT();
+  const slide = useRef(new Animated.Value(0)).current;
+  const { dragY, panHandlers } = useSwipeToDismiss(onClose);
+  const [draft, setDraft] = useState<WidgetCustomColors>(initialColors);
+  const [activeGroup, setActiveGroup] = useState<WidgetColorGroup>('text');
+  const activeGroupRef = useRef<WidgetColorGroup>('text');
+  const draftRef = useRef<WidgetCustomColors>(initialColors);
+
+  useEffect(() => {
+    Animated.timing(slide, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+  }, [slide]);
+
+  const selectGroup = (group: WidgetColorGroup) => {
+    activeGroupRef.current = group;
+    setActiveGroup(group);
+  };
+  const onChangeRef = useRef((hex: string) => {
+    const group = activeGroupRef.current;
+    const next = { ...draftRef.current, [group]: hex };
+    draftRef.current = next;
+    setDraft(next);
+  });
+  const save = () => { onSave(draftRef.current); onClose(); };
+
+  return (
+    <Modal transparent animationType="fade" visible onRequestClose={onClose}>
+      <TouchableWithoutFeedback onPress={onClose}>
+        <View style={styles.backdrop} />
+      </TouchableWithoutFeedback>
+      <Animated.View
+        style={[styles.sheetPanel, styles.sheetCompact, {
+          backgroundColor: T.s1,
+          borderColor: T.border,
+          transform: [{ translateY: Animated.add(
+            slide.interpolate({ inputRange: [0, 1], outputRange: [420, 0] }),
+            dragY,
+          ) }],
+        }]}
+      >
+        <View style={styles.sheetHandle} {...panHandlers}>
+          <View style={[styles.sheetHandleBar, { backgroundColor: T.s3 }]} />
+        </View>
+        <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+          <Text style={[styles.customThemeSheetTitle, { color: T.text, fontFamily: jks('700'), marginBottom: 0 }]}>Widget Colors</Text>
+          <WidgetColorPreview colors={draft} clear={clear} />
+          <View style={[styles.customGroupGrid, { paddingHorizontal: 16 }]}>
+            {(['text', 'accent'] as WidgetColorGroup[]).map(group => {
+              const active = activeGroup === group;
+              return (
+                <TouchableOpacity
+                  key={group}
+                  onPress={() => selectGroup(group)}
+                  activeOpacity={0.85}
+                  style={[styles.customGroupBtn, {
+                    backgroundColor: active ? draft.accent : 'transparent',
+                    borderColor: active ? draft.accent : T.borderMid,
+                  }]}
+                >
+                  <View style={[styles.customGroupSwatch, { backgroundColor: draft[group], borderColor: active ? 'rgba(255,255,255,0.35)' : T.border }]} />
+                  <Text numberOfLines={1} style={[styles.customGroupLabel, {
+                    color: active ? readableOn(draft.accent) : T.textSub,
+                    fontFamily: jks(active ? '700' : '500'),
+                  }]}>
+                    {WIDGET_COLOR_LABELS[group]}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+          <View style={{ paddingHorizontal: 16, marginTop: 14, marginBottom: 16 }}>
+            <HSBSliders color={draft[activeGroup]} onChangeRef={onChangeRef} accent={draft.accent} />
+          </View>
+          <View style={[styles.sheetActions, { marginHorizontal: 16, marginBottom: 24 }]}>
+            <TouchableOpacity onPress={onClose} style={[styles.sheetCancelBtn, { borderColor: T.borderMid }]}>
+              <Text style={[styles.sheetCancelLabel, { color: T.textSub, fontFamily: jks('500') }]}>Cancel</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={save} style={[styles.sheetSaveBtn, { backgroundColor: draft.accent }]}>
+              <Text style={[styles.sheetSaveLabel, { color: readableOn(draft.accent), fontFamily: jks('700') }]}>Save colors</Text>
+            </TouchableOpacity>
+          </View>
+        </ScrollView>
+      </Animated.View>
+    </Modal>
+  );
+}
+
+function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personalContext, setPersonalContext, autoClear, setAutoClear, darkMode, setDarkMode, accentLight, accentDark, setAccentLight, setAccentDark, themeId, setThemeId, widgetThemeId, setWidgetThemeId, widgetClear, setWidgetClear, widgetShorthand, setWidgetShorthand, widgetCustomColors, setWidgetCustomColors, widgetMicSide, setWidgetMicSide, customThemeDrafts, setCustomThemeDrafts, onClearArchive, onReplayOnboarding, calendarConflictsEnabled, setCalendarConflictsEnabled, onRequestCalendarConflictAccess }: SettingsProps) {
   const T = useT();
   const insets = useSafeAreaInsets();
   const isPaid = useIsPaid();
@@ -9707,6 +10023,7 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
   const [showUpsell, setShowUpsell] = useState(false);
   const [showDonate, setShowDonate] = useState(false);
   const [editingCustomSlot, setEditingCustomSlot] = useState<number | null>(null);
+  const [showWidgetColorSheet, setShowWidgetColorSheet] = useState(false);
   const [settingsToast, setSettingsToast] = useState<string | null>(null);
   const settingsToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settingsScrollRef = useRef<ScrollView | null>(null);
@@ -10030,8 +10347,44 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
                 </TouchableOpacity>
               );
             })}
+            <TouchableOpacity
+              activeOpacity={0.85}
+              onPress={() => { setWidgetThemeId(WIDGET_THEME_CUSTOM); setShowWidgetColorSheet(true); }}
+              style={[styles.previewCard, { backgroundColor: T.s1, borderColor: widgetThemeId === WIDGET_THEME_CUSTOM ? T.text : T.borderMid, borderWidth: widgetThemeId === WIDGET_THEME_CUSTOM ? 2 : 1 }]}
+            >
+              <View style={{ minHeight: 106, borderRadius: 8, borderWidth: 1, borderColor: `${widgetCustomColors.accent}66`, backgroundColor: widgetClear ? T.bg : T.s2, padding: 10, justifyContent: 'center', gap: 9 }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 9 }}>
+                  <View style={{ width: 34, height: 46, alignItems: 'center', justifyContent: 'center' }}>
+                    <Feather name="mic" size={20} color={widgetCustomColors.text} />
+                    <Ionicons name="sparkles" size={10} color={widgetCustomColors.accent} style={{ position: 'absolute', top: 6, right: 4 }} />
+                  </View>
+                  <View style={{ flex: 1, gap: 5 }}>
+                    <View style={{ width: '90%', height: 7, borderRadius: 4, backgroundColor: widgetCustomColors.text }} />
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+                      <View style={{ width: 40, height: 5, borderRadius: 3, backgroundColor: widgetCustomColors.accent }} />
+                      <View style={{ width: 32, height: 5, borderRadius: 3, backgroundColor: widgetCustomColors.accent, opacity: 0.75 }} />
+                    </View>
+                  </View>
+                </View>
+              </View>
+              <View style={styles.previewCardFooter}>
+                <View style={[styles.previewAccentSwatch, { backgroundColor: widgetCustomColors.text }]} />
+                <View style={[styles.previewAccentSwatch, { backgroundColor: widgetCustomColors.accent }]} />
+                <Text numberOfLines={1} style={[styles.previewCardName, { color: T.text, fontFamily: jks('700') }]}>Custom</Text>
+              </View>
+            </TouchableOpacity>
           </View>
           </ScrollableCardBox>
+          <View style={styles.widgetToggleRow}>
+            <View style={styles.widgetToggleItem}>
+              <Text numberOfLines={2} style={[styles.widgetToggleLabel, { color: T.textSub, fontFamily: jks('600'), flex: 1 }]}>Clear surfaces</Text>
+              <Toggle value={widgetClear} onChange={setWidgetClear} accent={accent} />
+            </View>
+            <View style={styles.widgetToggleItem}>
+              <Text numberOfLines={2} style={[styles.widgetToggleLabel, { color: T.textSub, fontFamily: jks('600'), flex: 1 }]}>Short task text</Text>
+              <Toggle value={widgetShorthand} onChange={setWidgetShorthand} accent={accent} />
+            </View>
+          </View>
           <Text style={[styles.settingRowSub, { color: T.textSub, fontFamily: jks('600'), marginTop: 14, marginBottom: 8 }]}>Mic button side</Text>
           <View style={{ flexDirection: 'row', gap: 8 }}>
             {(['left', 'right'] as WidgetMicSide[]).map((side) => {
@@ -10129,6 +10482,17 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
     {settingsToast && <View style={[styles.toastContainer, { pointerEvents: 'none' }]}><Toast message={settingsToast} /></View>}
     {showUpsell && <ProUpsellSheet accentColor={accent} onClose={() => setShowUpsell(false)} showToast={showSettingsToast} />}
     {showDonate && <DonateSheet accentColor={accent} onClose={() => setShowDonate(false)} />}
+    {showWidgetColorSheet && (
+      <WidgetColorSheet
+        initialColors={widgetCustomColors}
+        clear={widgetClear}
+        onSave={(colors) => {
+          setWidgetCustomColors(colors);
+          setWidgetThemeId(WIDGET_THEME_CUSTOM);
+        }}
+        onClose={() => setShowWidgetColorSheet(false)}
+      />
+    )}
     {editingCustomSlot !== null && (
       <CustomThemeSheet
         initialDraft={customThemeDrafts[editingCustomSlot] ?? DEFAULT_CUSTOM_THEME_DRAFT}
@@ -10540,10 +10904,11 @@ interface StandaloneGroceryProps {
   hasApiKey: boolean;
   accentColor: string;
   defaultTier: Tier;
+  widgetShorthand: boolean;
   lists: TaskList[];
   activeListId: string;
-  onAddMany: (items: { text: string; tier: Tier; reminder?: Reminder }[]) => AddTaskDraftResult;
-  onAddManyToList: (listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => AddTaskDraftResult;
+  onAddMany: (items: TaskDraft[]) => AddTaskDraftResult;
+  onAddManyToList: (listId: string, items: TaskDraft[]) => AddTaskDraftResult;
   groupCollapseScope: string;
   collapsedGroups: CollapsedGroups;
   setCollapsedGroup: (key: string, collapsed: boolean) => void;
@@ -10557,7 +10922,7 @@ function StandaloneGrocery({
   onClearCheckedGrocery, onClearAllGrocery, onAiSortGrocery,
   sharedGrocery,
   onShareGrocery, onRotateGroceryShareCode, onMakePrivateSharedGrocery, onLeaveSharedGrocery, onDeleteSharedGrocery,
-  hasApiKey, accentColor, defaultTier, lists, activeListId,
+  hasApiKey, accentColor, defaultTier, widgetShorthand, lists, activeListId,
   onAddMany, onAddManyToList,
   groupCollapseScope, collapsedGroups, setCollapsedGroup,
   focusedGroceryId: externalFocusedGroceryId,
@@ -10743,6 +11108,7 @@ function StandaloneGrocery({
         groceryMode={true}
         lists={lists}
         activeListId={activeListId}
+        widgetShorthand={widgetShorthand}
       />
       {toast && <View style={styles.toastContainer} pointerEvents="none"><Toast message={toast.message} sub={toast.sub} /></View>}
       {confirmNode}
@@ -10852,6 +11218,9 @@ function TriorityApp() {
   const [accentDark, setAccentDarkState] = useState<string | null>(null);
   const [themeId, setThemeIdState] = useState<string>('slate');
   const [widgetThemeId, setWidgetThemeIdState] = useState<WidgetThemeId>(WIDGET_THEME_MATCH_APP);
+  const [widgetClear, setWidgetClearState] = useState(false);
+  const [widgetShorthand, setWidgetShorthandState] = useState(true);
+  const [widgetCustomColors, setWidgetCustomColorsState] = useState<WidgetCustomColors>(DEFAULT_WIDGET_CUSTOM_COLORS);
   const [widgetMicSide, setWidgetMicSideState] = useState<WidgetMicSide>('left');
   const [customThemeDrafts, setCustomThemeDraftsState] = useState<(CustomThemeDraft | null)[]>([null, null, null]);
   const [apiKey, setApiKeyState] = useState('');
@@ -11005,6 +11374,9 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
       setAccentDarkState(data.accentDark);
       setThemeIdState(data.themeId);
       setWidgetThemeIdState(data.widgetThemeId);
+      setWidgetClearState(data.widgetClear);
+      setWidgetShorthandState(data.widgetShorthand);
+      setWidgetCustomColorsState(data.widgetCustomColors);
       setWidgetMicSideState(data.widgetMicSide);
       setCustomThemeDraftsState(data.customThemeDrafts);
       setHasApiKey(isValidKey(data.apiKey));
@@ -11502,10 +11874,10 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
     });
   }, []);
 
-  const addManyToActiveList = useCallback((items: { text: string; tier: Tier; reminder?: Reminder }[]) => {
+  const addManyToActiveList = useCallback((items: TaskDraft[]) => {
     const now = Date.now();
     const newTasks: Task[] = items.map((item, i) => ({
-      id: now + i, text: item.text, tier: item.tier, createdAt: now + i, reminder: item.reminder,
+      id: now + i, text: item.text, widgetLabel: item.widgetLabel, tier: item.tier, createdAt: now + i, reminder: item.reminder,
     }));
     setTasks(ts => [...ts, ...newTasks]);
     // No toast renderer at TriorityApp scope; missing-perm path still redirects to system settings.
@@ -11513,10 +11885,10 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
     return newTasks.map((task) => task.id);
   }, [activeListId, setTasks]);
 
-  const addManyToList = useCallback((listId: string, items: { text: string; tier: Tier; reminder?: Reminder }[]) => {
+  const addManyToList = useCallback((listId: string, items: TaskDraft[]) => {
     const now = Date.now();
     const newTasks: Task[] = items.map((item, i) => ({
-      id: now + i, text: item.text, tier: item.tier, createdAt: now + i, reminder: item.reminder,
+      id: now + i, text: item.text, widgetLabel: item.widgetLabel, tier: item.tier, createdAt: now + i, reminder: item.reminder,
     }));
     setListTasks(listId, ts => [...ts, ...newTasks]);
     scheduleRemindersBatch(newTasks, () => {}, listId);
@@ -11582,9 +11954,21 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
   };
   const setThemeId = (v: string) => { setThemeIdState(v); AsyncStorage.setItem('tri_theme', JSON.stringify(v)).catch(() => {}); };
   const setWidgetThemeId = (v: WidgetThemeId) => {
-    const next = v === WIDGET_THEME_MATCH_APP ? WIDGET_THEME_MATCH_APP : resolveThemeId(v);
+    const next = v === WIDGET_THEME_MATCH_APP || v === WIDGET_THEME_CUSTOM ? v : resolveThemeId(v);
     setWidgetThemeIdState(next);
     AsyncStorage.setItem(WIDGET_THEME_KEY, JSON.stringify(next)).catch(() => {});
+  };
+  const setWidgetClear = (v: boolean) => {
+    setWidgetClearState(v);
+    AsyncStorage.setItem(WIDGET_CLEAR_KEY, v ? '1' : '0').catch(() => {});
+  };
+  const setWidgetShorthand = (v: boolean) => {
+    setWidgetShorthandState(v);
+    AsyncStorage.setItem(WIDGET_SHORTHAND_KEY, v ? '1' : '0').catch(() => {});
+  };
+  const setWidgetCustomColors = (v: WidgetCustomColors) => {
+    setWidgetCustomColorsState(v);
+    AsyncStorage.setItem(WIDGET_CUSTOM_COLORS_KEY, JSON.stringify(v)).catch(() => {});
   };
   const setWidgetMicSide = (v: WidgetMicSide) => {
     const next = v === 'right' ? 'right' : 'left';
@@ -11614,14 +11998,16 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
     : (darkMode
       ? (accentDark ?? themeDef.defaultAccentDark)
       : (accentLight ?? themeDef.defaultAccentLight));
-  const widgetThemeDef = widgetThemeId === WIDGET_THEME_MATCH_APP ? null : getTheme(widgetThemeId);
+  const widgetIsCustom = widgetThemeId === WIDGET_THEME_CUSTOM;
+  const widgetThemeDef = widgetThemeId === WIDGET_THEME_MATCH_APP || widgetIsCustom ? null : getTheme(widgetThemeId);
   const widgetT = widgetThemeDef ? (darkMode ? widgetThemeDef.dark : widgetThemeDef.light) : T;
   const widgetAccentColor = widgetThemeDef
     ? (darkMode ? widgetThemeDef.defaultAccentDark : widgetThemeDef.defaultAccentLight)
-    : accentColor;
+    : widgetIsCustom ? widgetCustomColors.accent : accentColor;
+  const widgetTextColor = widgetIsCustom ? widgetCustomColors.text : widgetT.text;
   const widgetControlColor = widgetThemeColor(widgetT.s2, widgetT.bg);
   const widgetSurfaceColor = widgetThemeColor(widgetT.s2, widgetT.bg);
-  const widgetTextSubColor = widgetThemeColor(widgetT.textSub, widgetT.bg);
+  const widgetTextSubColor = widgetIsCustom ? widgetCustomColors.accent : widgetThemeColor(widgetT.textSub, widgetT.bg);
   // ─── Shared lists adapter (step 11b.3) ─────────────────────────────────
   // Merge private lists with the user's joined shared task lists into one
   // pill-row view. Shared lists adapt into TaskList shape on the fly using
@@ -11661,6 +12047,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
         return {
           id: it.id,
           text: it.text || '',
+          widgetLabel: it.widgetLabel,
           tier: it.tier || 'medium',
           createdAt: it.createdAt || 0,
           reminder: it.reminder || undefined,
@@ -11911,7 +12298,9 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
 
     mergedLists.forEach((list, index) => {
       list.tasks.forEach((task) => {
-        const label = normalizeLabel(task.text);
+        const label = normalizeLabel(widgetShorthand
+          ? widgetDisplayLabel(task)
+          : task.text);
         if (!label) return;
         const listOrder = listIndex.get(list.id) ?? index;
         const tierOrder = TIER_ORDER[task.tier] ?? 1;
@@ -11920,7 +12309,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
           const r = task.reminder;
           const repeatNext = nextReminderOccurrenceAt(r, now);
           const sortAt = (!r.repeatHourly && !r.repeatDaily && r.remindAt < now) ? r.remindAt : (repeatNext ?? r.remindAt);
-          const reminderText = formatReminderTime(sortAt);
+          const reminderText = formatWidgetReminderTime(sortAt);
           reminderRows.push({
             item: {
               listId: list.id,
@@ -11972,7 +12361,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
       ...reminderRows.map(row => row.item),
       ...taskRows.map(row => row.item),
     ].slice(0, 8);
-  }, [mergedLists, widgetT.high, widgetT.med, widgetT.low]);
+  }, [mergedLists, widgetShorthand, widgetT.high, widgetT.med, widgetT.low]);
   const widgetNextUpJson = useMemo(() => JSON.stringify(widgetNextUpItems), [widgetNextUpItems]);
 
   useEffect(() => {
@@ -11983,8 +12372,9 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
         surface: widgetSurfaceColor,
         control: widgetControlColor,
         accent: widgetAccentColor,
-        text: widgetT.text,
+        text: widgetTextColor,
         textSub: widgetTextSubColor,
+        clear: widgetClear,
         activeListName: activeList?.name || DEFAULT_LIST_NAME,
         activeListId,
         hasApiKey,
@@ -11992,7 +12382,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
         micSide: widgetMicSide,
       });
     } catch {}
-  }, [ready, widgetT.bg, widgetT.text, widgetAccentColor, widgetSurfaceColor, widgetControlColor, widgetTextSubColor, activeList?.name, activeListId, hasApiKey, widgetNextUpJson, widgetMicSide]);
+  }, [ready, widgetT.bg, widgetTextColor, widgetAccentColor, widgetSurfaceColor, widgetControlColor, widgetTextSubColor, widgetClear, activeList?.name, activeListId, hasApiKey, widgetNextUpJson, widgetMicSide]);
 
   useEffect(() => {
     if (!ready || !pendingReminderNav) return;
@@ -12155,6 +12545,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
                 hasApiKey,
                 personalContext,
                 isPaid,
+                widgetShorthand,
               })
             : { listId: preferredListId, tasks: [{ text, tier }], grocery: [] };
 
@@ -12229,6 +12620,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
     ready,
     setActiveListId,
     sharedTaskIdSet,
+    widgetShorthand,
   ]);
 
   const checkGroceryForScreen = useCallback((id: string) => {
@@ -12315,7 +12707,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
         <PortalHost>
           <BackButtonManager screen={screen} setScreen={setScreen} />
           <View style={{ flex: 1, overflow: 'hidden' }}>
-            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} onGroceryOnlyAdded={(ids) => { if (ids[0]) armFocusedGrocery(ids[0]); setScreen('grocery'); }} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} focusedTaskNonce={focusedTaskNonce} onFocusedTaskSeen={markFocusedTaskSeen} calendarConflictKeys={calendarConflictKeys} calendarConflictNotice={calendarConflictNotice} />}
+            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} widgetShorthand={widgetShorthand} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} onGroceryOnlyAdded={(ids) => { if (ids[0]) armFocusedGrocery(ids[0]); setScreen('grocery'); }} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} focusedTaskNonce={focusedTaskNonce} onFocusedTaskSeen={markFocusedTaskSeen} calendarConflictKeys={calendarConflictKeys} calendarConflictNotice={calendarConflictNotice} />}
             {screen === 'grocery' && (
               <StandaloneGrocery
                 groceryItems={groceryItemsForScreen}
@@ -12359,6 +12751,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
                 hasApiKey={hasApiKey}
                 accentColor={accentColor}
                 defaultTier={defaultTier}
+                widgetShorthand={widgetShorthand}
                 lists={lists}
                 activeListId={activeListId}
                 onAddMany={addManyToActiveList}
@@ -12380,6 +12773,9 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
                 accentLight={accentLight} accentDark={accentDark} setAccentLight={setAccentLight} setAccentDark={setAccentDark}
                 themeId={themeId} setThemeId={setThemeId}
                 widgetThemeId={widgetThemeId} setWidgetThemeId={setWidgetThemeId}
+                widgetClear={widgetClear} setWidgetClear={setWidgetClear}
+                widgetShorthand={widgetShorthand} setWidgetShorthand={setWidgetShorthand}
+                widgetCustomColors={widgetCustomColors} setWidgetCustomColors={setWidgetCustomColors}
                 widgetMicSide={widgetMicSide} setWidgetMicSide={setWidgetMicSide}
                 customThemeDrafts={customThemeDrafts} setCustomThemeDrafts={setCustomThemeDrafts}
                 onClearArchive={() => setArchive(() => [])} onReplayOnboarding={replayOnboarding}
@@ -12488,7 +12884,7 @@ const styles = StyleSheet.create({
 
   inputBar: { borderTopWidth: 1, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 12 },
   inputBarTopRow: { flexDirection: 'row', gap: 6, marginBottom: 10 },
-  inputTopBtn: { flex: 1, height: 34, borderRadius: 8, borderWidth: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 },
+  inputTopBtn: { flex: 1, height: 34, borderRadius: 8, borderWidth: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, transform: [{ translateY: 2 }] },
   aiOnLabel: { fontSize: 10 },
   inputBarBottomRow: { flexDirection: 'row', gap: 8, alignItems: 'center' },
   taskInput: { flex: 1, height: 36, borderRadius: 8, borderWidth: 1, paddingHorizontal: 12, paddingVertical: 0, fontSize: 14, includeFontPadding: false },
@@ -12636,6 +13032,9 @@ const styles = StyleSheet.create({
   settingRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 16, paddingVertical: 14 },
   settingRowLabel: { fontSize: 14 },
   settingRowSub: { fontSize: 12, marginTop: 2 },
+  widgetToggleRow: { flexDirection: 'row', alignItems: 'center', gap: 14, marginTop: 14 },
+  widgetToggleItem: { flex: 1, minWidth: 0, minHeight: 32, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+  widgetToggleLabel: { fontSize: 12, lineHeight: 16, marginTop: 0, includeFontPadding: false },
   toggle: { width: 44, height: 26, borderRadius: 13, borderWidth: 1, position: 'relative' },
   toggleKnob: { position: 'absolute', top: 2, width: 20, height: 20, borderRadius: 10 },
   appearanceLabelRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 },

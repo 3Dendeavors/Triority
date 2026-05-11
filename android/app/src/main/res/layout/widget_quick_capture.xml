@@ -56,7 +56,7 @@
             android:layout_gravity="start|center_vertical"
             android:clickable="true"
             android:focusable="true"
-            android:minWidth="120dp"
+            android:minWidth="58dp"
             android:visibility="gone">
 
             <ImageView
@@ -130,9 +130,11 @@
                         android:id="@+id/widget_preview_priority"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
+                        android:ellipsize="end"
                         android:fontFamily="sans"
                         android:includeFontPadding="false"
                         android:maxLines="1"
+                        android:maxWidth="82dp"
                         android:text=""
                         android:textSize="11.5sp"
                         android:textStyle="bold" />
