@@ -40,6 +40,7 @@ android/keystore.properties
 revenuecat-*.json
 promotion_codes.csv
 github-recovery-codes.txt
+CLI token github.txt
 
 # node.js
 #

@@ -1,8 +1,8 @@
 {
-  "versionName": "1.4.7",
-  "versionCode": 23,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.7/Triority-v1.4.7.apk",
-  "releaseNotes": "AI reliability fixes plus new voice-first Android widgets, next-up previews, widget appearance controls, safer default AI list routing, and task-focus fixes.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.7",
+  "versionName": "1.4.8",
+  "versionCode": 24,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.8/Triority-v1.4.8.apk",
+  "releaseNotes": "Widget polish and reminder stability: compact Next Up controls, clearer task-open taps, improved short widget text, compact review actions, and a reminder edit persistence fix.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.8",
   "required": false
 }
