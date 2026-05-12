@@ -1,8 +1,8 @@
 {
-  "versionName": "1.4.8",
-  "versionCode": 24,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.8/Triority-v1.4.8.apk",
-  "releaseNotes": "Widget polish and reminder stability: compact Next Up controls, clearer task-open taps, improved short widget text, compact review actions, and a reminder edit persistence fix.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.8",
+  "versionName": "1.4.9",
+  "versionCode": 25,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.9/Triority-v1.4.9.apk",
+  "releaseNotes": "AI reliability and task-handling update: public AI choices are now Gemini 2.5 Flash-Lite or Claude Sonnet; mixed task/grocery routing is stronger; generated routines, grocery amounts/package hints, recipe fractions, new-row focus, task drag/drop, widget import, and provider error messages are polished.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.9",
   "required": false
 }
