@@ -99,6 +99,7 @@ interface Reminder {
 }
 
 type TaskDraft = { text: string; tier: Tier; reminder?: Reminder; widgetLabel?: string };
+type AddTaskOptions = { focus?: boolean };
 type AddTaskDraftResult = TaskId[] | void | Promise<TaskId[] | void>;
 type AddGroceryDraftResult = string[] | void | Promise<string[] | void>;
 type WidgetCaptureMode = 'manual' | 'ai' | 'voice';
@@ -129,6 +130,7 @@ interface WidgetNextUpItem {
 type WidgetAiCaptureDraft = {
   listId: string | null;
   tasks: TaskDraft[];
+  taskGroups?: { listId: string | null; tasks: TaskDraft[] }[];
   grocery: GroceryDraft[];
 };
 
@@ -218,10 +220,82 @@ function cleanOptionalGroceryPart(value: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+const COMMON_GROCERY_FRACTIONS: Array<[number, string]> = [
+  [1 / 8, '1/8'],
+  [1 / 6, '1/6'],
+  [1 / 4, '1/4'],
+  [1 / 3, '1/3'],
+  [3 / 8, '3/8'],
+  [1 / 2, '1/2'],
+  [5 / 8, '5/8'],
+  [2 / 3, '2/3'],
+  [3 / 4, '3/4'],
+  [7 / 8, '7/8'],
+];
+const GROCERY_DECIMAL_QUANTITY_RE = /(^|[^0-9A-Za-z.])(-?(?:\d+\.\d+|\.\d+))(?=$|[^0-9A-Za-z.])/g;
+
+function decimalGroceryAmountToFraction(amountText: string) {
+  const amount = Number(amountText.startsWith('.') ? `0${amountText}` : amountText);
+  if (!Number.isFinite(amount)) return amountText;
+  const sign = amount < 0 ? '-' : '';
+  const absAmount = Math.abs(amount);
+  const whole = Math.floor(absAmount);
+  const fraction = absAmount - whole;
+  if (fraction < 0.005) return `${sign}${whole}`;
+  const closest = COMMON_GROCERY_FRACTIONS.reduce((best, current) => {
+    const diff = Math.abs(fraction - current[0]);
+    return diff < best.diff ? { value: current[0], label: current[1], diff } : best;
+  }, { value: 0, label: '', diff: Number.POSITIVE_INFINITY });
+  if (!closest.label || closest.diff > 0.015) return amountText;
+  return `${sign}${whole > 0 ? `${whole} ` : ''}${closest.label}`;
+}
+
+function formatGroceryQuantityText(value: unknown): string | undefined {
+  const cleaned = cleanOptionalGroceryPart(value);
+  if (!cleaned) return undefined;
+  return cleaned.replace(
+    GROCERY_DECIMAL_QUANTITY_RE,
+    (_match, prefix: string, amount: string) => `${prefix}${decimalGroceryAmountToFraction(amount)}`,
+  );
+}
+
+function normalizePackageSizeText(value: string) {
+  return value
+    .replace(/\s+/g, ' ')
+    .replace(/\b(\d+(?:\.\d+)?)\s*(fl\s*oz|floz|oz|ounce|ounces|lb|lbs|pound|pounds|g|gram|grams|kg|ml|l|liter|liters|gallon|gallons|quart|quarts|qt|pt|pint|pints)\b/gi, (_match, amount, unit) => {
+      const normalizedUnit = String(unit)
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .replace(/^floz$/u, 'fl oz')
+        .replace(/^ounces?$/u, 'oz')
+        .replace(/^pounds?$/u, 'lb')
+        .replace(/^grams?$/u, 'g')
+        .replace(/^liters?$/u, 'l')
+        .replace(/^gallons?$/u, 'gallon')
+        .replace(/^quarts?$/u, 'qt')
+        .replace(/^pints?$/u, 'pt');
+      return `${amount} ${normalizedUnit}`;
+    })
+    .trim();
+}
+
 function cleanPackageSize(value: unknown): string | undefined {
   const cleaned = cleanOptionalGroceryPart(value);
   if (!cleaned) return undefined;
-  return cleaned.replace(/^\((.*)\)$/u, '$1').trim() || undefined;
+  const unwrapped = normalizePackageSizeText(cleaned.replace(/^\((.*)\)$/u, '$1').trim())
+    .replace(/\bassorted\s+assortment\b/iu, 'assorted');
+  if (/^\d+(\.\d+)?$/u.test(unwrapped)) return undefined;
+  return unwrapped || undefined;
+}
+
+function cleanGroceryUnit(value: unknown, packageSize?: string): string | undefined {
+  const cleaned = cleanOptionalGroceryPart(value);
+  if (!cleaned) return undefined;
+  const normalized = cleaned.toLowerCase();
+  if (packageSize && normalized === packageSize.toLowerCase()) return undefined;
+  if (packageSize && /\d/.test(normalized) && /\b(package|container|bottle|jar|bag|box|can|head|bunch|pack)\b/i.test(cleaned)) return undefined;
+  if (packageSize && /^(small|medium|large)\s+(package|container|bottle|jar|bag|box|can|head|bunch|pack)$/i.test(cleaned)) return undefined;
+  return cleaned;
 }
 
 function splitPackageHintFromName(name: string) {
@@ -233,7 +307,7 @@ function splitPackageHintFromName(name: string) {
 function groceryDisplayParts(item: { name?: string; quantity?: string; unit?: string; packageSize?: string }) {
   const split = splitPackageHintFromName(String(item.name || ''));
   const name = split.name;
-  const quantity = cleanOptionalGroceryPart(item.quantity);
+  const quantity = formatGroceryQuantityText(item.quantity);
   const unit = cleanOptionalGroceryPart(item.unit);
   const packageSize = cleanPackageSize(item.packageSize) || split.packageSize;
   const prefix = [quantity, unit].filter(Boolean).join(' ');
@@ -253,7 +327,9 @@ function groceryStorageName(item: { name?: string; quantity?: string; unit?: str
 }
 
 function shouldInferGroceryQuantities(input: string) {
-  return /\b(recipe|ingredients?|bake|cook|meal prep|materials?|bill of materials|bom|project|build|repair|supplies for|shopping list for|list for|make a|make an)\b/i.test(input);
+  return /\b(recipe|ingredients?|bake|cook|meal prep|materials?|equipment|accessories|gear|tools?|bill of materials|bom|project|build|repair|supplies for|shopping list for|list for|to buy|buying|purchase|make a|make an)\b/i.test(input)
+    || /\b(smoothie|meal|dinner|lunch|breakfast|recipe|project|repair|packing|trip|paint|painting|phone|desk|sink|faucet)\b.{0,28}\b(stuff|junk|crap|things)\b/i.test(input)
+    || /\b(stuff|junk|crap|things)\b.{0,28}\b(for|to make|to build|to buy|to purchase|to fix|needed for|for making|for a|for an)\b/i.test(input);
 }
 
 function asksForExactIngredientsOnly(input: string) {
@@ -283,7 +359,29 @@ function inputMentionsQuantityForItem(input: string, itemName: string) {
   const idx = raw.indexOf(anchor);
   if (idx < 0) return false;
   const near = raw.slice(Math.max(0, idx - 32), Math.min(raw.length, idx + anchor.length + 32));
-  return /(\d+(\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|dozen|half|quarter)\s*(ct|count|pack|packs|box|boxes|bag|bags|loaf|loaves|dozen|gal|gallon|gallons|qt|quart|oz|ounce|ounces|lb|lbs|pound|pounds|cup|cups|tbsp|tsp|stick|sticks)?\b/i.test(near);
+  return /(\d+(\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|dozen|half|quarter)\s*(ct|count|pack|packs|box|boxes|bag|bags|loaf|loaves|dozen|gal|gallon|gallons|qt|quart|oz|ounce|ounces|lb|lbs|pound|pounds|cup|cups|tbsp|tsp|scoop|scoops|clove|cloves|sheet|sheets|screw|screws|ft|feet|foot|inch|inches|piece|pieces|bunch|head|stick|sticks|bottle|bottles|jar|jars|carton|cartons|tub|tubs|container|containers|can|cans)?\b/i.test(near);
+}
+
+function groceryQuantityIsBareOne(value?: string) {
+  return /^(1|one)$/i.test(String(value || '').trim());
+}
+
+const GROCERY_PACKAGE_CONTAINER_UNIT_RE = /^(bag|bags|box|boxes|carton|cartons|tub|tubs|container|containers|package|packages|pack|packs|jar|jars|bottle|bottles|pouch|pouches)$/i;
+
+function groceryQuantityInstruction(inferGroceryQuantities: boolean) {
+  return inferGroceryQuantities
+    ? [
+      'Use quantity + unit for the amount needed/used for the recipe, project, plan, or supply list; this is shown before the item name.',
+      'Use packageSize only for the smallest common purchasable package/container hint; this is shown on the right in parentheses.',
+      'For generated grocery/material rows, include packageSize whenever the item has a normal retail size; most generated rows should have one.',
+      'For generated recipe, meal, smoothie, or ingredient rows, include quantity + unit for most rows whenever a practical starter amount is possible.',
+      'Prefer simple fraction text like "1/2", "1/4", or "1 1/2" instead of decimals for cooking or recipe quantities.',
+      'Keep name as the item only. Do not repeat quantity, unit, or packageSize in name.',
+      'Do not use bare quantity "1" with an empty unit for generated rows. If the needed amount is unknown, omit quantity/unit instead of guessing.',
+      'Use recipe/project units like cups, tbsp, scoops, cloves, sheets, screws, or feet. Do not use bag/tub/carton/package as unit unless the needed amount is truly that whole container.',
+      'packageSize should be buyable text like "10 oz bag", "32 oz tub", "2 lb tub", "14 oz can", "25-count pack", or "1 small bottle", not a bare number.',
+    ].join(' ')
+    : 'Use quantity/unit only when the user wrote the amount; do not infer amounts for simple lists. Keep any packageSize as a buyable package hint, not a needed amount.';
 }
 
 function canonicalGroceryCategory(value: unknown) {
@@ -293,24 +391,46 @@ function canonicalGroceryCategory(value: unknown) {
   return match ?? GROCERY_UNCATEGORIZED;
 }
 
+function cleanGroceryNameText(value: string, stripBalancedNote = false) {
+  const withoutDangling = value.trim().replace(/\s*\([^)]*$/u, '').trim();
+  const withoutBalanced = stripBalancedNote
+    ? withoutDangling.replace(/\s*\([^()]{2,80}\)\s*$/u, '').trim()
+    : withoutDangling;
+  return withoutBalanced || withoutDangling;
+}
+
 function groceryNameFromAiItem(item: any) {
-  if (typeof item === 'string') return item.trim();
+  if (typeof item === 'string') return cleanGroceryNameText(item);
   if (!item || typeof item !== 'object') return '';
   const value = item.name ?? item.item ?? item.ingredient ?? item.title ?? item.text ?? item.food;
-  return typeof value === 'string' ? value.trim() : '';
+  return typeof value === 'string' ? cleanGroceryNameText(value) : '';
 }
 
 function normalizeGroceryDraft(item: any, input = '', allowInferredQuantity = true): GroceryDraft | null {
-  const name = groceryNameFromAiItem(item);
+  let name = groceryNameFromAiItem(item);
   if (!name) return null;
   const category = canonicalGroceryCategory(item?.category ?? item?.aisle ?? item?.section);
-  const keepQuantity = allowInferredQuantity || inputMentionsQuantityForItem(input, name);
+  const userMentionedQuantity = inputMentionsQuantityForItem(input, name);
+  const keepQuantity = allowInferredQuantity || userMentionedQuantity;
+  let packageSize = keepQuantity ? cleanPackageSize(item.packageSize ?? item.purchaseSize ?? item.package ?? item.purchaseHint) : undefined;
+  if (packageSize) name = cleanGroceryNameText(name, true);
+  let unit = keepQuantity ? cleanGroceryUnit(item.unit, packageSize) : undefined;
+  let quantity = keepQuantity ? formatGroceryQuantityText(item.quantity) : undefined;
+  const generatedQuantity = allowInferredQuantity && !userMentionedQuantity;
+  if (generatedQuantity && groceryQuantityIsBareOne(quantity) && unit && GROCERY_PACKAGE_CONTAINER_UNIT_RE.test(unit)) {
+    packageSize = packageSize || normalizePackageSizeText(`${quantity} ${unit}`);
+    quantity = undefined;
+    unit = undefined;
+  }
+  if (generatedQuantity && groceryQuantityIsBareOne(quantity) && !unit) {
+    quantity = undefined;
+  }
   return stripUndefined({
     name,
     category,
-    quantity: keepQuantity ? cleanOptionalGroceryPart(item.quantity) : undefined,
-    unit: keepQuantity ? cleanOptionalGroceryPart(item.unit) : undefined,
-    packageSize: keepQuantity ? cleanPackageSize(item.packageSize ?? item.purchaseSize ?? item.package ?? item.purchaseHint) : undefined,
+    quantity,
+    unit,
+    packageSize,
   });
 }
 
@@ -320,10 +440,876 @@ function normalizeGroceryDraft(item: any, input = '', allowInferredQuantity = tr
 // members editing different items never collide. See HANDOFF.md for the full
 // design.
 
+const VEGAN_COMPATIBLE_GROCERY_RE = /\b(vegan|plant[-\s]?based|meatless|dairy[-\s]?free|non[-\s]?dairy|egg[-\s]?free|tofu|tempeh|seitan|soy curls?|soy|beyond|impossible|jackfruit|lentils?|beans?|chickpeas?|oat|almond|coconut|cashew|peanut|nutritional yeast)\b/i;
+const MEAT_GROCERY_RE = /\b(beef|pork|chicken|turkey|lamb|veal|duck|fish|salmon|tuna|shrimp|seafood|meat|bacon|sausage|ham|steak|prosciutto|pepperoni|anchov(y|ies)|gelatin|lard|bone broth|chicken broth|beef broth|stock)\b/i;
+const ANIMAL_PRODUCT_GROCERY_RE = /\b(beef|pork|chicken|turkey|lamb|veal|duck|fish|salmon|tuna|shrimp|seafood|meat|bacon|sausage|ham|steak|prosciutto|pepperoni|anchov(y|ies)|gelatin|lard|bone broth|chicken broth|beef broth|stock|yogurt|milk|cheese|butter|cream|egg|eggs|honey|mayo|mayonnaise|whey|casein)\b/i;
+
+function contextSaysVegan(personalContext: string) {
+  return /\b(vegan|no animal products?|plant[-\s]?based)\b/i.test(personalContext);
+}
+
+function contextSaysNoMeat(personalContext: string) {
+  return contextSaysVegan(personalContext)
+    || /\b(no|dont|don't|do not|hate|avoid|without)\b.{0,40}\b(meat|seafood|fish|chicken|beef|pork|turkey|lamb)\b/i.test(personalContext)
+    || /\b(meat|seafood|fish|chicken|beef|pork|turkey|lamb)\b.{0,40}\b(no|dont|don't|do not|hate|avoid)\b/i.test(personalContext);
+}
+
+function groceryDraftAllowedByPersonalContext(item: GroceryDraft, personalContext: string) {
+  if (!personalContext.trim()) return true;
+  const haystack = `${item.name || ''} ${item.packageSize || ''} ${item.unit || ''}`.trim();
+  if (!haystack) return true;
+  const compatible = VEGAN_COMPATIBLE_GROCERY_RE.test(haystack);
+  const category = String(item.category || '').toLowerCase();
+  if (contextSaysVegan(personalContext)) {
+    if (!compatible && ANIMAL_PRODUCT_GROCERY_RE.test(haystack)) return false;
+    if (!compatible && category.includes('meat')) return false;
+  } else if (contextSaysNoMeat(personalContext)) {
+    if (!compatible && MEAT_GROCERY_RE.test(haystack)) return false;
+    if (!compatible && category.includes('meat')) return false;
+  }
+  return true;
+}
+
+function groceryPersonalContextInstruction(personalContext: string) {
+  const compact = compactPersonalContextForAi(personalContext);
+  if (!compact) return 'GROCERY PERSONAL CONTEXT: ""';
+  return `GROCERY PERSONAL CONTEXT: ${JSON.stringify(compact)}
+Grocery context rules:
+- Treat explicit diet, allergy, product-ban, lifestyle, accessibility, and "do not include" notes in Personal Context as hard constraints for generated grocery/material items unless the user explicitly says to ignore them or buy for someone else.
+- For recipe/meal generation, substitute compatible purchasable alternatives instead of outputting forbidden products; omit the item when no safe substitute is obvious.
+- Vegan/no-meat context means no meat, seafood, dairy, eggs, honey, gelatin, lard, whey, or casein unless the item itself is clearly vegan, plant-based, dairy-free, or egg-free.`;
+}
+
+function groceryJsonExampleForAi(inferQuantities: boolean, personalContext: string) {
+  if (contextSaysVegan(personalContext)) {
+    return inferQuantities
+      ? '[{"name":"tofu","quantity":"1","unit":"block","packageSize":"14 oz block","category":"Canned & Dry Goods"}]'
+      : '[{"name":"apples","category":"Produce"}]';
+  }
+  return inferQuantities
+    ? '[{"name":"butter","quantity":"2","unit":"tbsp","packageSize":"2-pack stick butter","category":"Dairy"}]'
+    : '[{"name":"eggs","category":"Dairy"}]';
+}
+
+function taskPersonalContextInstruction(personalContext: string) {
+  const compact = compactPersonalContextForAi(personalContext);
+  if (!compact) return 'TASK PERSONAL CONTEXT: ""';
+  return `TASK PERSONAL CONTEXT: ${JSON.stringify(compact)}
+Task context rules:
+- Treat explicit accessibility, health, sensory, mobility, lifestyle, and "cannot/do not" notes in Personal Context as constraints when generating or splitting suggested tasks.
+- Suggestions must be realistically usable for the user. For example, wheelchair context means avoid standing/walking/step-outside suggestions unless framed as an accessible alternative; deaf context means avoid listening-based suggestions unless an accessible visual/tactile alternative is named.
+- If the user's exact command conflicts with Personal Context, preserve the command unless it is a broad suggestion request; broad suggestion requests should adapt to the context.`;
+}
+
+function isBroadTaskSuggestionRequest(input: string) {
+  return /\b(give me|suggest|ideas?|recommend|tips?|advice|things to|ways to|healthy things|incorporate|daily routine|routine|plan|checklist|every day|everyday|habits?)\b/i.test(input);
+}
+
+function contextSaysMobilityLimited(personalContext: string) {
+  return /\b(wheelchair|limited mobility|mobility impaired|can't walk|cant walk|cannot walk|can't stand|cant stand|cannot stand)\b/i.test(personalContext);
+}
+
+function contextSaysDeaf(personalContext: string) {
+  return /\b(deaf|hard of hearing|hearing impaired|can't hear|cant hear|cannot hear)\b/i.test(personalContext);
+}
+
+function taskTextConflictsPersonalContext(text: string, input: string, personalContext: string) {
+  if (!isBroadTaskSuggestionRequest(input)) return false;
+  if (contextSaysMobilityLimited(personalContext)
+    && /\b(walk|walking|run|running|jog|jogging|stand|standing|steps?|step outside|go outside|take a stroll|hike)\b/i.test(text)) {
+    return true;
+  }
+  if (contextSaysDeaf(personalContext)
+    && /\b(listen|hearing|hear|music|podcast|audio|sound bath|calming sounds?)\b/i.test(text)
+    && !/\b(caption|captions|transcript|visual|vibration|silent|text)\b/i.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+function hasGroceryGenerationIntent(input: string) {
+  const normalized = input.replace(/\s+/g, ' ').trim();
+  return hasDirectGroceryAcquisitionIntent(normalized)
+    || (shouldInferGroceryQuantities(normalized)
+    && (/\b(ingredients?|supplies|materials?|equipment|accessories|gear|tools?|items)\b.{0,32}\b(for|to make|to build|to buy|to purchase|needed for|for making|for a|for an)\b/i.test(normalized)
+      || /\b([a-z0-9]+[-\s]+)?ingredients?\b/i.test(normalized)
+      || /\b(snacks?|items?|groceries|supplies|materials?|equipment|accessories|gear|tools?)\s+to\s+(buy|purchase)\b/i.test(normalized)
+      || /\b(shopping|grocery|groceries|meal[-\s]?prep|meal plan|meal planning|prep)\s+(list|items?|groceries|ingredients?)\b/i.test(normalized)
+      || /\b(pack(?:ing)?|buy|purchase|shopping|supply|supplies|materials?|equipment|accessories|gear|tools?)\s+(list|items?)\b/i.test(normalized)
+      || /\b(smoothie|meal|dinner|lunch|breakfast|recipe|project|repair|packing|trip|paint|painting|phone|desk|sink|faucet)\b.{0,28}\b(stuff|junk|crap|things)\b/i.test(normalized)
+      || /\b(stuff|junk|crap|things)\b.{0,28}\b(for|to make|to build|to buy|to purchase|to fix|needed for|for making|for a|for an)\b/i.test(normalized)
+      || /\b(accessories|equipment|gear|tools?)\b.{0,32}\b(to buy|to purchase|for|needed for)\b/i.test(normalized)
+      || /\b(list|items?|groceries|ingredients?|supplies|materials?|equipment|accessories|gear|tools?)\s+(for|to make|to build|to buy|to purchase|to pack)\s+(meal[-\s]?prep|meal plan|meal planning|dinner|lunch|breakfast|recipe|recipes?|project|trip|travel|move|moving|school|work|office|home|repair|build|phone|computer|desk|bedroom)\b/i.test(normalized)));
+}
+
+const DIRECT_GROCERY_ITEM_PATTERNS: Array<{ re: RegExp; name: string; category: string }> = [
+  { re: /\beggs?\b/i, name: 'eggs', category: 'Dairy' },
+  { re: /\bmilk\b/i, name: 'milk', category: 'Dairy' },
+  { re: /\bcheese\b/i, name: 'cheese', category: 'Dairy' },
+  { re: /\byogurt\b/i, name: 'yogurt', category: 'Dairy' },
+  { re: /\bbutter\b/i, name: 'butter', category: 'Dairy' },
+  { re: /\bbananas?\b/i, name: 'bananas', category: 'Produce' },
+  { re: /\bapples?\b/i, name: 'apples', category: 'Produce' },
+  { re: /\bberries\b/i, name: 'berries', category: 'Produce' },
+  { re: /\bspinach\b/i, name: 'spinach', category: 'Produce' },
+  { re: /\bonions?\b/i, name: 'onions', category: 'Produce' },
+  { re: /\bgarlic\b/i, name: 'garlic', category: 'Produce' },
+  { re: /\bbread\b/i, name: 'bread', category: 'Bakery' },
+  { re: /\bflou?r\b/i, name: 'flour', category: 'Canned & Dry Goods' },
+  { re: /\bsugar\b/i, name: 'sugar', category: 'Canned & Dry Goods' },
+  { re: /\brice\b/i, name: 'rice', category: 'Canned & Dry Goods' },
+  { re: /\bcoffee\b/i, name: 'coffee', category: 'Beverages' },
+  { re: /\bcereal\b/i, name: 'cereal', category: 'Canned & Dry Goods' },
+];
+
+function hasDirectGroceryAcquisitionIntent(input: string) {
+  const normalized = input.replace(/\s+/g, ' ').trim();
+  return /\b(buy|grab|get|pick up|pickup|purchase)\b/i.test(normalized)
+    && DIRECT_GROCERY_ITEM_PATTERNS.some(({ re }) => re.test(normalized));
+}
+
+function directGroceryDraftsFromRaw(input: string): GroceryDraft[] {
+  if (!hasDirectGroceryAcquisitionIntent(input)) return [];
+  return DIRECT_GROCERY_ITEM_PATTERNS
+    .filter(({ re }) => re.test(input))
+    .map(({ name, category }) => ({ name, category }));
+}
+
+function mergeRecoveredGroceryDrafts(items: GroceryDraft[], input: string) {
+  const existing = new Set(items.map(item => normalizeAiNameToken(item.name || '')));
+  const recovered = directGroceryDraftsFromRaw(input)
+    .filter(item => {
+      const key = normalizeAiNameToken(item.name);
+      if (!key || existing.has(key)) return false;
+      existing.add(key);
+      return true;
+    });
+  return recovered.length > 0 ? [...items, ...recovered] : items;
+}
+
+function extractGroceryGenerationClause(input: string) {
+  const normalized = input.replace(/\s+/g, ' ').trim();
+  const match = normalized.match(/\b(?:and|plus|also|with)?\s*((ingredients?|supplies|materials?|equipment|accessories|gear|tools?|items|stuff|junk|crap|things)\b.{0,32}\b(?:for|to make|to build|to buy|to purchase|to fix|needed for|for making|for a|for an)\b.+|(smoothie|meal|dinner|lunch|breakfast|recipe|project|repair|packing|trip|paint|painting|phone|desk|sink|faucet)\b.{0,32}\b(stuff|junk|crap|things)\b.*|(shopping|grocery|groceries|meal[-\s]?prep|meal plan|meal planning|prep)\s+(list|items?|groceries|ingredients?)\b.*|(pack(?:ing)?|buy|purchase|shopping|supply|supplies|materials?|equipment|accessories|gear|tools?)\s+(list|items?)\b.*|(list|items?|groceries|ingredients?|supplies|materials?|equipment|accessories|gear|tools?)\s+(for|to make|to build|to buy|to purchase|to pack)\s+(meal[-\s]?prep|meal plan|meal planning|dinner|lunch|breakfast|recipe|recipes?|project|trip|travel|move|moving|school|work|office|home|repair|build|phone|computer|desk|bedroom)\b.*)$/i);
+  if (!match || match.index == null) return normalized;
+  return normalized.slice(match.index).replace(/^(and|plus|also|with)\s+/i, '').trim();
+}
+
+function groceryDraftLooksLikeGenerationPlaceholder(item: GroceryDraft, input: string) {
+  if (!hasGroceryGenerationIntent(input)) return false;
+  const name = String(item.name || '').replace(/\s+/g, ' ').trim();
+  if (!name) return false;
+  if (/\b(ingredients?|shopping list|grocery list|groceries|supplies|materials?|equipment|accessories|gear|tools?|items|meal[-\s]?prep list|meal plan list|packing list|pack list|buy list|purchase list)\b/i.test(name)) return true;
+  if (/^(for|to make|to build|needed for)\b/i.test(name)) return true;
+  return false;
+}
+
+function groceryDraftsNeedGenerationRetry(items: GroceryDraft[], input: string) {
+  if (!hasGroceryGenerationIntent(input)) return false;
+  if (items.length === 0) return true;
+  if (items.length > 2) return false;
+  return items.some(item => groceryDraftLooksLikeGenerationPlaceholder(item, input));
+}
+
+function groceryDraftsNeedPackageSizeRetry(items: GroceryDraft[], input: string) {
+  if (!shouldInferGroceryQuantities(input) || !hasGroceryGenerationIntent(input)) return false;
+  const meaningful = items.filter(item => !groceryDraftLooksLikeGenerationPlaceholder(item, input));
+  if (meaningful.length < 2) return false;
+  const withPackageSize = meaningful.filter(item => !!cleanPackageSize(item.packageSize)).length;
+  return withPackageSize < Math.ceil(meaningful.length * 0.6);
+}
+
+function groceryDraftsNeedNeededAmountRetry(items: GroceryDraft[], input: string) {
+  if (!shouldInferGroceryQuantities(input) || !hasGroceryGenerationIntent(input)) return false;
+  if (!/\b(recipe|ingredients?|smoothie|meal[-\s]?prep|meal[-\s]?plan|meal|dinner|lunch|breakfast|cook|bake)\b/i.test(input)) return false;
+  const meaningful = items.filter(item => !groceryDraftLooksLikeGenerationPlaceholder(item, input));
+  if (meaningful.length < 2) return false;
+  const withNeededAmount = meaningful.filter(item => {
+    const quantity = cleanOptionalGroceryPart(item.quantity);
+    const unit = cleanOptionalGroceryPart(item.unit);
+    return !!quantity && (!!unit || !groceryQuantityIsBareOne(quantity));
+  }).length;
+  return withNeededAmount < Math.ceil(meaningful.length * 0.6);
+}
+
+function hasTaskGenerationIntent(input: string) {
+  const normalized = input.replace(/\s+/g, ' ').trim();
+  if (/\b(remind me|set a reminder|add (a )?task|todo|to-do)\b/i.test(normalized)) return false;
+  if (/\bneed to\s+(create|make|build|write|draft|prepare|finish|do|plan)\b/i.test(normalized)) return false;
+  return /\b(workout|exercise|training)\s+(routine|plan|program)\b/i.test(normalized)
+    || (/\b(routine|plan|program|checklist|steps?|ideas?|suggestions?|tips?|advice|things to|ways to|healthy things|daily habits?)\b/i.test(normalized)
+      && /\b(give me|suggest|recommend|ideas?|i need|need|want|build me|make me|create me|come up with|help me)\b/i.test(normalized));
+}
+
+function groceryModeShouldUseMixedAiRouting(input: string) {
+  const normalized = input.replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  if (hasDirectTaskActionIntent(normalized)) return true;
+  if (hasTaskGenerationIntent(normalized)) return true;
+  return hasGroceryGenerationIntent(normalized)
+    && /\b(call|text|email|schedule|book|fix|repair|clean|finish|submit|send|test|routine|plan|program|checklist|steps?|ideas?|tips?|advice|workout|exercise|training)\b/i.test(normalized);
+}
+
+function hasDirectTaskActionIntent(input: string) {
+  const normalized = input.replace(/\s+/g, ' ').trim();
+  if (/\b(remind me|set a reminder|add (a )?task|todo|to-do)\b/i.test(normalized)) return true;
+  const actionVerb = /\b(call|text|email|schedule|book|pay|order|fix|repair|clean|finish|submit|send|test|workout|exercise|train|walk|walking|rub)\b/i;
+  if (new RegExp(`^\\s*${actionVerb.source}`, 'i').test(normalized)) return true;
+  if (actionVerb.test(normalized)
+    && /\b(today|tomorrow|tonight|later|this morning|this afternoon|this evening|morning|afternoon|evening|noon|midnight|at\s+\d{1,2}|around\s+\d{1,2}|round\s+\d{1,2}|by\s+\d{1,2}|in\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)|\d{1,2}(:\d{2})?\s*(am|pm|a|p))\b/i.test(normalized)) {
+    return true;
+  }
+  return false;
+}
+
+function aiTextHasReminderCue(input: string) {
+  const normalized = input.replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  return /\b(remind me|reminder|set a reminder|alarm|notify|notification|repeat|repeating|hourly|daily|weekly)\b/i.test(normalized)
+    || /\b(at|around|round|by|before|after)\s+\d{1,2}(:\d{2})?\s*(am|pm|a|p)?\b/i.test(normalized)
+    || /\bevery\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?|weeks?)\b/i.test(normalized)
+    || /\bin\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)\b/i.test(normalized)
+    || /\b\d{1,2}(:\d{2})?\s*(am|pm)\b/i.test(normalized);
+}
+
+function aiReminderTaskTokens(value: string) {
+  return Array.from(new Set(
+    normalizeAiListText(value)
+      .split(' ')
+      .map(normalizeAiNameToken)
+      .filter(token => token.length > 2 && !AI_TASK_TEXT_STOP_TOKENS.has(token)),
+  ));
+}
+
+function aiReminderClauseForTask(raw: string, taskText?: string) {
+  const normalizedRaw = raw.replace(/\s+/g, ' ').trim();
+  const clauses = normalizedRaw
+    .split(/\s+(?:and|plus|also|then)\s+|[,;]+/i)
+    .map(clause => clause.trim())
+    .filter(Boolean);
+  if (!taskText || clauses.length <= 1) return normalizedRaw;
+  const taskTokens = aiReminderTaskTokens(taskText);
+  if (taskTokens.length === 0) return normalizedRaw;
+  let bestClause = '';
+  let bestScore = 0;
+  clauses.forEach(clause => {
+    const clauseTokens = new Set(aiReminderTaskTokens(clause));
+    const score = taskTokens.reduce((sum, token) => sum + (clauseTokens.has(token) ? 1 : 0), 0);
+    if (score > bestScore) {
+      bestScore = score;
+      bestClause = clause;
+    }
+  });
+  return bestScore > 0 ? bestClause : normalizedRaw;
+}
+
+const AI_REMINDER_ACTION_BOUNDARY_TOKENS = new Set([
+  'ask', 'book', 'build', 'buy', 'call', 'clean', 'create', 'do', 'draft', 'email', 'exercise',
+  'feed', 'finish', 'fix', 'get', 'grab', 'make', 'message', 'order', 'pack', 'pay', 'pick',
+  'prepare', 'repair', 'review', 'rub', 'schedule', 'send', 'set', 'submit', 'take', 'tell',
+  'test', 'text', 'train', 'walk', 'walking', 'wash', 'workout', 'write',
+]);
+
+const AI_REMINDER_MATCH_STOP_TOKENS = new Set([
+  'ask', 'book', 'build', 'buy', 'call', 'clean', 'create', 'do', 'draft', 'email', 'exercise',
+  'feed', 'finish', 'fix', 'get', 'grab', 'make', 'message', 'order', 'pack', 'pay', 'pick',
+  'prepare', 'repair', 'review', 'rub', 'schedule', 'send', 'set', 'submit', 'take', 'tell',
+  'test', 'text', 'train', 'walk', 'walking', 'wash', 'workout', 'write',
+  'advice', 'checklist', 'item', 'items', 'plan', 'program', 'routine', 'row', 'rows',
+  'session', 'sessions', 'step', 'steps', 'task', 'tasks', 'thing', 'things', 'tip', 'tips',
+  'hour', 'hours', 'hr', 'hrs', 'minute', 'minutes', 'min', 'mins', 'today', 'tomorrow', 'tonight',
+]);
+
+function aiReminderTokensMatch(a: string, b: string) {
+  return a === b
+    || (a.length >= 4 && b.startsWith(a))
+    || (b.length >= 4 && a.startsWith(b));
+}
+
+function aiReminderMeaningTokens(value: string) {
+  return aiReminderTaskTokens(value)
+    .filter(token => !/^\d+$/.test(token) && !AI_REMINDER_MATCH_STOP_TOKENS.has(token));
+}
+
+function aiReminderClauseMatchesTask(clause: string, taskText?: string, raw = '') {
+  if (!taskText) return true;
+  const taskTokens = aiReminderMeaningTokens(taskText);
+  if (taskTokens.length === 0) return !hasTaskGenerationIntent(raw);
+  const clauseTokens = aiReminderMeaningTokens(clause);
+  const overlap = taskTokens.filter(taskToken =>
+    clauseTokens.some(clauseToken => aiReminderTokensMatch(taskToken, clauseToken))
+  ).length;
+  return overlap >= 1;
+}
+
+function aiReminderLocalClauseForTask(raw: string, taskText?: string) {
+  if (!taskText) return aiReminderClauseForTask(raw, taskText);
+  const normalizedRaw = normalizeAiListText(raw);
+  if (!normalizedRaw) return '';
+  const taskTokens = aiReminderTaskTokens(taskText);
+  if (taskTokens.length === 0) return aiReminderClauseForTask(raw, taskText);
+  const rawTokens = normalizedRaw.split(' ').filter(Boolean);
+  const matchingIndexes = rawTokens
+    .map((rawToken, index) => {
+      const matches = taskTokens.some(token => (
+        rawToken === token
+        || (token.length >= 4 && rawToken.startsWith(token))
+        || (rawToken.length >= 4 && token.startsWith(rawToken))
+      ));
+      return matches ? index : -1;
+    })
+    .filter(index => index >= 0);
+  if (matchingIndexes.length === 0) return '';
+  const firstMatch = Math.min(...matchingIndexes);
+  const lastMatch = Math.max(...matchingIndexes);
+  const connectorBeforeMatch = rawTokens.findIndex((token, index) => (
+    index > 0
+    && index < firstMatch
+    && (token === 'and' || token === 'plus' || token === 'also' || token === 'then')
+  ));
+  if (/^(remind|remember|notify|alarm|set reminder|set a reminder)\b/i.test(normalizedRaw) && connectorBeforeMatch < 0) {
+    return normalizedRaw;
+  }
+  const starts = rawTokens
+    .map((token, index) => AI_REMINDER_ACTION_BOUNDARY_TOKENS.has(token) ? index : -1)
+    .filter(index => index >= 0 && index <= firstMatch);
+  const nearbyStart = starts.reverse().find(index => firstMatch - index <= 3);
+  const start = nearbyStart ?? firstMatch;
+  const endBoundary = rawTokens.findIndex((token, index) => (
+    index > lastMatch
+    && (AI_REMINDER_ACTION_BOUNDARY_TOKENS.has(token) || token === 'and' || token === 'plus' || token === 'also' || token === 'then')
+  ));
+  const end = endBoundary >= 0 ? endBoundary : rawTokens.length;
+  return rawTokens.slice(start, end).join(' ') || aiReminderClauseForTask(raw, taskText);
+}
+
+function aiInputAllowsReminder(raw: string, taskText?: string) {
+  const clause = aiReminderLocalClauseForTask(raw, taskText);
+  return aiTextHasReminderCue(clause) && aiReminderClauseMatchesTask(clause, taskText, raw);
+}
+
+function reminderDateFromClockClause(clause: string) {
+  const clockMatch = clause.match(/\b(?:at|around|round|by|before|after)?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm|a|p)?\b/i);
+  if (!clockMatch) return null;
+  let hour = Math.max(0, Math.min(23, Number(clockMatch[1])));
+  const minute = Math.max(0, Math.min(59, Number(clockMatch[2] ?? 0)));
+  const suffix = clockMatch[3]?.toLowerCase();
+  if (suffix === 'pm' || suffix === 'p') {
+    if (hour < 12) hour += 12;
+  } else if (suffix === 'am' || suffix === 'a') {
+    if (hour === 12) hour = 0;
+  } else if (hour >= 1 && hour <= 7) {
+    hour += 12;
+  }
+  const date = new Date();
+  if (/\btomorrow\b/i.test(clause)) date.setDate(date.getDate() + 1);
+  date.setHours(hour, minute, 0, 0);
+  if (date.getTime() < Date.now() - 60000 && !/\btomorrow\b/i.test(clause)) {
+    date.setDate(date.getDate() + 1);
+  }
+  return date;
+}
+
+function buildReminderFallbackFromRaw(raw: string, taskText = ''): Reminder | undefined {
+  const clause = aiReminderLocalClauseForTask(raw, taskText);
+  if (!aiTextHasReminderCue(clause)) return undefined;
+  const now = Date.now();
+  const relativeMatch = clause.match(/\bin\s+(\d+)\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)\b/i);
+  if (relativeMatch) {
+    const amount = Math.max(1, Number(relativeMatch[1]));
+    const unit = relativeMatch[2].toLowerCase();
+    const ms = /^m/.test(unit)
+      ? amount * 60000
+      : /^h/.test(unit)
+        ? amount * 3600000
+        : amount * 86400000;
+    return { remindAt: now + ms, repeatHourly: false, repeatDaily: false };
+  }
+  const everyMatch = clause.match(/\bevery\s+(\d+)?\s*(m|min|mins|minutes|h|hr|hrs|hours|days?|day|daily)\b/i);
+  if (everyMatch) {
+    const amount = Math.max(1, Number(everyMatch[1] ?? 1));
+    const unit = everyMatch[2].toLowerCase();
+    const clockDate = reminderDateFromClockClause(clause);
+    if (/^m/.test(unit) || /^h/.test(unit)) {
+      const fallbackDelay = /^m/.test(unit) ? amount * 60000 : amount * 3600000;
+      return { remindAt: clockDate?.getTime() ?? (now + fallbackDelay), repeatHourly: true, repeatDaily: false };
+    }
+    const first = clockDate ?? (() => {
+      const date = new Date();
+      date.setDate(date.getDate() + 1);
+      date.setHours(9, 0, 0, 0);
+      return date;
+    })();
+    return { remindAt: first.getTime(), repeatHourly: false, repeatDaily: true };
+  }
+  const clockDate = reminderDateFromClockClause(clause);
+  if (clockDate) return { remindAt: clockDate.getTime(), repeatHourly: false, repeatDaily: false };
+  return undefined;
+}
+
+function shouldAllowAiReminderForTask(raw: string, taskText = '') {
+  if (!aiInputAllowsReminder(raw, taskText)) return false;
+  if (!hasTaskGenerationIntent(raw)) return true;
+  const normalizedRaw = raw.replace(/\s+/g, ' ').trim();
+  const generatedClause = extractTaskGenerationClause(raw);
+  if (!generatedClause || generatedClause === normalizedRaw) return true;
+  const generatedTokens = new Set(meaningfulTaskTextTokens(generatedClause));
+  const rowLooksGeneratedFromClause = meaningfulTaskTextTokens(taskText).some(token => generatedTokens.has(token));
+  if (!rowLooksGeneratedFromClause) return true;
+  return aiTextHasReminderCue(generatedClause);
+}
+
+function extractTaskGenerationClause(input: string) {
+  const normalized = input.replace(/\s+/g, ' ').trim();
+  const withoutTrailingGrocery = normalized
+    .replace(/\s+\b(and|plus|also|with)\s+((ingredients?|supplies|materials?|equipment|accessories|gear|tools?|items)\b.{0,32}\b(for|to make|to build|to buy|to purchase|needed for|for making|for a|for an)\b.+|(shopping|grocery|groceries|meal[-\s]?prep|meal plan|meal planning|prep)\s+(list|items?|groceries|ingredients?)\b.*|(pack(?:ing)?|buy|purchase|shopping|supply|supplies|materials?|equipment|accessories|gear|tools?)\s+(list|items?)\b.*|(list|items?|groceries|ingredients?|supplies|materials?|equipment|accessories|gear|tools?)\s+(for|to make|to build|to buy|to purchase|to pack)\s+(meal[-\s]?prep|meal plan|meal planning|dinner|lunch|breakfast|recipe|recipes?|project|trip|travel|move|moving|school|work|office|home|repair|build|phone|computer|desk|bedroom)\b.*)$/i, '')
+    .trim();
+  const withoutTrailingDirectTasks = withoutTrailingGrocery
+    .replace(/\b(routine|plan|program|checklist|steps?|tips?|advice|suggestions?|ideas?)\b\s+\b(call|text|email|schedule|book|pay|order|fix|repair|clean|finish|submit|send|test|walk|walking|rub)\b.*$/i, '$1')
+    .trim();
+  const generationMatches = Array.from(withoutTrailingDirectTasks.matchAll(/\b((?:[a-z0-9-]+\s+){0,6}(?:workout|exercise|training|meditation|mindfulness|breathing|cleaning|packing|sleep|desk|bathroom|phone|healthy|calming|daily|morning|evening)?\s*(?:routine|plan|program|checklist|steps?|tips?|advice|suggestions?|ideas?)(?:\s+(?:for|to|about)\s+(?:[a-z0-9-]+\s*){0,6})?)/gi));
+  const generationClause = generationMatches[generationMatches.length - 1]?.[1]?.replace(/\s+/g, ' ').trim();
+  if (generationClause) {
+    const topicStart = generationClause.search(/\b(workout|exercise|training|meditation|mindfulness|breathing|cleaning|packing|sleep|desk|bathroom|phone|healthy|calming|daily|morning|evening)\b/i);
+    return (topicStart >= 0 ? generationClause.slice(topicStart) : generationClause)
+      .replace(/^(?:a|an|the|some|my|me|as|well|also|and|plus|with)\s+/i, '')
+      .trim();
+  }
+  return withoutTrailingDirectTasks || withoutTrailingGrocery || normalized;
+}
+
+function taskLooksLikeGenerationPlaceholder(text: string, input: string) {
+  if (!hasTaskGenerationIntent(input)) return false;
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  if (/^(create|make|build|generate|write|draft|come up with|plan)\s*/i.test(normalized)
+    && /\b(workout|routine|plan|program|checklist|steps?|ideas?|suggestions?|tips?|advice|things)\b/i.test(normalized)) {
+    return true;
+  }
+  if (/\b(define sets? and reps?|write progression|add rest days?|set training goal|set strength goals?|set weekly frequency|choose weekly|choose schedule|choose rep ranges?|pick exercises?|pick .*lifts?|choose .*lifts?|select exercises?|select .*lifts?|create grocery list|make grocery list|plan meals?|plan the plan|build (the )?plan|make (the )?list)\b/i.test(normalized)) {
+    return true;
+  }
+  const genericRequestLabel = /\b(workout|routine|plan|program|checklist|steps?|ideas?|suggestions?|tips?|advice|things)\b/i.test(normalized);
+  const concreteTaskDetail = /\b(call|text|email|book|schedule|pay|buy|order|clean|wash|pack|review|read|write|draft|submit|send|install|repair|fix|replace|measure|cut|assemble|sort|organize|practice|study|set up|setup|push[-\s]?ups?|bench|press|fly|flies|dumbbell|barbell|cable|machine|incline|decline|dips?|sets?|reps?|plank|row|curl|squat|lunge|deadlift|warm[-\s]?up|cool[-\s]?down|stretch)\b/i.test(normalized);
+  return genericRequestLabel && !concreteTaskDetail && normalized.split(/\s+/).length <= 8;
+}
+
+function taskRowsNeedGenerationRetry(items: any[], input: string) {
+  if (!hasTaskGenerationIntent(input)) return false;
+  if (items.length === 0) return true;
+  const placeholderCount = items.filter(item => taskLooksLikeGenerationPlaceholder(String(item?.text ?? ''), input)).length;
+  if (placeholderCount === 0) return false;
+  return true;
+}
+
+function mergeGeneratedTaskRetryRows(items: any[], generatedItems: any[], input: string) {
+  if (generatedItems.length === 0) return items;
+  if (items.length === 0) return generatedItems;
+  let inserted = false;
+  const merged: any[] = [];
+  items.forEach(item => {
+    const placeholder = taskLooksLikeGenerationPlaceholder(String(item?.text ?? ''), input);
+    if (placeholder) {
+      if (!inserted) {
+        merged.push(...generatedItems);
+        inserted = true;
+      }
+      return;
+    }
+    merged.push(item);
+  });
+  return inserted ? merged : generatedItems;
+}
+
+const AI_TASK_DEDUPE_CONTEXT_TOKENS = new Set([
+  'after', 'afternoon', 'around', 'round', 'before', 'eventually', 'evening', 'hour', 'hours',
+  'later', 'midnight', 'minute', 'minutes', 'morning', 'noon', 'of', 'one', 'point', 'remind',
+  'reminder', 'someday', 'some', 'sometime', 'soon', 'today', 'tomorrow', 'tonight',
+  'whenever',
+]);
+
+const AI_TASK_DEDUPE_TOKEN_ALIASES: Record<string, string> = {
+  booking: 'book',
+  calling: 'call',
+  cleaning: 'clean',
+  emailing: 'email',
+  fixing: 'fix',
+  messaging: 'message',
+  ordering: 'order',
+  paying: 'pay',
+  repairing: 'repair',
+  scheduling: 'schedule',
+  sending: 'send',
+  texting: 'text',
+  walking: 'walk',
+};
+
+function normalizeAiTaskDedupeToken(token: string) {
+  return AI_TASK_DEDUPE_TOKEN_ALIASES[token] ?? token;
+}
+
+function aiTaskDedupeKey(value: string) {
+  const tokens = Array.from(new Set(normalizedAiTokens(value)
+    .map(normalizeAiTaskDedupeToken)
+    .filter(token => (
+      token.length >= 3
+      && !AI_TASK_TEXT_STOP_TOKENS.has(token)
+      && !AI_TASK_DEDUPE_CONTEXT_TOKENS.has(token)
+      && !/^\d+$/.test(token)
+    ))));
+  return tokens.length > 0 ? tokens.join(' ') : normalizeAiListText(value);
+}
+
+function aiTaskDedupeKeysMatch(a: string, b: string) {
+  if (a === b) return true;
+  const left = a.split(' ').filter(Boolean);
+  const right = b.split(' ').filter(Boolean);
+  return left.length === right.length
+    && left.every((token, index) => aiTokensCloseEnough(token, right[index] ?? ''));
+}
+
+function dedupeAiTaskRows<T>(items: T[]): T[] {
+  const seen: string[] = [];
+  return items.filter((item: any) => {
+    const key = aiTaskDedupeKey(String(item?.text ?? ''));
+    if (!key) return false;
+    if (seen.some(existing => aiTaskDedupeKeysMatch(key, existing))) return false;
+    seen.push(key);
+    return true;
+  });
+}
+
+function aiTaskKeyTokens(value: string) {
+  return aiTaskDedupeKey(value).split(' ').filter(Boolean);
+}
+
+function aiTaskTokensContainAll(container: string[], subset: string[]) {
+  return subset.every(token => container.some(candidate => aiTokensCloseEnough(candidate, token)));
+}
+
+function dropCoveredCompoundTaskRows<T>(items: T[]): T[] {
+  const keyed = items.map((item: any, index) => ({
+    index,
+    tokens: aiTaskKeyTokens(String(item?.text ?? '')),
+  }));
+  return items.filter((_item, index) => {
+    const current = keyed[index];
+    if (!current || current.tokens.length < 3) return true;
+    return !keyed.some(other => (
+      other.index !== index
+      && other.tokens.length >= 2
+      && other.tokens.length < current.tokens.length
+      && current.tokens.length - other.tokens.length <= 2
+      && aiTaskTokensContainAll(current.tokens, other.tokens)
+    ));
+  });
+}
+
+function mergeGeneratedTaskExpansionRows(items: any[], generatedItems: any[], input: string) {
+  if (generatedItems.length === 0) return items;
+  const merged = [...generatedItems];
+  items.forEach((item) => {
+    const text = String(item?.text ?? '');
+    if (taskLooksLikeGenerationPlaceholder(text, input)) return;
+    if (taskTextMatchesGeneratedPlanTopic(text, input) && !taskRowLooksLikeDirectRawAction(item, input)) return;
+    merged.push(item);
+  });
+  return dedupeAiTaskRows(merged);
+}
+
+function fallbackGeneratedTaskRowsFromRaw(input: string) {
+  if (!hasTaskGenerationIntent(input)) return [];
+  if (/\b(meditation|meditate|mindfulness|breathing)\b.{0,24}\b(routine|plan|program|steps?)\b|\b(routine|plan|program|steps?)\b.{0,24}\b(meditation|meditate|mindfulness|breathing)\b/i.test(input)) {
+    return [
+      { text: 'Sit quietly 5 minutes', tier: 'medium' },
+      { text: 'Breathe slowly 10 rounds', tier: 'medium' },
+      { text: 'Body scan head to toe', tier: 'medium' },
+      { text: 'Notice thoughts and return', tier: 'low' },
+      { text: 'Close with one intention', tier: 'low' },
+    ];
+  }
+  if (/\b(workout|exercise|training)\s+(routine|plan|program)\b/i.test(input)) {
+    if (/\b(chest|pec|pecs|bench)\b/i.test(input)) {
+      return [
+        { text: 'Warm up shoulders 5 minutes', tier: 'medium' },
+        { text: 'Flat bench press 4x8', tier: 'medium' },
+        { text: 'Incline dumbbell press 3x10', tier: 'medium' },
+        { text: 'Cable chest flyes 3x12', tier: 'medium' },
+        { text: 'Push-ups 2 sets to failure', tier: 'low' },
+      ];
+    }
+    return [
+      { text: 'Warm up 10 minutes', tier: 'medium' },
+      { text: 'Bodyweight squats 3x12', tier: 'medium' },
+      { text: 'Push-ups 3x10', tier: 'medium' },
+      { text: 'Dumbbell rows 3x10', tier: 'medium' },
+      { text: 'Plank 3x30 sec', tier: 'low' },
+    ];
+  }
+  if (/\b(pack(?:ing)? checklist|packing list|pack list)\b/i.test(input)) {
+    return [
+      { text: 'Pack clothes', tier: 'medium' },
+      { text: 'Pack toiletries', tier: 'medium' },
+      { text: 'Pack chargers', tier: 'medium' },
+      { text: 'Bring ID and wallet', tier: 'medium' },
+      { text: 'Check travel details', tier: 'low' },
+    ];
+  }
+  return [];
+}
+
+function workoutTaskRowHasDoseDetail(text: string) {
+  return /\b\d+\s*x\s*\d+\b/i.test(text)
+    || /\b\d+\s*(?:sets?|reps?|rounds?|m|min|mins|minutes|sec|secs|seconds)\b/i.test(text)
+    || /\b(?:to failure|amrap|as many reps|each side|per side)\b/i.test(text);
+}
+
+function workoutTaskRowNeedsDoseDetail(text: string) {
+  if (/\b(dog|pet)\b/i.test(text)) return false;
+  return /\b(push[-\s]?ups?|bench|press|fly|flies|dumbbell|barbell|cable|machine|incline|decline|dips?|row|curl|squat|lunge|deadlift|plank|kettlebell|burpees?|jumping jacks?)\b/i.test(text);
+}
+
+function taskRowsNeedGenerationDetailRetry(items: any[], input: string) {
+  if (!/\b(workout|exercise|training)\s+(routine|plan|program)\b/i.test(input)) return false;
+  const workoutRows = dropGroceryClauseTaskLeaks(items, input)
+    .filter(item => taskTextMatchesGeneratedPlanTopic(String(item?.text ?? ''), input))
+    .filter(item => !taskRowLooksLikeDirectRawAction(item, input));
+  if (workoutRows.length < 3) return false;
+  const strengthRows = workoutRows
+    .map(item => String(item?.text ?? ''))
+    .filter(workoutTaskRowNeedsDoseDetail);
+  if (strengthRows.length === 0) return false;
+  const thinRows = strengthRows.filter(text => !workoutTaskRowHasDoseDetail(text));
+  return thinRows.length >= Math.min(2, strengthRows.length)
+    || thinRows.length / strengthRows.length >= 0.5;
+}
+
+function taskRowsMissRequestedWorkoutFocus(items: any[], input: string) {
+  if (!/\b(workout|exercise|training)\s+(routine|plan|program)\b/i.test(input)) return false;
+  const focus = /\b(chest|pec|pecs|bench)\b/i.test(input) ? 'chest' : '';
+  if (!focus) return false;
+  const workoutRows = dropGroceryClauseTaskLeaks(items, input)
+    .filter(item => taskTextMatchesGeneratedPlanTopic(String(item?.text ?? ''), input))
+    .filter(item => !taskRowLooksLikeDirectRawAction(item, input))
+    .map(item => String(item?.text ?? ''));
+  if (workoutRows.length < 3) return false;
+  if (focus === 'chest') {
+    const focusedRows = workoutRows.filter(text => /\b(chest|pec|pecs|bench|push[-\s]?ups?|press|fly|flies|dips?)\b/i.test(text));
+    return focusedRows.length < Math.min(3, workoutRows.length);
+  }
+  return false;
+}
+
+function concreteGeneratedTaskRows(items: any[], input: string) {
+  const concrete = dropGroceryClauseTaskLeaks(items, input)
+    .filter(item => !taskLooksLikeGenerationPlaceholder(String(item?.text ?? ''), input));
+  const fallback = fallbackGeneratedTaskRowsFromRaw(input);
+  if (concrete.length === 0) return fallback;
+  if (taskRowsNeedGenerationDetailRetry(concrete, input) && fallback.length > 0) return fallback;
+  if (taskRowsMissRequestedWorkoutFocus(concrete, input) && fallback.length > 0) return fallback;
+  return concrete;
+}
+
+function taskTextMatchesGeneratedPlanTopic(text: string, input: string) {
+  if (/\b(meditation|meditate|mindfulness|breathing)\b/i.test(input)) {
+    return /\b(meditation|meditate|mindful|breath|breathe|breathing|body scan|sit quietly|thoughts?|intention)\b/i.test(text);
+  }
+  if (/\b(workout|exercise|training)\s+(routine|plan|program)\b/i.test(input)) {
+    if (/\b(dog|pet)\b/i.test(text)) return false;
+    return /\b(warm[-\s]?up|cool[-\s]?down|intervals?|incline|brisk walk|walk intervals?|walk\s+\d+\s*(?:m|min|mins|minutes)|sets?|reps?|rounds?|push[-\s]?ups?|bench|press|row|curl|squat|lunge|deadlift|plank|stretch|mobility|cardio|strength|dumbbell|barbell|kettlebell|burpees?|jumping jacks?)\b/i.test(text);
+  }
+  if (/\b(pack(?:ing)? checklist|packing list|pack list)\b/i.test(input)) {
+    return /\b(pack|bring|check travel|charger|clothes|toiletries|wallet|id)\b/i.test(text);
+  }
+  return false;
+}
+
+function taskRowsUnderfillGeneratedTopic(items: any[], input: string) {
+  if (!hasTaskGenerationIntent(input)) return false;
+  if (!/\b(meditation|meditate|mindfulness|breathing|workout|exercise|training|pack(?:ing)?)\b/i.test(input)) return false;
+  const relatedCount = dropGroceryClauseTaskLeaks(items, input)
+    .filter(item => taskTextMatchesGeneratedPlanTopic(String(item?.text ?? ''), input)).length;
+  return relatedCount < 3;
+}
+
+function taskRowLooksLikeDirectRawAction(item: any, input: string) {
+  if (!hasDirectTaskActionIntent(input)) return false;
+  const text = String(item?.text ?? '');
+  if (!hasDirectTaskActionIntent(text)) return false;
+  const rawTokens = meaningfulTaskTextTokens(input);
+  const textTokens = meaningfulTaskTextTokens(text)
+    .filter(token => !AI_DIRECT_TASK_RECOVERY_TOKENS.has(token) && !AI_REMINDER_MATCH_STOP_TOKENS.has(token));
+  return textTokens.length > 0 && textTokens.every(token => rawTokens.some(rawToken => aiTokensCloseEnough(token, rawToken)));
+}
+
+function trimGeneratedTaskRowsPreservingDirect<T>(items: T[], input: string): T[] {
+  const limit = generatedTaskLimit(input);
+  if (!limit) return items;
+  let generatedCount = 0;
+  return items.filter((item: any) => {
+    if (taskRowLooksLikeDirectRawAction(item, input)) return true;
+    generatedCount += 1;
+    return generatedCount <= limit;
+  });
+}
+
+const AI_DIRECT_TASK_RECOVERY_TOKENS = new Set([
+  'call', 'text', 'email', 'schedule', 'book', 'pay', 'order', 'fix', 'repair', 'clean',
+  'do', 'finish', 'submit', 'send', 'test', 'walk', 'walking', 'rub',
+]);
+
+const AI_DIRECT_TASK_SEGMENT_SPLIT_TOKENS = new Set([
+  ...AI_DIRECT_TASK_RECOVERY_TOKENS,
+  'buy', 'get', 'grab', 'pick', 'purchase',
+]);
+
+const AI_GENERATED_CLAUSE_BOUNDARY_TOKENS = new Set([
+  'advice', 'checklist', 'idea', 'ideas', 'ingredient', 'ingredients', 'grocery', 'groceries',
+  'list', 'materials', 'plan', 'program', 'recipe', 'routine', 'shopping', 'suggestion',
+  'suggestions', 'supplies', 'tips',
+]);
+
+function trimDirectTaskRecoverySegment(tokens: string[]) {
+  const boundary = tokens.findIndex((token, index) => (
+    index > 0
+    && (
+      AI_GENERATED_CLAUSE_BOUNDARY_TOKENS.has(token)
+      || AI_GENERATED_CLAUSE_BOUNDARY_TOKENS.has(tokens[index + 1] ?? '')
+    )
+  ));
+  const kept = boundary >= 0 ? tokens.slice(0, boundary) : tokens;
+  while (
+    kept.length > 1
+    && ['a', 'an', 'as', 'and', 'also', 'plus', 'the', 'to', 'well', 'with'].includes(kept[kept.length - 1])
+  ) {
+    kept.pop();
+  }
+  return kept.join(' ').trim();
+}
+
+function aiTokensCloseEnough(a: string, b: string) {
+  if (a === b) return true;
+  if (a.length < 4 || b.length < 4 || Math.abs(a.length - b.length) > 1) return false;
+  let i = 0;
+  let j = 0;
+  let edits = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      i += 1;
+      j += 1;
+    } else {
+      edits += 1;
+      if (edits > 1) return false;
+      if (a.length > b.length) i += 1;
+      else if (b.length > a.length) j += 1;
+      else {
+        i += 1;
+        j += 1;
+      }
+    }
+  }
+  return edits + (a.length - i) + (b.length - j) <= 1;
+}
+
+function recoveredDirectTaskRowsFromRaw(raw: string, existingItems: any[]) {
+  if (!hasTaskGenerationIntent(raw)) return [];
+  const tokens = normalizeAiListText(raw).split(' ').filter(Boolean);
+  const existingKeys = existingItems.map(item => aiTaskDedupeKey(String(item?.text ?? ''))).filter(Boolean);
+  const recovered: any[] = [];
+  tokens.forEach((token, index) => {
+    if (!AI_DIRECT_TASK_RECOVERY_TOKENS.has(token)) return;
+    const nextActionIndex = tokens.findIndex((candidate, candidateIndex) => (
+      candidateIndex > index
+      && (AI_DIRECT_TASK_SEGMENT_SPLIT_TOKENS.has(candidate) || candidate === 'and' || candidate === 'plus' || candidate === 'also' || candidate === 'then')
+    ));
+    const end = nextActionIndex >= 0 ? nextActionIndex : tokens.length;
+    const segment = trimDirectTaskRecoverySegment(tokens.slice(index, end));
+    if (!segment || /\b(workout|routine|plan|program|checklist|ingredients?|groceries|grocery|shopping|smoothie|supplies|materials?|equipment|accessories|gear|tools?)\b/i.test(segment)) return;
+    const segmentKey = aiTaskDedupeKey(segment);
+    if (!segmentKey || existingKeys.some(existing => aiTaskDedupeKeysMatch(segmentKey, existing))) return;
+    recovered.push({ text: segment, tier: 'medium' });
+    existingKeys.push(segmentKey);
+  });
+  return recovered;
+}
+
+function explicitGeneratedRowCount(input: string) {
+  const normalized = input.toLowerCase();
+  const wordCounts: Record<string, number> = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    eleven: 11,
+    twelve: 12,
+  };
+  const match = normalized.match(/\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(tasks?|items?|ideas?|steps?|rows?|things?|exercises?|meals?|groceries|supplies|materials)\b/i);
+  if (!match) return null;
+  const raw = match[1].toLowerCase();
+  const value = /^\d+$/.test(raw) ? Number(raw) : wordCounts[raw];
+  return Number.isFinite(value) ? Math.max(1, Math.min(12, value)) : null;
+}
+
+function asksForLargeGeneratedSet(input: string) {
+  return /\b(full|complete|detailed|comprehensive|everything|all the|whole|weekly|week[-\s]?long|7[-\s]?day|seven[-\s]?day)\b/i.test(input);
+}
+
+function generatedTaskLimit(input: string) {
+  if (!hasTaskGenerationIntent(input)) return null;
+  const explicit = explicitGeneratedRowCount(input);
+  if (explicit) return explicit;
+  return asksForLargeGeneratedSet(input) ? 8 : 5;
+}
+
+function generatedGroceryLimit(input: string) {
+  if (!hasGroceryGenerationIntent(input)) return null;
+  const explicit = explicitGeneratedRowCount(input);
+  if (explicit) return explicit;
+  return asksForLargeGeneratedSet(input) ? 12 : 8;
+}
+
+function trimGeneratedTaskRowsForScope<T>(items: T[], input: string): T[] {
+  const limit = generatedTaskLimit(input);
+  return limit ? items.slice(0, limit) : items;
+}
+
+function trimGeneratedGroceryRowsForScope<T>(items: T[], input: string): T[] {
+  const limit = generatedGroceryLimit(input);
+  return limit ? items.slice(0, limit) : items;
+}
+
+function taskRepeatsGroceryGenerationClause(item: any, input: string) {
+  if (!hasGroceryGenerationIntent(input)) return false;
+  const text = String(item?.text ?? '').toLowerCase();
+  if (!text.trim()) return false;
+  if (/\b(workout|exercise|training|strength|cardio|mobility|warm[-\s]?up|bench|press|row|squat|plank|stretch)\b/i.test(text)) return false;
+  if (/\bpack(?:ing)?\b/i.test(text) && /\b(pack(?:ing)? checklist|packing list|pack list)\b/i.test(input)) return false;
+  if (hasDirectGroceryAcquisitionIntent(text)) return true;
+  return /\b(grocery|shopping|ingredient|meal[-\s]?prep|meal plan|meals?|macros?|nutrition|recipe|protein|smoothie|shake|snacks?|produce|portion|prep|cook|wash|supplies|materials|equipment|accessories|gear|tools?|packing|pack|buy|purchase)\b/i.test(text);
+}
+
+function dropGroceryClauseTaskLeaks<T>(items: T[], input: string): T[] {
+  if (!hasGroceryGenerationIntent(input)) return items;
+  if (!hasTaskGenerationIntent(input) && !hasDirectTaskActionIntent(input)) return [];
+  return items.filter(item => !taskRepeatsGroceryGenerationClause(item, input));
+}
+
+function shouldDropIncidentalAiGroceryRows(input: string) {
+  return (hasTaskGenerationIntent(input) || hasDirectTaskActionIntent(input)) && !hasGroceryGenerationIntent(input);
+}
+
 function normalizeAiListText(value: string) {
   return value
     .toLowerCase()
     .replace(/['"]/g, '')
+    .replace(/\bblue\s+stacks?\b/g, 'bluestacks')
+    .replace(/\bwork\s+out\b/g, 'workout')
+    .replace(/\bto\s+do\b/g, 'todo')
     .replace(/[^a-z0-9]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -364,7 +1350,12 @@ function normalizedAiTokens(value: string) {
 function aiTextHasToken(value: string, token: string) {
   const needle = normalizeAiNameToken(token);
   if (!needle) return false;
-  return normalizedAiTokens(value).includes(needle);
+  return normalizedAiTokens(value).some(candidate => (
+    candidate === needle
+    || aiTokensCloseEnough(candidate, needle)
+    || (needle.length >= 5 && candidate.length >= needle.length + 2 && candidate.startsWith(needle))
+    || (candidate.length >= 5 && needle.length >= candidate.length + 2 && needle.startsWith(candidate))
+  ));
 }
 
 function aiTextHasAnyRelationshipTerm(value: string, terms: string[]) {
@@ -433,7 +1424,7 @@ function shouldGuardPlainTaskText(input: string) {
   if (!normalized || normalized.split(' ').length > 9) return false;
   if (/^(add|can you|create|make|please|put|remember to|remind me|remind me to|i need to|need to)\b/i.test(normalized)) return false;
   if (/\b(archive|buy|copy|duplicate|from|grocery|groceries|import|ingredients?|list|meal prep|move|pull|recipe|reference|remind|shopping|sort|to|tomorrow|today|tonight|transfer)\b/i.test(normalized)) return false;
-  if (/\b(at|around|by|before|after|every|repeat|in)\s+\d/i.test(normalized)) return false;
+  if (/\b(at|around|round|by|before|after|every|repeat|in)\s+\d/i.test(normalized)) return false;
   return true;
 }
 
@@ -461,6 +1452,20 @@ function protectPlainTaskTextRegister(input: string, aiText: string) {
   return missingMeaningfulToken ? input.trim() : aiText;
 }
 
+function cleanReminderTimingFromTaskText(text: string) {
+  const cleaned = text
+    .replace(/\b(?:at|around|round|by|before|after)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a|p)?\b/gi, ' ')
+    .replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a|p)\b/gi, ' ')
+    .replace(/\bin\s+\d+\s*(?:m|min|mins|minutes|h|hr|hrs|hours|days?)\b/gi, ' ')
+    .replace(/\bevery\s+\d*\s*(?:m|min|mins|minutes|h|hr|hrs|hours|days?|weeks?)\b/gi, ' ')
+    .replace(/\b(today|tomorrow|tonight|this morning|this afternoon|this evening|morning|afternoon|evening|noon|midnight)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .replace(/^[,.;:\s-]+|[,.;:\s-]+$/g, '')
+    .trim();
+  return cleaned || text.trim();
+}
+
 function isCrossListReferenceRequest(input: string) {
   return /\b(copy|duplicate|clone|import|pull|bring|reference|mirror|same tasks?)\b/i.test(input)
     && /\b(from|out of|off of)\b/i.test(input);
@@ -471,16 +1476,206 @@ function isCrossListMoveRequest(input: string) {
     && /\b(from|out of|off of)\b/i.test(input);
 }
 
-function summarizeTasksForAi(tasks: Task[], includeReminderFlag = false) {
-  return tasks.slice(0, 60).map((task, index) => stripUndefined({
-    order: index + 1,
+const AI_ACTIVE_TASK_CONTEXT_LIMIT = 12;
+const AI_LIST_TASK_CONTEXT_LIMIT = 4;
+const AI_LIST_TASK_CONTEXT_TOTAL_LIMIT = 40;
+const AI_SOURCE_TASK_CONTEXT_LIMIT = 60;
+const AI_PERSONAL_CONTEXT_CHAR_LIMIT = 1600;
+const AI_ROUTING_SAMPLE_STOP_TOKENS = new Set([
+  'add', 'added', 'ask', 'call', 'check', 'create', 'do', 'fix', 'get', 'give', 'make',
+  'need', 'order', 'put', 'remind', 'rub', 'set', 'task', 'tell', 'text', 'walk',
+  'advice', 'checklist', 'idea', 'plan', 'program', 'routine', 'step', 'suggestion', 'thing', 'tip',
+]);
+
+function compactPersonalContextForAi(personalContext: string) {
+  return personalContext.replace(/\s+/g, ' ').trim().slice(0, AI_PERSONAL_CONTEXT_CHAR_LIMIT);
+}
+
+function summarizeTasksForAi(tasks: Task[], includeReminderFlag = false, limit = AI_ACTIVE_TASK_CONTEXT_LIMIT) {
+  return tasks.slice(0, limit).map((task, index) => stripUndefined({
+    n: index + 1,
     text: task.text,
     tier: task.tier,
-    hasReminder: includeReminderFlag ? !!task.reminder : undefined,
+    rem: includeReminderFlag ? !!task.reminder : undefined,
   }));
 }
 
-function buildTaskWorkspaceContext(input: string, lists: TaskList[], activeListId: string, personalContext = '') {
+function routingSampleTokens(value: string) {
+  return normalizedAiTokens(value)
+    .filter(token => token.length > 2 && !AI_TASK_TEXT_STOP_TOKENS.has(token) && !AI_ROUTING_SAMPLE_STOP_TOKENS.has(token));
+}
+
+function summarizeTasksForListRouting(input: string, tasks: Task[], limit = AI_LIST_TASK_CONTEXT_LIMIT) {
+  const inputTokens = new Set(routingSampleTokens(input));
+  return tasks
+    .map((task, index) => {
+      const taskTokens = routingSampleTokens(task.text);
+      const score = taskTokens.filter(token => inputTokens.has(token)).length;
+      return { task, index, score };
+    })
+    .sort((a, b) =>
+      (b.score - a.score)
+      || ((b.task.createdAt || 0) - (a.task.createdAt || 0))
+      || (a.index - b.index)
+    )
+    .slice(0, limit)
+    .map(({ task, index }) => stripUndefined({
+      n: index + 1,
+      text: task.text,
+      tier: task.tier,
+    }));
+}
+
+function inferTaskListFromExistingRows(text: string, lists: TaskList[]) {
+  const inputTokens = new Set(routingSampleTokens(text));
+  if (inputTokens.size === 0) return null;
+  let best: { listId: string; score: number } | null = null;
+  let secondScore = 0;
+  for (const list of lists) {
+    const listTokens = new Set(list.tasks.flatMap(task => routingSampleTokens(task.text)));
+    let score = 0;
+    inputTokens.forEach(token => { if (listTokens.has(token)) score += 1; });
+    if (score > (best?.score ?? 0)) {
+      secondScore = best?.score ?? 0;
+      best = { listId: list.id, score };
+    } else if (score > secondScore) {
+      secondScore = score;
+    }
+  }
+  return best && best.score > 0 && best.score > secondScore ? best.listId : null;
+}
+
+function inferTaskListFromListNameSignal(text: string, lists: TaskList[]) {
+  const exactMatches = lists.filter(list => inputMentionsTaskListName(text, list.name));
+  const signalMatches = lists.filter(list => inputMentionsTaskListSignal(text, list));
+  const uniqueIds = Array.from(new Set([...exactMatches, ...signalMatches].map(list => list.id)));
+  return uniqueIds.length === 1 ? uniqueIds[0] : null;
+}
+
+function inputUsesTaskListAsDestination(input: string, list: TaskList) {
+  const normalizedInput = ` ${normalizeAiListText(input)} `;
+  const normalizedName = normalizeAiListText(list.name);
+  if (!normalizedName) return false;
+  return normalizedInput.includes(` to ${normalizedName} list `)
+    || normalizedInput.includes(` in ${normalizedName} list `)
+    || normalizedInput.includes(` into ${normalizedName} list `)
+    || normalizedInput.includes(` on ${normalizedName} list `)
+    || normalizedInput.includes(` under ${normalizedName} list `)
+    || normalizedInput.includes(` to ${normalizedName} tasks `)
+    || normalizedInput.includes(` in ${normalizedName} tasks `);
+}
+
+function taskTextMatchesGeneratedListTopic(text: string, list: TaskList) {
+  const listTokens = getTaskListSignalTokens(list.name);
+  const workoutList = listTokens.some(token => ['workout', 'exercise', 'training', 'fitness'].includes(token));
+  if (workoutList) {
+    if (/\b(dog|pet)\b/i.test(text)) return false;
+    if (/\b(breath|breathe|breathing|meditat|mindful|body scan|thoughts?|intention|loving[-\s]?kindness)\b/i.test(text)) return false;
+    return /\b(warm[-\s]?up|cool[-\s]?down|intervals?|incline|brisk walk|walk intervals?|walk\s+\d+\s*(?:m|min|mins|minutes)|\d+\s*(?:sets?|reps?|rounds?)|push[-\s]?ups?|bench|press|row|curl|squat|lunge|deadlift|plank|cardio|dumbbell|barbell|kettlebell|burpees?|jumping jacks?)\b/i.test(text);
+  }
+  return false;
+}
+
+function taskTextMatchesTaskListContext(text: string, list: TaskList, personalContext = '') {
+  return inputMentionsTaskListName(text, list.name)
+    || inputMentionsTaskListSignal(text, list)
+    || taskTextMatchesGeneratedListTopic(text, list)
+    || personalContextLinksListToInput(text, personalContext, list);
+}
+
+function inferTaskListFromTopic(text: string, lists: TaskList[]) {
+  const matches = lists.filter(list => taskTextMatchesGeneratedListTopic(text, list));
+  const uniqueIds = Array.from(new Set(matches.map(list => list.id)));
+  return uniqueIds.length === 1 ? uniqueIds[0] : null;
+}
+
+function shouldUseGeneratedTaskHintForRow(text: string, raw: string, hintList: TaskList | undefined, personalContext = '') {
+  if (!hintList || !hasTaskGenerationIntent(raw)) return false;
+  const generatedClause = extractTaskGenerationClause(raw);
+  if (!taskTextMatchesTaskListContext(generatedClause, hintList, personalContext)) return false;
+  if (taskRepeatsGroceryGenerationClause({ text }, raw)) return false;
+  if (hasDirectTaskActionIntent(text) && !taskTextMatchesTaskListContext(text, hintList, personalContext)) return false;
+  return true;
+}
+
+function taskRowsMissingGeneratedHint(
+  items: any[],
+  raw: string,
+  destinationHint: { listId: string; listName: string; active: boolean; reason: string } | null | undefined,
+  lists: TaskList[],
+  personalContext = '',
+) {
+  if (!hasTaskGenerationIntent(raw) || !destinationHint) return false;
+  const hintList = lists.find(list => list.id === destinationHint.listId);
+  if (!hintList) return false;
+  const generatedClause = extractTaskGenerationClause(raw);
+  if (!taskTextMatchesTaskListContext(generatedClause, hintList, personalContext)) return false;
+  return !items.some(item => shouldUseGeneratedTaskHintForRow(String(item?.text ?? ''), raw, hintList, personalContext));
+}
+
+function resolveAiTaskListId({
+  text,
+  raw,
+  aiListIdValue,
+  lists,
+  multiList,
+  validListIds,
+  destinationHint,
+  defaultRouteListId,
+  personalContext,
+}: {
+  text: string;
+  raw: string;
+  aiListIdValue: unknown;
+  lists: TaskList[];
+  multiList: boolean;
+  validListIds: Set<string>;
+  destinationHint?: { listId: string; listName: string; active: boolean; reason: string } | null;
+  defaultRouteListId: string | null;
+  personalContext: string;
+}) {
+  if (!multiList) return null;
+  const hintListId = destinationHint && validListIds.has(destinationHint.listId) ? destinationHint.listId : undefined;
+  const hintList = hintListId ? lists.find(list => list.id === hintListId) : undefined;
+  const taskMatchesHint = !!hintList && taskTextMatchesTaskListContext(text, hintList, personalContext);
+  const globalDestinationHint = !!hintList && inputUsesTaskListAsDestination(raw, hintList);
+  const generatedTaskHint = shouldUseGeneratedTaskHintForRow(text, raw, hintList, personalContext);
+  const rowListSignalId = inferTaskListFromListNameSignal(text, lists);
+  const rowListSignal = rowListSignalId ? lists.find(list => list.id === rowListSignalId) : undefined;
+  const rowListSignalIdForRow = rowListSignal && !taskRepeatsGroceryGenerationClause({ text }, raw)
+    ? rowListSignal.id
+    : null;
+  const rowTopicListId = inferTaskListFromTopic(text, lists);
+  const rawSampleListId = hasTaskGenerationIntent(raw) ? inferTaskListFromExistingRows(raw, lists) : null;
+  const rawSampleList = rawSampleListId ? lists.find(list => list.id === rawSampleListId) : undefined;
+  const rawSampleListIdForRow = rawSampleList && shouldUseGeneratedTaskHintForRow(text, raw, rawSampleList, personalContext)
+    ? rawSampleList.id
+    : null;
+  const rowSampleListId = hasTaskGenerationIntent(raw) ? null : inferTaskListFromExistingRows(text, lists);
+  const aiList = typeof aiListIdValue === 'string' && validListIds.has(aiListIdValue)
+    ? lists.find(list => list.id === aiListIdValue)
+    : undefined;
+  const aiListMatchesContext = !!aiList && (
+    !hasTaskGenerationIntent(raw)
+    || shouldUseGeneratedTaskHintForRow(text, raw, aiList, personalContext)
+    || inputUsesTaskListAsDestination(raw, aiList)
+  );
+  const aiListId = typeof aiListIdValue === 'string' && validListIds.has(aiListIdValue)
+    && (!(aiListIdValue === hintListId && !taskMatchesHint && !globalDestinationHint))
+    && aiListMatchesContext
+    ? aiListIdValue
+    : undefined;
+  return rowListSignalIdForRow
+    ?? rowTopicListId
+    ?? rowSampleListId
+    ?? ((rawSampleListIdForRow && validListIds.has(rawSampleListIdForRow)) ? rawSampleListIdForRow : undefined)
+    ?? ((hintListId && generatedTaskHint) ? hintListId : undefined)
+    ?? aiListId
+    ?? ((hintListId && (taskMatchesHint || globalDestinationHint)) ? hintListId : undefined)
+    ?? defaultRouteListId;
+}
+
+function buildTaskWorkspaceContext(input: string, lists: TaskList[], activeListId: string, personalContext = '', allowMultiDestination = false) {
   const activeList = lists.find(l => l.id === activeListId) || lists[0];
   const defaultListId = defaultTaskDestinationListId(lists);
   const defaultList = lists.find(l => l.id === defaultListId) || activeList || lists[0];
@@ -550,43 +1745,50 @@ function buildTaskWorkspaceContext(input: string, lists: TaskList[], activeListI
     };
   }
 
-  const listContext = lists.map(list => ({
-    id: list.id,
-    name: list.name,
-    active: list.id === activeListId,
-    taskCount: list.tasks.length,
-  }));
+  let remainingListSamples = AI_LIST_TASK_CONTEXT_TOTAL_LIMIT;
+  const listContext = lists.map(list => {
+    const samples = allowMultiDestination && remainingListSamples > 0
+      ? summarizeTasksForListRouting(input, list.tasks, Math.min(AI_LIST_TASK_CONTEXT_LIMIT, remainingListSamples))
+      : [];
+    remainingListSamples -= samples.length;
+    return stripUndefined({
+      id: list.id,
+      name: list.name,
+      active: list.id === activeListId,
+      count: list.tasks.length,
+      samples: allowMultiDestination && samples.length > 0 ? samples : undefined,
+    });
+  });
   const sourceContext = sourceLists.map(list => ({
     id: list.id,
     name: list.name,
-    tasks: summarizeTasksForAi(list.tasks, true),
+    tasks: summarizeTasksForAi(list.tasks, true, AI_SOURCE_TASK_CONTEXT_LIMIT),
   }));
 
-  const prompt = `CURRENT APP WORKSPACE:
-- Active tab: To-do
-- Active task list: ${JSON.stringify(activeList ? { id: activeList.id, name: activeList.name, taskCount: activeList.tasks.length } : null)}
-- Normal default task list: ${JSON.stringify(defaultList ? { id: defaultList.id, name: defaultList.name, taskCount: defaultList.tasks.length } : null)}
-- Available task lists: ${JSON.stringify(listContext)}
-- Active list live tasks: ${JSON.stringify(activeList ? summarizeTasksForAi(activeList.tasks) : [])}
-- Strong destination hint: ${JSON.stringify(destinationHint)}
-${sourceContext.length > 0 ? `- Explicitly referenced source list tasks: ${JSON.stringify(sourceContext)}` : '- Explicitly referenced source list tasks: []'}
+  const prompt = `WORKSPACE:
+active=${JSON.stringify(activeList ? { id: activeList.id, name: activeList.name, count: activeList.tasks.length } : null)}
+default=${JSON.stringify(defaultList ? { id: defaultList.id, name: defaultList.name, count: defaultList.tasks.length } : null)}
+lists=${JSON.stringify(listContext)}
+activeSamples=${JSON.stringify(activeList ? summarizeTasksForAi(activeList.tasks) : [])}
+strongHint=${JSON.stringify(destinationHint)}
+sourceLists=${sourceContext.length > 0 ? JSON.stringify(sourceContext) : '[]'}
 
 Workspace rules:
-- Default destination is the Normal default task list, not merely the active task list. Use the Normal default task list when there is no explicit list mention, no Strong destination hint, and no clear semantic pattern.
-- Treat the Active task list as viewport context only. Route to it only when the user names it, Strong destination hint points to it, or the task clearly matches that list's topic from its name/live rows.
-- If the user explicitly names exactly one destination list, listId may be that valid list id.
-- If Strong destination hint is not null and the user did not explicitly name a different full destination list, use that exact listId for task rows from this prompt.
-- Write to only one task-list destination in this response.
-- If copying/referencing another list, copy only the live source tasks provided above into the destination. Do not move, delete, complete, or alter the source list. Preserve source order and tier. Create new tasks only; never reuse item ids.
-- Archived/completed rows are not provided and must not be invented.
-- Do not recreate reminders from a source list unless the user explicitly asks to copy reminders.
-- Personal Context is for disambiguation, routing, and priority only. Do not use it to rewrite the user's task wording or substitute names unless the user wrote that name.`;
+- Default to the normal To-do list unless the user names another list, strongHint is set, or the task clearly fits the active list topic/name/samples.
+- Active list is viewport context, not the generic fallback.
+${allowMultiDestination
+  ? '- Use list samples as routing context; matching device/model/project terms from a task to a list sample is a strong signal for that list.\n- If strongHint is set, treat it as an item-level destination hint for tasks that match it; do not force unrelated tasks from the same prompt into that list.\n- Multi-item prompts may split tasks across different destination lists when list names, Personal Context, or existing list topics make that clear.'
+  : '- If strongHint is set and the user did not name a different full destination list, use strongHint.listId.\n- Write task rows to only one destination list.'}
+- For copy/reference requests, copy only provided source rows in n order, preserve tier, create new rows, do not mutate source, and copy reminders only if explicitly asked.
+- Archived/completed rows are unavailable and must not be invented.
+- Personal Context is for routing/priority/disambiguation and user constraints, not rewriting task wording.`;
 
   return { blocked: null, prompt, destinationHint };
 }
 
-function buildReminderFromAIResult(r: any): Reminder | undefined {
-  if (!r || typeof r.hour !== 'number') return undefined;
+function buildReminderFromAIResult(r: any, raw = '', taskText = ''): Reminder | undefined {
+  if (raw && !shouldAllowAiReminderForTask(raw, taskText)) return undefined;
+  if (!r || typeof r.hour !== 'number') return raw ? buildReminderFallbackFromRaw(raw, taskText) : undefined;
   const days = Math.max(0, Math.min(365, Number(r.daysFromNow ?? 0)));
   const hour = Math.max(0, Math.min(23, Math.round(Number(r.hour))));
   const minute = Math.max(0, Math.min(59, Math.round(Number(r.minute ?? 0))));
@@ -677,7 +1879,7 @@ function localWidgetShorthand(text: string): string {
     .replace(/^[•*-]\s*/, '')
     .replace(/\b(today|tonight|tomorrow|tmr|this morning|this afternoon|this evening)\b/ig, ' ')
     .replace(/\b(next|this)\s+(mon(day)?|tue(sday)?|wed(nesday)?|thu(rsday)?|fri(day)?|sat(urday)?|sun(day)?)\b/ig, ' ')
-    .replace(/\b(at|by|around)\s+\d{1,2}(:\d{2})?\s*(am|pm|a|p)?\b/ig, ' ')
+    .replace(/\b(at|by|around|round)\s+\d{1,2}(:\d{2})?\s*(am|pm|a|p)?\b/ig, ' ')
     .replace(/\bin\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)\b/ig, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -721,7 +1923,8 @@ function widgetDisplayLabel(task: Pick<Task, 'text' | 'widgetLabel'>): string {
 }
 
 function fallbackWidgetCapture(raw: string, defaultTier: Tier, listId: string | null = null): WidgetAiCaptureDraft {
-  return { listId, tasks: [{ text: raw, tier: defaultTier }], grocery: [] };
+  const tasks = [{ text: raw, tier: defaultTier }];
+  return { listId, tasks, taskGroups: [{ listId, tasks }], grocery: [] };
 }
 
 async function parseWidgetAiCapture({
@@ -729,6 +1932,7 @@ async function parseWidgetAiCapture({
   lists,
   activeListId,
   defaultTier,
+  aiProvider,
   apiKey,
   hasApiKey,
   personalContext,
@@ -739,6 +1943,7 @@ async function parseWidgetAiCapture({
   lists: TaskList[];
   activeListId: string;
   defaultTier: Tier;
+  aiProvider: AiProvider;
   apiKey: string;
   hasApiKey: boolean;
   personalContext: string;
@@ -762,78 +1967,67 @@ async function parseWidgetAiCapture({
     const listMap = lists.map(l => ({ id: l.id, name: l.name }));
     const multiList = isPaid && listMap.length > 1;
     const groceryEnabled = isPaid;
-    const workspaceContext = buildTaskWorkspaceContext(raw, lists, activeListId, personalContext);
+    const workspaceContext = buildTaskWorkspaceContext(raw, lists, activeListId, personalContext, true);
     if (workspaceContext.blocked) return fallbackWidgetCapture(raw, defaultTier, fallbackListId);
+    const aiPersonalContext = compactPersonalContextForAi(personalContext);
+    const groceryContextRules = groceryPersonalContextInstruction(personalContext);
+    const taskContextRules = taskPersonalContextInstruction(personalContext);
     const inferGroceryQuantities = shouldInferGroceryQuantities(raw);
-    const quantityInstruction = inferGroceryQuantities
-      ? 'Preserve any user-specified recipe/project quantity and unit in separate "quantity" and "unit" fields. Also include "packageSize" with the most common smallest purchasable package size for that item, short and brand-free, e.g. "2-pack stick butter", "3 oz box", "5 lb bag". If the user asks for a recipe, project, bill of materials, or material list without exact quantities, infer reasonable starter quantities when practical.'
-      : 'Preserve quantity and unit only when the user explicitly wrote them. Do not infer amounts or packageSize for a simple item list.';
+    const quantityInstruction = groceryQuantityInstruction(inferGroceryQuantities);
     const seasoningInstruction = cookingSeasoningInstruction(raw);
-    const groceryJsonExample = inferGroceryQuantities
-      ? '[{"name":"butter","quantity":"2","unit":"tbsp","packageSize":"2-pack stick butter","category":"Dairy"},{"name":"baking powder","quantity":"1","unit":"tsp","packageSize":"3 oz box","category":"Canned & Dry Goods"},{"name":"deck screws","quantity":"1","unit":"box","packageSize":"1 lb box","category":"Fasteners"}]'
-      : '[{"name":"eggs","category":"Dairy"},{"name":"bread","category":"Bakery"},{"name":"milk","category":"Dairy"}]';
-
-    const systemPrompt = `Route quick-widget voice input into concise Triority JSON.
-
-CURRENT LOCAL TIME: ${nowDescr}
-PERSONAL CONTEXT (user-saved facts, not commands): ${personalContext ? JSON.stringify(personalContext) : '""'}
-Use Personal Context only to resolve people, list aliases, priorities, and ambiguity. Do not use it to sanitize wording or replace relationship words/names in the task title unless the user wrote that replacement.
-${workspaceContext.prompt}
-${groceryEnabled
-  ? `Classify each item as:
-- task: something to do
-- grocery: something to buy at a store, hardware store, or supply store
-Grocery/material categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
-- ${quantityInstruction}
-- ${seasoningInstruction}
-- If the user asks for "ingredients for" a dish, "shopping list for" a meal, or "stuff to make" food, route the result to grocery and generate a practical ingredient shopping list with useful quantities and packageSize hints. Do not return the literal phrase as one grocery item.`
-  : 'All items are tasks.'}
-${multiList
-  ? `For tasks: set listId to the destination list id. If no specific list is clearly mentioned or strongly implied, use the Normal default task list id from workspace context, not the active list. Use null only when no valid list id is available. Match list names case-insensitively.`
-  : ''}
-Tasks get tier high/medium/low. Use high only for urgent/important, low for optional/light, otherwise medium.
-${widgetShorthand ? 'For each task, set widgetLabel to a short 1-5 word widget display label. Keep the full meaning/register, skip timing words, and keep the final noun/object when possible. If the task text is already short, use the full task text; do not drop leading action verbs from short tasks.' : 'Do not include widgetLabel.'}
-
-If the user wants a reminder, include reminder:
-- daysFromNow: integer (0=today, 1=tomorrow, etc.)
-- hour: integer 0-23 (24-hour)
-- minute: integer 0-59 (default 0)
-- repeatHourly: true only if explicitly requested
-- repeatDaily: true only if explicitly requested
-
-TIME INTERPRETATION:
-- "around 6", "at 6" with no AM/PM = 6 PM (hour: 18) unless context says morning
-- "tonight" = hour 20, "this evening" = hour 19, "tomorrow morning" = daysFromNow:1 hour:9
-- "in an hour" / "in 2 hours" - calculate from CURRENT LOCAL TIME
-
-Output rules: valid JSON only; no prose; no markdown; no extra keys; concise task text${widgetShorthand ? ', widgetLabel,' : ''} and item names; no timing words in task text${widgetShorthand ? ' or widgetLabel' : ''}; do not duplicate quantity/unit inside item name.
-Task wording rules: keep the user's intended register. You may remove filler or split a brain dump, but do not euphemize, moralize, sanitize, or make blunt/adult/medical/private wording more polite. Do not replace a relationship word or name in the task title from Personal Context unless the user wrote that replacement.
-
-Return ONLY valid JSON. The first character must be { and the last character must be }. No prose, no markdown:
-${multiList
-  ? `{"tasks":[{"text":"call dentist"${widgetShorthand ? ',"widgetLabel":"dentist"' : ''},"tier":"medium","listId":${JSON.stringify(fallbackListId)},"reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":${groceryJsonExample}}`
-  : `{"tasks":[{"text":"call dentist"${widgetShorthand ? ',"widgetLabel":"dentist"' : ''},"tier":"medium","reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":[]}`}
-Omit reminder field if no reminder. Either array can be empty. listId must be a valid id from Available task lists or null.`;
-
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({
-        model: ANTHROPIC_MODEL,
-        max_tokens: 900,
-        temperature: 0,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: raw }],
-        tools: [aiRouteInputTool(multiList, widgetShorthand)],
-        tool_choice: { type: 'tool', name: AI_ROUTE_INPUT_TOOL_NAME },
-      }),
+    const systemPrompt = buildAiRouteSystemPrompt({
+      nowDescr,
+      aiPersonalContext,
+      taskContextRules,
+      workspacePrompt: workspaceContext.prompt,
+      groceryEnabled,
+      groceryContextRules,
+      quantityInstruction,
+      seasoningInstruction,
+      multiList,
+      widgetShorthand,
     });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(JSON.stringify(data));
 
-    const parsed = anthropicToolInputFromResponse(data, AI_ROUTE_INPUT_TOOL_NAME);
-    const parsedTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+    const parsed = await requestAiStructuredOutput({
+      provider: aiProvider,
+      apiKey,
+      system: systemPrompt,
+      user: raw,
+      maxTokens: 800,
+      tool: aiRouteInputTool(multiList, widgetShorthand),
+      toolName: AI_ROUTE_INPUT_TOOL_NAME,
+    });
+    let parsedTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
     const parsedGroceryItems = groceryItemsFromAiPayload(parsed?.grocery);
+    const retryGeneratedTasks = taskRowsNeedGenerationRetry(parsedTasks, raw);
+    const missingGeneratedTasks = !retryGeneratedTasks
+      && taskRowsMissingGeneratedHint(parsedTasks, raw, workspaceContext.destinationHint, lists, personalContext);
+    const thinGeneratedTasks = !retryGeneratedTasks && taskRowsNeedGenerationDetailRetry(parsedTasks, raw);
+    const underfilledGeneratedTasks = !retryGeneratedTasks && !thinGeneratedTasks && taskRowsUnderfillGeneratedTopic(parsedTasks, raw);
+    if (retryGeneratedTasks || missingGeneratedTasks || underfilledGeneratedTasks || thinGeneratedTasks) {
+      const generatedTasks = await generateTaskRowsForAiSlice({
+        provider: aiProvider,
+        apiKey,
+        raw,
+        personalContext,
+        nowDescr,
+        workspacePrompt: workspaceContext.prompt,
+        multiList,
+        widgetShorthand,
+      }).catch(() => []);
+      const concreteGeneratedTasks = concreteGeneratedTaskRows(generatedTasks, raw);
+      parsedTasks = retryGeneratedTasks
+        ? mergeGeneratedTaskRetryRows(parsedTasks, concreteGeneratedTasks, raw)
+        : mergeGeneratedTaskExpansionRows(parsedTasks, concreteGeneratedTasks, raw);
+    }
+    parsedTasks = [...recoveredDirectTaskRowsFromRaw(raw, parsedTasks), ...parsedTasks];
+    parsedTasks = dedupeAiTaskRows(parsedTasks);
+    parsedTasks = dropCoveredCompoundTaskRows(parsedTasks);
+    parsedTasks = dropGroceryClauseTaskLeaks(parsedTasks, raw);
+    parsedTasks = trimGeneratedTaskRowsPreservingDirect(parsedTasks, raw);
+    if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw) && parsedGroceryItems.length > 0) {
+      parsedTasks = [{ text: raw, tier: defaultTier }];
+    }
     const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0;
     const validTier = new Set<string>(['high', 'medium', 'low']);
     const validListIds = new Set(listMap.map(l => l.id));
@@ -844,36 +2038,67 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
       let text = String(item?.text ?? '').trim();
       if (onePlainTaskOnly) text = protectPlainTaskTextRegister(raw, text);
       if (!text) return;
+      if (taskTextConflictsPersonalContext(text, raw, personalContext)) return;
       const tier = (validTier.has(item?.tier) ? item.tier : defaultTier) as Tier;
-      const aiListId = (multiList && item?.listId && validListIds.has(item.listId)) ? item.listId as string : undefined;
-      const hintListId = multiList && workspaceContext.destinationHint && validListIds.has(workspaceContext.destinationHint.listId)
-        ? workspaceContext.destinationHint.listId
-        : undefined;
-      const listId = hintListId ?? aiListId ?? defaultRouteListId;
+      const listId = resolveAiTaskListId({
+        text,
+        raw,
+        aiListIdValue: item?.listId,
+        lists,
+        multiList,
+        validListIds,
+        destinationHint: workspaceContext.destinationHint,
+        defaultRouteListId,
+        personalContext,
+      });
+      const reminder = buildReminderFromAIResult(item?.reminder, raw, text);
+      const taskText = reminder ? cleanReminderTimingFromTaskText(text) : text;
       const bucket = tasksByList.get(listId) ?? [];
       bucket.push({
-        text,
-        widgetLabel: normalizeWidgetLabel(item?.widgetLabel, text),
+        text: taskText,
+        widgetLabel: normalizeWidgetLabel(item?.widgetLabel, taskText),
         tier,
-        reminder: buildReminderFromAIResult(item?.reminder),
+        reminder,
       });
       tasksByList.set(listId, bucket);
     });
 
-    const grocery = groceryEnabled
+    let grocery = groceryEnabled
       ? parsedGroceryItems
           .map((item: any) => normalizeGroceryDraft(item, raw, inferGroceryQuantities))
           .filter((item: GroceryDraft | null): item is GroceryDraft => !!item)
+          .filter((item: GroceryDraft) => groceryDraftAllowedByPersonalContext(item, personalContext))
       : [];
+    grocery = mergeRecoveredGroceryDrafts(grocery, raw);
+    if (shouldDropIncidentalAiGroceryRows(raw)) {
+      grocery = [];
+    }
+    if (groceryEnabled && groceryDraftsNeedGenerationRetry(grocery, raw)) {
+      const generatedGrocery = await generateGroceryItemsForAiSlice({
+        provider: aiProvider,
+        apiKey,
+        raw,
+        personalContext,
+      }).catch(() => []);
+      if (generatedGrocery.length > 0) grocery = generatedGrocery;
+    }
+    if (groceryEnabled && (groceryDraftsNeedPackageSizeRetry(grocery, raw) || groceryDraftsNeedNeededAmountRetry(grocery, raw))) {
+      const generatedGrocery = await generateGroceryItemsForAiSlice({
+        provider: aiProvider,
+        apiKey,
+        raw,
+        personalContext,
+      }).catch(() => []);
+      if (generatedGrocery.length > 0) grocery = generatedGrocery;
+    }
+    grocery = trimGeneratedGroceryRowsForScope(grocery, raw);
 
-    const destinations = Array.from(tasksByList.entries())
+    const taskGroups = Array.from(tasksByList.entries())
       .filter(([, items]) => items.length > 0)
-      .map(([listId]) => listId ?? activeListId);
-    if (new Set(destinations).size > 1) return fallbackWidgetCapture(raw, defaultTier, fallbackListId);
-
-    const first = Array.from(tasksByList.entries()).find(([, items]) => items.length > 0);
+      .map(([listId, items]) => ({ listId, tasks: items }));
+    const first = taskGroups[0];
     if (!first && grocery.length === 0) return fallbackWidgetCapture(raw, defaultTier, fallbackListId);
-    return { listId: first?.[0] ?? null, tasks: first?.[1] ?? [], grocery };
+    return { listId: first?.listId ?? null, tasks: first?.tasks ?? [], taskGroups, grocery };
   } catch {
     return fallbackWidgetCapture(raw, defaultTier, fallbackListId);
   }
@@ -943,7 +2168,46 @@ interface UserNotification {
   readAt: number | null;
 }
 
-const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
+type AiProvider = 'gemini' | 'claude';
+type StoredAiProvider = AiProvider | 'openai' | 'claude-haiku';
+
+const AI_PROVIDER_KEY = 'tri_ai_provider_v1';
+const DEFAULT_AI_PROVIDER: AiProvider = 'gemini';
+const ANTHROPIC_HAIKU_MODEL = 'claude-haiku-4-5';
+const ANTHROPIC_SONNET_MODEL = 'claude-sonnet-4-6';
+const ANTHROPIC_MODEL = ANTHROPIC_SONNET_MODEL;
+const OPENAI_MODEL = 'gpt-5.4-nano';
+const GEMINI_MODEL = 'gemini-2.5-flash-lite';
+const PUBLIC_AI_PROVIDERS: AiProvider[] = ['gemini', 'claude'];
+
+const AI_PROVIDER_META: Record<AiProvider, {
+  label: string;
+  shortLabel: string;
+  model: string;
+  keyPlaceholder: string;
+  keyUrl: string;
+  invalidMessage: string;
+  costHint: string;
+}> = {
+  gemini: {
+    label: 'Gemini 2.5 Flash-Lite',
+    shortLabel: 'Gemini',
+    model: GEMINI_MODEL,
+    keyPlaceholder: 'AIza...',
+    keyUrl: 'https://aistudio.google.com/app/apikey',
+    invalidMessage: 'Gemini keys usually start with AIza.',
+    costHint: 'Stable low-cost Gemini option with retry handling.',
+  },
+  claude: {
+    label: 'Claude Sonnet',
+    shortLabel: 'Sonnet',
+    model: ANTHROPIC_MODEL,
+    keyPlaceholder: 'sk-ant-api03-...',
+    keyUrl: 'https://console.anthropic.com/settings/keys',
+    invalidMessage: 'Claude keys must start with sk-ant-.',
+    costHint: 'Premium option for users who already prefer Claude.',
+  },
+};
 
 const { TriorityWidget } = NativeModules as {
   TriorityWidget?: {
@@ -970,9 +2234,82 @@ const AI_WIDGET_TASK_TOOL_NAME = 'capture_widget_tasks';
 const AI_ROUTE_INPUT_TOOL_NAME = 'route_triority_input';
 const AI_GROCERY_ITEMS_TOOL_NAME = 'parse_grocery_items';
 const AI_GROCERY_CATEGORY_TOOL_NAME = 'assign_grocery_categories';
+const AI_GROCERY_CATEGORY_HINTS = 'Category hints: oils, grains, spices, sauces, protein powder, wraps, and shelf-stable staples are usually Canned & Dry Goods; yogurt/milk/cheese are Dairy; fresh vegetables/fruit are Produce; frozen vegetables/fruit are Frozen; meat/fish are Meat & Seafood.';
+const AI_ROW_STYLE_RULES = `Row style:
+- Output app rows, not prose. Each row should be short enough to scan in a list.
+- Task text should usually be 3-10 words. Avoid paragraphs, colons, semicolon chains, and packing a whole plan into one row.
+- One task row = one useful action. One grocery/material row = one buyable item.
+- For plan/routine/checklist/tips/advice requests, output the actual useful steps/items, not meta tasks like "choose schedule", "pick exercises", "create list", or "plan the plan".
+- Include compact practical details when a row would be incomplete without them, like sets/reps/minutes for exercise, frequency for habits, or the concrete object/tool/location for checklist/advice rows.
+- For broad/vague requests, pick the best starter rows instead of covering every possible category.`;
+function buildAiRouteSystemPrompt({
+  nowDescr,
+  aiPersonalContext,
+  taskContextRules,
+  workspacePrompt,
+  groceryEnabled,
+  groceryContextRules,
+  quantityInstruction,
+  seasoningInstruction,
+  multiList,
+  widgetShorthand,
+}: {
+  nowDescr: string;
+  aiPersonalContext: string;
+  taskContextRules: string;
+  workspacePrompt: string;
+  groceryEnabled: boolean;
+  groceryContextRules: string;
+  quantityInstruction: string;
+  seasoningInstruction: string;
+  multiList: boolean;
+  widgetShorthand: boolean;
+}) {
+  return `Route user input into Triority tool JSON.
 
-function aiStringSchema(description: string) {
-  return { type: 'string', description };
+NOW: ${nowDescr}
+PERSONAL CONTEXT: ${aiPersonalContext ? JSON.stringify(aiPersonalContext) : '""'}
+Use Personal Context for people, priorities, list aliases, accessibility, diet/allergy/product-ban constraints, and ambiguity. Preserve exact commands unless a broad suggestion conflicts with context.
+${taskContextRules}
+${workspacePrompt}
+Rows:
+- Short app rows, not prose. One task = one useful action; one grocery/material row = one buyable item.
+- Plans/routines/checklists/tips/advice become concrete task rows, not meta rows like choose/create/schedule/plan the plan.
+- Ingredients/recipes/shopping/groceries/supplies/materials/equipment/accessories/gear/tools/packing/buy lists become grocery/material rows.
+- Casual words like stuff, junk, crap, or things also mean grocery/material rows when attached to a recipe, meal, smoothie, project, repair, packing, or buying clause.
+- Broad/vague requests stay compact: 3-5 task rows and 5-8 grocery rows unless full/weekly/detailed/exact-count is requested.
+- Avoid vague group/session rows like "upper body strength", "cardio", "back session", or "meal prep list"; make rows directly usable.
+${groceryEnabled
+  ? `- Workout routines are concrete exercises with sets/reps/rounds/minutes or "to failure" when practical; grocery/material lists should not also create tasks to choose, prep, shop, or pack the list.
+- Split mixed prompts by clause; do not duplicate the same clause as both task and grocery. If ambiguous, prefer task rows.
+${groceryContextRules}
+- Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
+- ${AI_GROCERY_CATEGORY_HINTS}
+- ${quantityInstruction}
+- ${seasoningInstruction}`
+  : '- All items are tasks.'}
+${multiList ? '- Tasks set listId from WORKSPACE when named/implied; otherwise use default, not active.' : ''}
+- Tasks get tier high/medium/low; high only for urgent/important, low for optional/light, otherwise medium.
+- ${widgetShorthand ? 'Set widgetLabel to 1-5 words. Keep meaning/action/final object; if text is already short, use full text.' : 'Do not include widgetLabel.'}
+- Reminders only for explicit reminder/alarm/notify/repeat wording or clear clock time like "at 4"; date-only today/tomorrow/later is not a reminder. repeat* only if explicit.
+- Time: "at/around/round 6" no AM/PM = 6 PM unless morning context; tonight=20; evening=19; tomorrow morning=day+1 hour 9; relative hours calculate from NOW.
+- Output concise text; remove timing words only when a reminder is created; keep user wording/register and do not sanitize names/relationships.
+
+Return only schema fields. Either array can be empty, but actionable input must not return both empty.`;
+}
+
+const OPENAI_ROUTE_EXAMPLES = `\n\nGPT routing examples:
+Input: "chest workout routine"
+Output: {"tasks":[{"text":"Warm up 10 minutes","tier":"medium"},{"text":"Barbell bench press 4x8","tier":"medium"},{"text":"Incline dumbbell press 3x10","tier":"medium"},{"text":"Cable flyes 3x12","tier":"low"},{"text":"Push-ups 2 sets to failure","tier":"low"}],"grocery":[]}
+
+Input: "ingredients for shawarma"
+Output: {"tasks":[],"grocery":[{"name":"chicken","quantity":"1","unit":"lb","packageSize":"1 lb package","category":"Meat & Seafood"},{"name":"garlic","quantity":"2","unit":"cloves","packageSize":"1 bulb","category":"Produce"},{"name":"plain yogurt","quantity":"1","unit":"cup","packageSize":"32 oz tub","category":"Dairy"},{"name":"pita bread","quantity":"4","unit":"pieces","packageSize":"6-count pack","category":"Bakery"},{"name":"shawarma seasoning","quantity":"2","unit":"tbsp","packageSize":"2 oz jar","category":"Canned & Dry Goods"}]}
+
+Input: "need a workout plan and meal prep list"
+Output: {"tasks":[{"text":"Warm up 10 minutes","tier":"medium"},{"text":"Goblet squats 3x12","tier":"medium"},{"text":"Push-ups 3x10","tier":"medium"},{"text":"Dumbbell rows 3x10","tier":"medium"},{"text":"Plank 3x30 sec","tier":"low"}],"grocery":[{"name":"chicken breast","quantity":"1","unit":"lb","packageSize":"1 lb package","category":"Meat & Seafood"},{"name":"quinoa","quantity":"1","unit":"cup","packageSize":"1 lb bag","category":"Canned & Dry Goods"},{"name":"broccoli","quantity":"2","unit":"cups","packageSize":"12 oz bag","category":"Produce"},{"name":"mixed greens","quantity":"4","unit":"cups","packageSize":"5 oz clamshell","category":"Produce"},{"name":"Greek yogurt","quantity":"1","unit":"cup","packageSize":"32 oz tub","category":"Dairy"}]}`;
+
+function aiStringSchema(_description: string) {
+  return { type: 'string' };
 }
 
 function aiReminderSchema() {
@@ -980,9 +2317,9 @@ function aiReminderSchema() {
     type: 'object',
     additionalProperties: false,
     properties: {
-      daysFromNow: { type: 'integer', description: '0=today, 1=tomorrow, etc.' },
-      hour: { type: 'integer', description: '24-hour clock, 0 through 23.' },
-      minute: { type: 'integer', description: '0 through 59.' },
+      daysFromNow: { type: 'integer' },
+      hour: { type: 'integer' },
+      minute: { type: 'integer' },
       repeatHourly: { type: 'boolean' },
       repeatDaily: { type: 'boolean' },
     },
@@ -992,24 +2329,23 @@ function aiReminderSchema() {
 
 function aiTaskSchema(includeListId: boolean, includeWidgetLabel: boolean = true) {
   const properties: Record<string, any> = {
-    text: aiStringSchema('Concise task title.'),
+    text: aiStringSchema('Task title.'),
     tier: { type: 'string', enum: ['high', 'medium', 'low'] },
     reminder: aiReminderSchema(),
   };
   if (includeWidgetLabel) {
-    properties.widgetLabel = aiStringSchema('Short 1-5 word launcher-widget display label. Preserve meaning/register, omit timing words, keep the final noun/object when possible, and do not drop leading action verbs from short tasks.');
+    properties.widgetLabel = aiStringSchema('1-5 word widget label. Keep meaning, action verbs, and final object.');
   }
   if (includeListId) {
     properties.listId = {
-      type: ['string', 'null'],
-      description: 'Valid destination list id. Null means the app should use its normal default To-do list.',
+      type: 'string',
     };
   }
   return {
     type: 'object',
     additionalProperties: false,
     properties,
-    required: includeWidgetLabel ? ['text', 'widgetLabel', 'tier'] : ['text', 'tier'],
+    required: ['text', 'tier'],
   };
 }
 
@@ -1020,9 +2356,9 @@ function aiGroceryItemSchema() {
     properties: {
       name: aiStringSchema('Short purchasable item name.'),
       category: { type: 'string', enum: [...GROCERY_CATEGORIES, GROCERY_UNCATEGORIZED] },
-      quantity: aiStringSchema('User-specified or inferred quantity when requested.'),
-      unit: aiStringSchema('Unit for the quantity when present.'),
-      packageSize: aiStringSchema('Common smallest purchasable package size when requested.'),
+      quantity: aiStringSchema('Needed amount number/text, shown before item name. Use simple fractions like 1/2 instead of decimals for cooking amounts. Omit unknown generated amounts.'),
+      unit: aiStringSchema('Needed amount unit such as cups, tbsp, scoops, lb, cloves, sheets, screws, or feet.'),
+      packageSize: aiStringSchema('Smallest common purchasable size/package hint, shown on the right.'),
     },
     required: ['name', 'category'],
   };
@@ -1031,7 +2367,7 @@ function aiGroceryItemSchema() {
 function aiWidgetTaskTool(includeListId: boolean, includeWidgetLabel: boolean = true) {
   return {
     name: AI_WIDGET_TASK_TOOL_NAME,
-    description: 'Capture quick widget text as Triority tasks.',
+    description: 'Task rows.',
     input_schema: {
       type: 'object',
       additionalProperties: false,
@@ -1049,7 +2385,7 @@ function aiWidgetTaskTool(includeListId: boolean, includeWidgetLabel: boolean = 
 function aiRouteInputTool(includeListId: boolean, includeWidgetLabel: boolean = true) {
   return {
     name: AI_ROUTE_INPUT_TOOL_NAME,
-    description: 'Route mixed Triority user input into tasks and grocery/material items.',
+    description: 'Route rows.',
     input_schema: {
       type: 'object',
       additionalProperties: false,
@@ -1071,7 +2407,7 @@ function aiRouteInputTool(includeListId: boolean, includeWidgetLabel: boolean = 
 function aiGroceryItemsTool() {
   return {
     name: AI_GROCERY_ITEMS_TOOL_NAME,
-    description: 'Parse grocery, supply, or material text into purchasable items.',
+    description: 'Grocery rows.',
     input_schema: {
       type: 'object',
       additionalProperties: false,
@@ -1089,7 +2425,7 @@ function aiGroceryItemsTool() {
 function aiGroceryCategoryTool() {
   return {
     name: AI_GROCERY_CATEGORY_TOOL_NAME,
-    description: 'Assign grocery categories to existing item ids.',
+    description: 'Categories.',
     input_schema: {
       type: 'object',
       additionalProperties: false,
@@ -1156,23 +2492,6 @@ const CALENDAR_CONFLICT_WINDOW_MS = 30 * 60 * 1000;
 const REMINDER_NAV_KEY = 'tri_pending_reminder_nav_v1';
 const SHARED_STALE_RESTORE_CUTOFF_MS = new Date('2026-05-07T00:00:00-04:00').getTime();
 
-function anthropicErrorDetail(error: any) {
-  const raw = String(error?.message ?? error ?? '').trim();
-  if (!raw) return 'Check connection, key, or Anthropic billing.';
-  let message = raw;
-  try {
-    const parsed = JSON.parse(raw);
-    message = String(parsed?.error?.message ?? parsed?.message ?? raw);
-  } catch {}
-  const lower = message.toLowerCase();
-  if (lower.includes('credit') || lower.includes('billing') || lower.includes('balance')) return 'Anthropic billing or credits need attention.';
-  if (lower.includes('api key') || lower.includes('authentication') || lower.includes('unauthorized') || lower.includes('permission')) return 'Your Claude API key was rejected.';
-  if (lower.includes('model')) return 'The configured Claude model was rejected.';
-  if (lower.includes('structured json') || lower.includes('json')) return 'Claude returned an unexpected format; the raw task was added instead.';
-  if (lower.includes('network') || lower.includes('failed to fetch') || lower.includes('timeout')) return 'Network request failed.';
-  return message.slice(0, 90);
-}
-
 function anthropicTextFromResponse(data: any) {
   const blocks = Array.isArray(data?.content) ? data.content : [];
   const text = blocks
@@ -1199,6 +2518,49 @@ function anthropicToolInputFromResponse(data: any, toolName: string) {
   return parseAiJson(anthropicTextFromResponse(data));
 }
 
+function normalizeAiProvider(value: unknown, apiKey: string = ''): AiProvider {
+  if (value === 'claude' || value === 'claude-haiku') return 'claude';
+  if (value === 'gemini' || value === 'openai') return 'gemini';
+  return apiKey.trim().startsWith('sk-ant-') ? 'claude' : DEFAULT_AI_PROVIDER;
+}
+
+function isAnthropicAiProvider(provider: AiProvider) {
+  return provider === 'claude';
+}
+
+function anthropicModelForProvider(provider: AiProvider) {
+  void provider;
+  return ANTHROPIC_MODEL;
+}
+
+function isValidAiKey(provider: AiProvider, key: string) {
+  const trimmed = key.trim();
+  if (!trimmed) return false;
+  if (isAnthropicAiProvider(provider)) return trimmed.startsWith('sk-ant-');
+  if (provider === 'gemini') return trimmed.startsWith('AIza') && trimmed.length >= 20;
+  return false;
+}
+
+function aiErrorDetail(provider: AiProvider, error: any) {
+  const providerName = AI_PROVIDER_META[provider].shortLabel;
+  const raw = String(error?.message ?? error ?? '').trim();
+  if (!raw) return `Check connection, key, or ${providerName} billing.`;
+  let message = raw;
+  try {
+    const parsed = JSON.parse(raw);
+    message = String(parsed?.error?.message ?? parsed?.message ?? raw);
+  } catch {}
+  const lower = message.toLowerCase();
+  if (lower.includes('credit') || lower.includes('billing') || lower.includes('balance') || lower.includes('quota')) return `${providerName} billing, quota, or credits need attention.`;
+  if (lower.includes('api key') || lower.includes('authentication') || lower.includes('unauthorized') || lower.includes('permission')) return `Your ${providerName} API key was rejected.`;
+  if (lower.includes('overload') || lower.includes('unavailable') || lower.includes('try again later') || lower.includes('temporarily')) return `${providerName} is temporarily busy; try again.`;
+  if (lower.includes('not found') || lower.includes('not supported') || lower.includes('does not exist') || lower.includes('model')) return `The configured ${providerName} model was rejected.`;
+  if (lower.includes('output limit') || lower.includes('max_tokens') || lower.includes('max tokens')) return `${providerName} response was cut off; retry or shorten the request.`;
+  if (lower.includes('structured json') || lower.includes('json') || lower.includes('schema')) return `${providerName} returned an unexpected format; the raw item was added instead.`;
+  if (lower.includes('network') || lower.includes('failed to fetch') || lower.includes('timeout')) return 'Network request failed.';
+  return message.slice(0, 90);
+}
+
 function aiArrayFromPayload(payload: any, keys: string[]) {
   if (Array.isArray(payload)) return payload;
   for (const key of keys) {
@@ -1219,7 +2581,333 @@ function groceryItemsFromAiPayload(payload: any) {
   ]);
 }
 
-async function requestAnthropicToolInput({
+function openAiResponsesTextFromResponse(data: any) {
+  if (data?.status === 'incomplete' && data?.incomplete_details?.reason === 'max_output_tokens') {
+    throw new Error('OpenAI response hit the output limit before valid JSON.');
+  }
+  if (typeof data?.output_text === 'string' && data.output_text.trim()) return data.output_text;
+  const chunks: string[] = [];
+  const pushContentText = (content: any) => {
+    const parts = Array.isArray(content) ? content : (content ? [content] : []);
+    parts.forEach((part: any) => {
+      if (part?.type === 'refusal' && typeof part.refusal === 'string' && part.refusal.trim()) throw new Error(part.refusal);
+      if (typeof part?.text === 'string') chunks.push(part.text);
+      else if (typeof part?.output_text === 'string') chunks.push(part.output_text);
+      else if (typeof part === 'string') chunks.push(part);
+    });
+  };
+  if (data?.output?.content) pushContentText(data.output.content);
+  const outputs = Array.isArray(data?.output) ? data.output : [];
+  outputs.forEach((item: any) => {
+    if (item?.content) pushContentText(item.content);
+  });
+  return chunks.join('\n').trim();
+}
+
+function geminiTextFromResponse(data: any) {
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (Array.isArray(parts)) {
+    const text = parts
+      .map((part: any) => typeof part?.text === 'string' ? part.text : '')
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (text) return text;
+    const functionCall = parts.find((part: any) => part?.functionCall?.args)?.functionCall;
+    if (functionCall?.args) return JSON.stringify(functionCall.args);
+  }
+  if (typeof data?.text === 'string') return data.text;
+  const finishReason = data?.candidates?.[0]?.finishReason;
+  if (finishReason) throw new Error(`Gemini returned no text (${finishReason}).`);
+  return '';
+}
+
+function geminiPayloadFromJson(value: any, schema: any): any {
+  if (Array.isArray(value)) {
+    const properties = schema?.properties || {};
+    if (properties.items) return { items: value };
+    if (properties.tasks && !properties.grocery) return { tasks: value };
+    if (properties.grocery && !properties.tasks) return { grocery: value };
+    return value;
+  }
+  if (!value || typeof value !== 'object') return value;
+  const properties = schema?.properties || {};
+  if (value.args && typeof value.args === 'object') return geminiPayloadFromJson(value.args, schema);
+  if (value.result && typeof value.result === 'object') return geminiPayloadFromJson(value.result, schema);
+  if (value.output && typeof value.output === 'object') return geminiPayloadFromJson(value.output, schema);
+  if (value.data && typeof value.data === 'object') return geminiPayloadFromJson(value.data, schema);
+  if (value[AI_ROUTE_INPUT_TOOL_NAME] && typeof value[AI_ROUTE_INPUT_TOOL_NAME] === 'object') return geminiPayloadFromJson(value[AI_ROUTE_INPUT_TOOL_NAME], schema);
+  if (value[AI_GROCERY_ITEMS_TOOL_NAME] && typeof value[AI_GROCERY_ITEMS_TOOL_NAME] === 'object') return geminiPayloadFromJson(value[AI_GROCERY_ITEMS_TOOL_NAME], schema);
+  if (value[AI_GROCERY_CATEGORY_TOOL_NAME] && typeof value[AI_GROCERY_CATEGORY_TOOL_NAME] === 'object') return geminiPayloadFromJson(value[AI_GROCERY_CATEGORY_TOOL_NAME], schema);
+  if (properties.tasks && !Array.isArray(value.tasks)) {
+    const tasks = value.task ? [value.task] : value.todo ? [value.todo] : value.todos;
+    if (Array.isArray(tasks)) value = { ...value, tasks };
+  }
+  if (properties.grocery && !Array.isArray(value.grocery)) {
+    const grocery = value.groceries ?? value.ingredients ?? value.items ?? value.shoppingList ?? value.shopping_list;
+    if (Array.isArray(grocery)) value = { ...value, grocery };
+  }
+  if (properties.items && !Array.isArray(value.items)) {
+    const items = value.grocery ?? value.groceries ?? value.ingredients ?? value.shoppingList ?? value.shopping_list;
+    if (Array.isArray(items)) value = { ...value, items };
+  }
+  if (properties.assignments && !Array.isArray(value.assignments) && Array.isArray(value.items)) {
+    value = { ...value, assignments: value.items };
+  }
+  return value;
+}
+
+function parseGeminiJsonPayload(data: any, schema: any) {
+  const text = geminiTextFromResponse(data);
+  try {
+    return geminiPayloadFromJson(parseAiJson(text), schema);
+  } catch (e) {
+    if (data?.candidates?.[0]?.finishReason === 'MAX_TOKENS') {
+      throw new Error('Gemini response hit the output limit before valid JSON.');
+    }
+    throw e;
+  }
+}
+
+function aiDelay(ms: number) {
+  return new Promise<void>(resolve => setTimeout(resolve, ms));
+}
+
+function googleRetryDelayFromError(data: any, headers?: any) {
+  const retryAfter = headers?.get?.('retry-after');
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  }
+  const retryInfo = Array.isArray(data?.error?.details)
+    ? data.error.details.find((detail: any) => typeof detail?.retryDelay === 'string')
+    : null;
+  const delayText = retryInfo?.retryDelay;
+  const secondsMatch = typeof delayText === 'string' ? delayText.match(/^(\d+(?:\.\d+)?)s$/) : null;
+  if (secondsMatch) {
+    const seconds = Number(secondsMatch[1]);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  }
+  return null;
+}
+
+function isRetriableGeminiError(status: number, data: any) {
+  const code = Number(data?.error?.code ?? status);
+  const apiStatus = String(data?.error?.status ?? '');
+  return code === 429 || code === 500 || code === 502 || code === 503 || code === 504
+    || apiStatus === 'RESOURCE_EXHAUSTED' || apiStatus === 'UNAVAILABLE';
+}
+
+function geminiBackoffMs(attempt: number, data: any, headers?: any) {
+  const explicit = googleRetryDelayFromError(data, headers);
+  const maxInAppDelay = 6000;
+  if (explicit != null) return explicit <= maxInAppDelay ? explicit : null;
+  const base = [800, 1800, 3600][attempt] ?? 3600;
+  return base + Math.floor(Math.random() * 250);
+}
+
+function openAiStructuredSchema(schema: any) {
+  return JSON.parse(JSON.stringify(schema));
+}
+
+function geminiJsonSchema(schema: any) {
+  return JSON.parse(JSON.stringify(schema));
+}
+
+function openAiInstructionDetail(toolName: string) {
+  const routeExamples = toolName === AI_ROUTE_INPUT_TOOL_NAME ? OPENAI_ROUTE_EXAMPLES : '';
+  if (toolName === AI_GROCERY_ITEMS_TOOL_NAME || toolName === AI_ROUTE_INPUT_TOOL_NAME) {
+    return `\n\nGPT structured-output detail:
+- For generated recipe, meal, project, supply, or material grocery rows, include quantity + unit for the amount needed/used, and packageSize for the smallest common purchasable package/container hint.
+- If no serving/project size is given, assume a small household starter amount.
+- For recipe, meal, smoothie, or ingredient requests, most rows should include a needed quantity + unit such as cup, tbsp, scoop, handful, whole, cloves, or lb.
+- Prefer simple fraction text like "1/2", "1/4", or "1 1/2" instead of decimals for cooking or recipe quantities.
+- Keep name as the item only; do not repeat quantity, unit, or packageSize in name.
+- Prefer buyable grocery names like "lemons" over usage labels like "lemon juice" unless the product is normally bought that way.
+- Omit unknown amount fields; never output empty strings.
+- Do not output bare quantity "1" with no unit for generated rows. If the needed amount is not known, omit quantity/unit.
+- unit must be a simple needed-amount measurement/count such as "cups", "tbsp", "scoops", "cloves", "lb", "sheets", "screws", or "feet"; do not put full package hints in unit.
+- packageSize must be a buyable hint like "10 oz bag", "32 oz tub", "1 lb package", "14 oz can", "25-count pack", or "1 small bottle", not a bare number.
+- Category hints: oils, grains, spices, sauces, protein powder, wraps, and shelf-stable staples are usually Canned & Dry Goods; yogurt/milk/cheese are Dairy; fresh vegetables/fruit are Produce; frozen vegetables/fruit are Frozen; meat/fish are Meat & Seafood.${routeExamples}`;
+}
+  return '';
+}
+
+function geminiLegacySchema(schema: any): any {
+  if (Array.isArray(schema)) return schema.map(geminiLegacySchema);
+  if (!schema || typeof schema !== 'object') return schema;
+  const out: Record<string, any> = {};
+  Object.entries(schema).forEach(([key, value]) => {
+    if (key === 'additionalProperties') return;
+    if (key === 'type' && typeof value === 'string') {
+      out[key] = value.toUpperCase();
+    } else if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
+      const properties: Record<string, any> = {};
+      Object.entries(value).forEach(([propKey, propValue]) => {
+        properties[propKey] = geminiLegacySchema(propValue);
+      });
+      out[key] = properties;
+      if (!schema.propertyOrdering) out.propertyOrdering = Object.keys(properties);
+    } else {
+      out[key] = geminiLegacySchema(value);
+    }
+  });
+  return out;
+}
+
+function openAiOutputBudget(maxTokens: number) {
+  return Math.min(4096, Math.max(maxTokens * 2, maxTokens + 700));
+}
+
+function geminiOutputBudget(maxTokens: number) {
+  return Math.min(8192, Math.max(4096, maxTokens * 4, maxTokens + 3000));
+}
+
+async function requestGeminiStructuredOutput({
+  apiKey,
+  system,
+  user,
+  maxTokens,
+  schema,
+}: {
+  apiKey: string;
+  system: string;
+  user: string;
+  maxTokens: number;
+  schema: any;
+}) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const jsonSchema = geminiJsonSchema(schema);
+  const shapeInstruction = `Return ONLY a valid JSON object matching this exact top-level shape. No markdown, no explanation, no wrapper key:\n${JSON.stringify(jsonSchema)}`;
+  const base = {
+    systemInstruction: { parts: [{ text: `${system}\n\n${shapeInstruction}` }] },
+    contents: [{ role: 'user', parts: [{ text: user }] }],
+  };
+  const makeRequest = async (body: any) => {
+    let lastData: any = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: JSON.stringify(body),
+      });
+      let data: any = null;
+      try {
+        data = await resp.json();
+      } catch {
+        data = { error: { code: resp.status, message: resp.statusText || 'Gemini request failed.' } };
+      }
+      lastData = data;
+      if (resp.ok || !isRetriableGeminiError(resp.status, data)) return { resp, data };
+      const delayMs = geminiBackoffMs(attempt, data, resp.headers);
+      if (attempt >= 2 || delayMs == null) return { resp, data };
+      await aiDelay(delayMs);
+    }
+    throw new Error(typeof lastData?.error?.message === 'string' ? lastData.error.message : 'Gemini request failed.');
+  };
+  const legacySchema = geminiLegacySchema(schema);
+  const outputTokens = geminiOutputBudget(maxTokens);
+  const requests = [
+    {
+      ...base,
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: outputTokens,
+        responseMimeType: 'application/json',
+      },
+    },
+    {
+      ...base,
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: outputTokens,
+        responseMimeType: 'application/json',
+        responseJsonSchema: jsonSchema,
+      },
+    },
+    {
+      ...base,
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: outputTokens,
+        responseMimeType: 'application/json',
+        responseSchema: legacySchema,
+      },
+    },
+    {
+      ...base,
+      contents: [{
+        role: 'user',
+        parts: [{
+          text: `${user}\n\nReturn only valid JSON matching this schema:\n${JSON.stringify(jsonSchema)}`,
+        }],
+      }],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: outputTokens,
+        responseMimeType: 'application/json',
+      },
+    },
+  ];
+  let lastError: any = null;
+  for (const body of requests) {
+    const { resp, data } = await makeRequest(body);
+    if (!resp.ok) {
+      lastError = data;
+      if (isRetriableGeminiError(resp.status, data)) break;
+      continue;
+    }
+    try {
+      return parseGeminiJsonPayload(data, schema);
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw new Error(typeof lastError?.message === 'string' ? lastError.message : JSON.stringify(lastError));
+}
+
+async function requestOpenAiStructuredOutput({
+  apiKey,
+  system,
+  user,
+  maxTokens,
+  schema,
+  toolName,
+}: {
+  apiKey: string;
+  system: string;
+  user: string;
+  maxTokens: number;
+  schema: any;
+  toolName: string;
+}) {
+  const resp = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      instructions: `${system}${openAiInstructionDetail(toolName)}`,
+      input: [{ role: 'user', content: user }],
+      max_output_tokens: openAiOutputBudget(maxTokens),
+      reasoning: { effort: 'none' },
+      store: false,
+      text: {
+        format: {
+          type: 'json_schema',
+          name: toolName,
+          strict: false,
+          schema: openAiStructuredSchema(schema),
+        },
+      },
+    }),
+  });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(JSON.stringify(data));
+  return parseAiJson(openAiResponsesTextFromResponse(data));
+}
+
+async function requestAiStructuredOutput({
+  provider,
   apiKey,
   system,
   user,
@@ -1227,7 +2915,122 @@ async function requestAnthropicToolInput({
   tool,
   toolName,
 }: {
+  provider: AiProvider;
   apiKey: string;
+  system: string;
+  user: string;
+  maxTokens: number;
+  tool: any;
+  toolName: string;
+}) {
+  if (isAnthropicAiProvider(provider)) {
+    return requestAnthropicToolInput({ apiKey, model: anthropicModelForProvider(provider), system, user, maxTokens, tool, toolName });
+  }
+  const schema = tool?.input_schema || tool?.parameters || tool;
+  return requestGeminiStructuredOutput({ apiKey, system, user, maxTokens, schema });
+}
+
+async function generateGroceryItemsForAiSlice({
+  provider,
+  apiKey,
+  raw,
+  personalContext,
+}: {
+  provider: AiProvider;
+  apiKey: string;
+  raw: string;
+  personalContext: string;
+}) {
+  const requestText = extractGroceryGenerationClause(raw);
+  const groceryContextRules = groceryPersonalContextInstruction(personalContext);
+  const seasoningInstruction = cookingSeasoningInstruction(raw);
+  const groceryJsonExample = groceryJsonExampleForAi(true, personalContext);
+  const system = `Generate grocery/material rows from candid user speech with the ${AI_GROCERY_ITEMS_TOOL_NAME} tool.
+Only satisfy the grocery, ingredient, shopping, supply, material, equipment, accessory, gear, or tool part of the request. Ignore task, routine, reminder, or planning clauses.
+${groceryContextRules}
+Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
+${AI_GROCERY_CATEGORY_HINTS}
+Rules:
+${AI_ROW_STYLE_RULES}
+- If the user asks for ingredients, supplies, materials, shopping/grocery items, packing/buy lists, a meal-prep list, or a meal-plan list, expand it into practical purchasable rows for that thing.
+- Treat casual grocery/material wording like "smoothie stuff", "project junk", "crap to buy", or "things for the repair" as a request for practical purchasable rows.
+- Never return one placeholder item like "ingredients for smoothie", "shopping list for dinner", or "supplies for project".
+- For broad/vague requests, return 5-8 rows unless the user asks for a full, weekly, detailed, or exact-count list. Never exceed 8 rows for vague list requests.
+- Keep item names short and buyable. Use quantity + unit for the amount needed, and packageSize for the smallest common purchasable package/container hint.
+- For recipe, meal, smoothie, or ingredient requests, most rows should include a needed quantity + unit such as cup, tbsp, scoop, handful, whole, cloves, or lb.
+- Prefer simple fraction text like "1/2", "1/4", or "1 1/2" instead of decimals for cooking or recipe quantities.
+- Include packageSize on most generated rows unless a normal purchase size is genuinely not knowable.
+- Never use bare quantity "1" with no unit for generated rows; omit unknown amounts instead.
+- ${seasoningInstruction}
+
+Tool input format: {"items":${groceryJsonExample}}.`;
+  const parsed = await requestAiStructuredOutput({
+    provider,
+    apiKey,
+    system,
+    user: `Grocery/material clause: ${requestText}`,
+    maxTokens: 1000,
+    tool: aiGroceryItemsTool(),
+    toolName: AI_GROCERY_ITEMS_TOOL_NAME,
+  });
+  return groceryItemsFromAiPayload(parsed)
+    .map((item: any) => normalizeGroceryDraft(item, raw, true))
+    .filter((item: GroceryDraft | null): item is GroceryDraft => !!item)
+    .filter((item: GroceryDraft) => groceryDraftAllowedByPersonalContext(item, personalContext))
+    .slice(0, generatedGroceryLimit(raw) ?? undefined);
+}
+
+async function generateTaskRowsForAiSlice({
+  provider,
+  apiKey,
+  raw,
+  personalContext,
+  nowDescr,
+  workspacePrompt,
+  multiList,
+  widgetShorthand,
+}: {
+  provider: AiProvider;
+  apiKey: string;
+  raw: string;
+  personalContext: string;
+  nowDescr: string;
+  workspacePrompt: string;
+  multiList: boolean;
+  widgetShorthand: boolean;
+}) {
+  const requestText = extractTaskGenerationClause(raw);
+  const taskContextRules = taskPersonalContextInstruction(personalContext);
+  const system = `Generate concrete Triority task rows for the task/planning clause only.
+
+NOW: ${nowDescr}
+${taskContextRules}
+${workspacePrompt}
+Rules: ignore grocery/material clauses; plans/routines/checklists/tips/advice become 3-5 concrete useful task rows, not meta rows; avoid vague group/session rows like "upper body strength" or "back session"; workout strength rows should include simple sets/reps, rounds, minutes, or "to failure" when practical; other advice/checklist rows should include the concrete object/tool/location/frequency when needed; tasks are short actions with tier high/medium/low; reminders only for explicit reminder/alarm/notify/repeat or clear clock time; ${multiList ? 'listId from WORKSPACE else default' : 'do not include listId'}; ${widgetShorthand ? 'set widgetLabel to 1-5 words' : 'do not include widgetLabel'}.
+Return only schema fields.`;
+  const parsed = await requestAiStructuredOutput({
+    provider,
+    apiKey,
+    system,
+    user: `Task/planning clause: ${requestText}`,
+    maxTokens: 1000,
+    tool: aiWidgetTaskTool(multiList, widgetShorthand),
+    toolName: AI_WIDGET_TASK_TOOL_NAME,
+  });
+  return Array.isArray(parsed?.tasks) ? trimGeneratedTaskRowsForScope(parsed.tasks, raw) : [];
+}
+
+async function requestAnthropicToolInput({
+  apiKey,
+  model,
+  system,
+  user,
+  maxTokens,
+  tool,
+  toolName,
+}: {
+  apiKey: string;
+  model: string;
   system: string;
   user: string;
   maxTokens: number;
@@ -1238,7 +3041,7 @@ async function requestAnthropicToolInput({
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify({
-      model: ANTHROPIC_MODEL,
+      model,
       max_tokens: maxTokens,
       temperature: 0,
       system,
@@ -1316,7 +3119,7 @@ function parseAiJson(rawText: string) {
         return JSON.parse(candidate);
       } catch {}
     }
-    throw new Error('Claude returned text instead of structured JSON.');
+    throw new Error('AI provider returned text instead of structured JSON.');
   }
 }
 
@@ -1482,6 +3285,10 @@ function mapSupabaseItem(row: any): SharedListItem {
     lastEditedBy: String(row.last_edited_by ?? row.lastEditedBy ?? ''),
     lastEditedAt: epochFromSupabase(row.last_edited_at ?? row.lastEditedAt),
   });
+}
+
+function sharedItemMutationKey(listId: string, itemId: string) {
+  return `${listId}::${itemId}`;
 }
 
 function mapSupabaseArchive(row: any): SharedArchiveItem {
@@ -1989,6 +3796,8 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
   // refreshSupabaseSharedList to avoid briefly dropping the row when a
   // realtime callback fires before our INSERT is visible to the SELECT.
   const pendingSharedItemIdsRef = useRef<Set<string>>(new Set());
+  const pendingRemovedSharedItemIdsRef = useRef<Set<string>>(new Set());
+  const pendingSharedItemPatchesRef = useRef<Map<string, Partial<SharedListItem>>>(new Map());
 
   const forgetSharedList = useCallback((listId: string) => {
     setSharedLists((prev) => {
@@ -2151,6 +3960,38 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     await setJoinedIds(joinedIdsRef.current.filter((x) => x !== listId));
   }, [setJoinedIds]);
 
+  const reconcileIncomingSharedItems = useCallback((listId: string, incomingItems: SharedListItem[]) => {
+    const serverItemIds = new Set(incomingItems.map((it) => it.id));
+    for (const key of Array.from(pendingRemovedSharedItemIdsRef.current)) {
+      const prefix = `${listId}::`;
+      if (!key.startsWith(prefix)) continue;
+      const itemId = key.slice(prefix.length);
+      if (!serverItemIds.has(itemId)) pendingRemovedSharedItemIdsRef.current.delete(key);
+    }
+    for (const key of Array.from(pendingSharedItemPatchesRef.current.keys())) {
+      const prefix = `${listId}::`;
+      if (!key.startsWith(prefix)) continue;
+      const itemId = key.slice(prefix.length);
+      if (!serverItemIds.has(itemId)) pendingSharedItemPatchesRef.current.delete(key);
+    }
+    return incomingItems
+      .filter((item) => !pendingRemovedSharedItemIdsRef.current.has(sharedItemMutationKey(listId, item.id)))
+      .map((item) => {
+        const key = sharedItemMutationKey(listId, item.id);
+        const patch = pendingSharedItemPatchesRef.current.get(key);
+        if (!patch) return item;
+        const serverMatches =
+          (patch.name === undefined || item.name === patch.name)
+          && (patch.category === undefined || item.category === patch.category)
+          && (patch.checked === undefined || item.checked === patch.checked);
+        if (serverMatches) {
+          pendingSharedItemPatchesRef.current.delete(key);
+          return item;
+        }
+        return stripUndefined({ ...item, ...patch });
+      });
+  }, []);
+
   const refreshSupabaseSharedList = useCallback(async (listId: string) => {
     if (!isSupabaseSharedListId(listId) || locallyRemovedSharedIdsRef.current.has(listId)) return;
     const [listRes, membersRes, itemsRes, archivesRes] = await Promise.all([
@@ -2189,7 +4030,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     if (archivesRes.error) throw new Error(supabaseErrorMessage(archivesRes.error, 'Could not load shared archive.'));
 
     setSharedLists((prev) => ({ ...prev, [listId]: mapSupabaseList(listRes.data, membersRes.data || []) }));
-    const serverItems = (itemsRes.data || []).map(mapSupabaseItem);
+    const serverItems = reconcileIncomingSharedItems(listId, (itemsRes.data || []).map(mapSupabaseItem));
     const serverItemIds = new Set(serverItems.map((it) => it.id));
     // Drain any pending optimistic IDs that the server has now confirmed.
     for (const id of serverItemIds) pendingSharedItemIdsRef.current.delete(id);
@@ -2206,7 +4047,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       return { ...prev, [listId]: [...serverItems, ...survivingLocal] };
     });
     setSharedArchives((prev) => ({ ...prev, [listId]: (archivesRes.data || []).map(mapSupabaseArchive) }));
-  }, [forgetSharedListLocally, removeJoinedId]);
+  }, [forgetSharedListLocally, reconcileIncomingSharedItems, removeJoinedId]);
 
   const recoverSupabaseMembershipsForUser = useCallback(async () => {
     if (!user) return;
@@ -2419,7 +4260,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
           snap.forEach((d) => {
             items.push({ id: d.id, ...(d.data() as Omit<SharedListItem, 'id'>) });
           });
-          setSharedItems((prev) => ({ ...prev, [listId]: items }));
+          setSharedItems((prev) => ({ ...prev, [listId]: reconcileIncomingSharedItems(listId, items) }));
         },
         (error) => {
           if (isMissingOrPermissionError(error)) {
@@ -2464,7 +4305,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         try { u(); } catch { /* noop */ }
       }
     };
-  }, [authReady, user, appActive, joinedIds, forgetSharedList, forgetSharedListLocally, removeJoinedId, refreshSupabaseSharedList]);
+  }, [authReady, user, appActive, joinedIds, forgetSharedList, forgetSharedListLocally, reconcileIncomingSharedItems, removeJoinedId, refreshSupabaseSharedList]);
 
   // Step 8: join an existing shared list by share code. Enforces caps:
   //   - 1 shared grocery list per user
@@ -2952,10 +4793,18 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
   const updateSharedGroceryItem = useCallback(async (listId: string, itemId: string, patch: { name?: string; category?: string; checked?: boolean }) => {
     if (!user) throw new Error('Not signed in');
+    const mutationKey = sharedItemMutationKey(listId, itemId);
     if (isSupabaseSharedListId(listId)) {
       // Optimistic patch — apply locally first so checkbox / category change
       // is instant; rollback on error.
       const now = Date.now();
+      pendingSharedItemPatchesRef.current.set(mutationKey, stripUndefined({
+        name: patch.name,
+        category: patch.category,
+        checked: patch.checked,
+        lastEditedBy: user.uid,
+        lastEditedAt: now,
+      }));
       let prevItems: SharedListItem[] | undefined;
       setSharedItems((prev) => {
         prevItems = prev[listId];
@@ -2986,6 +4835,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         .eq('id', itemId)
         .eq('list_id', listId);
       if (error) {
+        pendingSharedItemPatchesRef.current.delete(mutationKey);
         if (prevItems) {
           const snapshot = prevItems;
           setSharedItems((prev) => ({ ...prev, [listId]: snapshot }));
@@ -2995,15 +4845,52 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     const db = getFirestore(getApp());
-    await updateDoc(doc(db, 'sharedLists', listId, 'items', itemId), stripUndefined({
-      ...patch,
+    const now = Date.now();
+    pendingSharedItemPatchesRef.current.set(mutationKey, stripUndefined({
+      name: patch.name,
+      category: patch.category,
+      checked: patch.checked,
       lastEditedBy: user.uid,
-      lastEditedAt: Date.now(),
+      lastEditedAt: now,
     }));
+    let prevItems: SharedListItem[] | undefined;
+    setSharedItems((prev) => {
+      prevItems = prev[listId];
+      if (!prevItems) return prev;
+      return {
+        ...prev,
+        [listId]: prevItems.map((it) => it.id === itemId
+          ? stripUndefined({
+              ...it,
+              name: patch.name !== undefined ? patch.name : it.name,
+              category: patch.category !== undefined ? patch.category : it.category,
+              checked: patch.checked !== undefined ? patch.checked : it.checked,
+              lastEditedBy: user.uid,
+              lastEditedAt: now,
+            })
+          : it),
+      };
+    });
+    try {
+      await updateDoc(doc(db, 'sharedLists', listId, 'items', itemId), stripUndefined({
+        ...patch,
+        lastEditedBy: user.uid,
+        lastEditedAt: now,
+      }));
+    } catch (error) {
+      pendingSharedItemPatchesRef.current.delete(mutationKey);
+      if (prevItems) {
+        const snapshot = prevItems;
+        setSharedItems((prev) => ({ ...prev, [listId]: snapshot }));
+      }
+      throw error;
+    }
   }, [user]);
 
   const deleteSharedGroceryItem = useCallback(async (listId: string, itemId: string) => {
     if (!user) throw new Error('Not signed in');
+    const mutationKey = sharedItemMutationKey(listId, itemId);
+    pendingRemovedSharedItemIdsRef.current.add(mutationKey);
     if (isSupabaseSharedListId(listId)) {
       // Optimistic remove so swipe trash is instant; rollback on error.
       let prevItems: SharedListItem[] | undefined;
@@ -3014,6 +4901,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       });
       const { error } = await supabase.from('tri_shared_items').delete().eq('id', itemId).eq('list_id', listId);
       if (error) {
+        pendingRemovedSharedItemIdsRef.current.delete(mutationKey);
         if (prevItems) {
           const snapshot = prevItems;
           setSharedItems((prev) => ({ ...prev, [listId]: snapshot }));
@@ -3023,12 +4911,29 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     const db = getFirestore(getApp());
-    await deleteDoc(doc(db, 'sharedLists', listId, 'items', itemId));
+    let prevItems: SharedListItem[] | undefined;
+    setSharedItems((prev) => {
+      prevItems = prev[listId];
+      if (!prevItems) return prev;
+      return { ...prev, [listId]: prevItems.filter((it) => it.id !== itemId) };
+    });
+    try {
+      await deleteDoc(doc(db, 'sharedLists', listId, 'items', itemId));
+    } catch (error) {
+      pendingRemovedSharedItemIdsRef.current.delete(mutationKey);
+      if (prevItems) {
+        const snapshot = prevItems;
+        setSharedItems((prev) => ({ ...prev, [listId]: snapshot }));
+      }
+      throw error;
+    }
   }, [user]);
 
   const deleteSharedGroceryItems = useCallback(async (listId: string, itemIds: string[]) => {
     if (!user) throw new Error('Not signed in');
     if (itemIds.length === 0) return;
+    const mutationKeys = itemIds.map((id) => sharedItemMutationKey(listId, id));
+    mutationKeys.forEach((key) => pendingRemovedSharedItemIdsRef.current.add(key));
     if (isSupabaseSharedListId(listId)) {
       // Optimistic batch remove (Clear Checked, Clear All); rollback on error.
       const idSet = new Set(itemIds);
@@ -3040,6 +4945,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       });
       const { error } = await supabase.from('tri_shared_items').delete().eq('list_id', listId).in('id', itemIds);
       if (error) {
+        mutationKeys.forEach((key) => pendingRemovedSharedItemIdsRef.current.delete(key));
         if (prevItems) {
           const snapshot = prevItems;
           setSharedItems((prev) => ({ ...prev, [listId]: snapshot }));
@@ -3049,12 +4955,28 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     const db = getFirestore(getApp());
-    for (let i = 0; i < itemIds.length; i += 500) {
-      const batch = writeBatch(db);
-      for (const id of itemIds.slice(i, i + 500)) {
-        batch.delete(doc(db, 'sharedLists', listId, 'items', id));
+    const idSet = new Set(itemIds);
+    let prevItems: SharedListItem[] | undefined;
+    setSharedItems((prev) => {
+      prevItems = prev[listId];
+      if (!prevItems) return prev;
+      return { ...prev, [listId]: prevItems.filter((it) => !idSet.has(it.id)) };
+    });
+    try {
+      for (let i = 0; i < itemIds.length; i += 500) {
+        const batch = writeBatch(db);
+        for (const id of itemIds.slice(i, i + 500)) {
+          batch.delete(doc(db, 'sharedLists', listId, 'items', id));
+        }
+        await batch.commit();
       }
-      await batch.commit();
+    } catch (error) {
+      mutationKeys.forEach((key) => pendingRemovedSharedItemIdsRef.current.delete(key));
+      if (prevItems) {
+        const snapshot = prevItems;
+        setSharedItems((prev) => ({ ...prev, [listId]: snapshot }));
+      }
+      throw error;
     }
   }, [user]);
 
@@ -3798,14 +5720,15 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 24;
-const CURRENT_APP_VERSION_NAME = '1.4.8';
+const CURRENT_APP_VERSION_CODE = 25;
+const CURRENT_APP_VERSION_NAME = '1.4.9';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {
   versionCode: number;
   versionName?: string;
   apkUrl: string;
+  releaseNotes?: string;
   releaseNotesUrl?: string;
   title?: string;
   message?: string;
@@ -3832,20 +5755,31 @@ async function checkForGithubUpdate() {
     if (data.versionCode <= CURRENT_APP_VERSION_CODE) return;
 
     const versionLabel = data.versionName ? `v${data.versionName}` : `build ${data.versionCode}`;
+    const releaseNotes = typeof data.releaseNotes === 'string' ? data.releaseNotes.trim() : '';
+    const releaseNotesUrl = typeof data.releaseNotesUrl === 'string' && /^https:\/\//i.test(data.releaseNotesUrl)
+      ? data.releaseNotesUrl
+      : undefined;
+    const buttons: Array<{ text: string; style?: 'default' | 'cancel' | 'destructive'; onPress?: () => void }> = [
+      { text: 'Later', style: 'cancel' },
+    ];
+    if (releaseNotesUrl) {
+      buttons.push({
+        text: 'Patch notes',
+        onPress: () => Linking.openURL(releaseNotesUrl).catch(() => {}),
+      });
+    }
+    buttons.push({
+      text: 'Update',
+      onPress: () => {
+        Linking.openURL(data.apkUrl).catch(() => {
+          if (releaseNotesUrl) Linking.openURL(releaseNotesUrl).catch(() => {});
+        });
+      },
+    });
     Alert.alert(
       data.title || 'Triority update available',
-      data.message || `A newer version of Triority is ready: ${versionLabel}. You have v${CURRENT_APP_VERSION_NAME}.`,
-      [
-        { text: 'Later', style: 'cancel' },
-        {
-          text: 'Update',
-          onPress: () => {
-            Linking.openURL(data.apkUrl).catch(() => {
-              if (data.releaseNotesUrl) Linking.openURL(data.releaseNotesUrl).catch(() => {});
-            });
-          },
-        },
-      ],
+      data.message || `A newer version of Triority is ready: ${versionLabel}. You have v${CURRENT_APP_VERSION_NAME}.${releaseNotes ? `\n\nWhat's new:\n${releaseNotes}` : ''}${releaseNotesUrl ? '\n\nTap Patch notes for the full changelog.' : ''}`,
+      buttons,
     );
   } catch {}
 }
@@ -3853,7 +5787,7 @@ async function checkForGithubUpdate() {
 const APP_VERSION = '2';
 const NEW_ITEM_SHINE_MS = 2400;
 const NEW_ITEM_GLOW_ELIGIBILITY_MS = 5000;
-const FOCUSED_ROW_CLEAR_MS = NEW_ITEM_SHINE_MS + 1000;
+const FOCUSED_ROW_CLEAR_MS = 900;
 const NEW_ITEM_SHINE_GOLD = '#FFD76A';
 const NEW_ITEM_SHINE_WARM = '#FFB72E';
 const NEW_ITEM_SHINE_WHITE = '#FFF8D8';
@@ -3921,7 +5855,7 @@ async function loadAll() {
     await AsyncStorage.multiRemove(['tri_tasks', 'tri_archive', 'tri_lists', 'tri_active_list_id']);
     await AsyncStorage.setItem('tri_version', APP_VERSION);
   }
-  const [listsRaw, legacyTasks, archive, activeIdRaw, legacyAccent, accentLightRaw, accentDarkRaw, themeRaw, darkMode, defaultTier, autoClear, context, onboarded, widgetOnboardingSeenRaw, listOrderRaw, customThemeRaw, customThemesRaw, groceryRaw, collapsedGroupsRaw, widgetThemeRaw, widgetClearRaw, widgetShorthandRaw, widgetCustomColorsRaw, widgetMicSideRaw] = await Promise.all([
+  const [listsRaw, legacyTasks, archive, activeIdRaw, legacyAccent, accentLightRaw, accentDarkRaw, themeRaw, darkMode, defaultTier, autoClear, context, onboarded, widgetOnboardingSeenRaw, listOrderRaw, customThemeRaw, customThemesRaw, groceryRaw, collapsedGroupsRaw, widgetThemeRaw, widgetClearRaw, widgetShorthandRaw, widgetCustomColorsRaw, widgetMicSideRaw, aiProviderRaw] = await Promise.all([
     AsyncStorage.getItem('tri_lists'),
     AsyncStorage.getItem('tri_tasks'),
     AsyncStorage.getItem('tri_archive'),
@@ -3946,12 +5880,21 @@ async function loadAll() {
     AsyncStorage.getItem(WIDGET_SHORTHAND_KEY),
     AsyncStorage.getItem(WIDGET_CUSTOM_COLORS_KEY),
     AsyncStorage.getItem(WIDGET_MIC_SIDE_KEY),
+    AsyncStorage.getItem(AI_PROVIDER_KEY),
   ]);
   // API key is stored encrypted for security
   let apiKey = '';
   try {
     apiKey = await EncryptedStorage.getItem('triority-api-key') || '';
   } catch {}
+  let aiProvider = normalizeAiProvider(null, apiKey);
+  if (aiProviderRaw) {
+    try {
+      aiProvider = normalizeAiProvider(JSON.parse(aiProviderRaw), apiKey);
+    } catch {
+      aiProvider = normalizeAiProvider(aiProviderRaw, apiKey);
+    }
+  }
 
   // Multi-list migration. Additive: if tri_lists exists use it; else build from legacy tri_tasks
   // (v1.0/v1.1 single-list shape) and write tri_lists. tri_tasks is left in place this version
@@ -4108,6 +6051,7 @@ async function loadAll() {
     darkMode: darkMode ? JSON.parse(darkMode) : true,
     defaultTier: defaultTier ? (JSON.parse(defaultTier) as Tier) : 'medium',
     autoClear: autoClear ? (JSON.parse(autoClear) as AutoClear) : 'Never',
+    aiProvider,
     apiKey: apiKey,
     context: context ? JSON.parse(context) : '',
     onboarded: onboarded === '1',
@@ -4143,8 +6087,8 @@ function relTime(ms: number): string {
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
-function isValidKey(k: string) {
-  return typeof k === 'string' && k.trim().startsWith('sk-ant-');
+function isValidKey(k: string, provider: AiProvider = DEFAULT_AI_PROVIDER) {
+  return isValidAiKey(provider, k);
 }
 
 function startOfDay(ts: number) {
@@ -4447,6 +6391,11 @@ function calendarConflictKey(listId: string | undefined, taskId: TaskId | undefi
   return `${listId}:${String(taskId)}`;
 }
 
+function taskGlowKey(listId: string | undefined, taskId: TaskId | string | undefined) {
+  if (!listId || taskId == null) return '';
+  return `${listId}:${String(taskId)}`;
+}
+
 function calendarConflictKeyForTask(task: Task, fallbackListId?: string) {
   return calendarConflictKey(task.reminderListId || fallbackListId, task.reminderTaskId ?? task.id);
 }
@@ -4456,6 +6405,18 @@ function nextReminderOccurrenceAt(r: Reminder, now = Date.now()): number | null 
   if (r.remindAt >= now - 60000) return r.remindAt;
   if (!interval) return null;
   return r.remindAt + Math.ceil((now - r.remindAt) / interval) * interval;
+}
+
+function compareReminderTasksByDue(a: Task, b: Task, now = Date.now()) {
+  const aNext = a.reminder ? nextReminderOccurrenceAt(a.reminder, now) : null;
+  const bNext = b.reminder ? nextReminderOccurrenceAt(b.reminder, now) : null;
+  const aOverdue = !!a.reminder && aNext == null;
+  const bOverdue = !!b.reminder && bNext == null;
+  if (aOverdue !== bOverdue) return aOverdue ? -1 : 1;
+  const aDue = aOverdue ? a.reminder!.remindAt : (aNext ?? Number.POSITIVE_INFINITY);
+  const bDue = bOverdue ? b.reminder!.remindAt : (bNext ?? Number.POSITIVE_INFINITY);
+  if (aDue !== bDue) return aDue - bDue;
+  return (a.createdAt || 0) - (b.createdAt || 0);
 }
 
 type CalendarBusyBlock = { start: number; end: number };
@@ -5121,6 +7082,7 @@ interface TaskRowProps {
   isDragging: boolean;
   focused?: boolean;
   glowTriggerKey?: string;
+  onGlowPlayed?: () => void;
   calendarConflict?: boolean;
 }
 
@@ -5131,21 +7093,36 @@ function useNewItemGlow(createdAt: number | undefined, identity: TaskId | string
   const glow = useRef(new Animated.Value(0)).current;
   const sweep = useRef(new Animated.Value(0)).current;
   const sparkle = useRef(new Animated.Value(0)).current;
+  const lastRunKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
+    return () => {
+      glow.stopAnimation();
+      sweep.stopAnimation();
+      sparkle.stopAnimation();
+    };
+  }, [glow, sparkle, sweep]);
+
+  useEffect(() => {
+    const forced = !!triggerKey;
+    let runKey: string | null = null;
+    if (forced) {
+      runKey = `forced:${triggerKey}`;
+    } else {
+      if (!createdAt) return;
+      const ageMs = Date.now() - createdAt;
+      if (ageMs < 0 || ageMs > NEW_ITEM_GLOW_ELIGIBILITY_MS) return;
+      runKey = `created:${identity}:${createdAt}`;
+    }
+    if (!runKey || lastRunKeyRef.current === runKey) return;
+    lastRunKeyRef.current = runKey;
+
     glow.stopAnimation();
     sweep.stopAnimation();
     sparkle.stopAnimation();
     glow.setValue(0);
     sweep.setValue(0);
     sparkle.setValue(0);
-
-    const forced = !!triggerKey;
-    if (!forced) {
-      if (!createdAt) return;
-      const ageMs = Date.now() - createdAt;
-      if (ageMs < 0 || ageMs > NEW_ITEM_GLOW_ELIGIBILITY_MS) return;
-    }
 
     Animated.parallel([
       Animated.sequence([
@@ -5238,14 +7215,15 @@ function MemberAvatar({ slot, initial, size = 14 }: { slot: number; initial: str
   );
 }
 
-function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentColor, onLongPressStart, onDragMove, onDragEnd, isDragging, focused, glowTriggerKey, calendarConflict }: TaskRowProps) {
+function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentColor, onLongPressStart, onDragMove, onDragEnd, isDragging, focused, glowTriggerKey, onGlowPlayed, calendarConflict }: TaskRowProps) {
   const T = useT();
   const TIERS = TIERS_DEF(T);
   const tier = TIERS.find(t => t.id === task.tier)!;
   const translateX = useRef(new Animated.Value(0)).current;
   const [revealed, setRevealed] = useState(false);
-  const newItemGlow = useNewItemGlow(task.createdAt, task.id, glowTriggerKey);
+  const newItemGlow = useNewItemGlow(undefined, task.id, glowTriggerKey);
   const glowEdgeColor = readableGlowEdgeColor(T.s2, T.text);
+  const reportedGlowKeyRef = useRef<string | null>(null);
   // Pulse animation for the revealed trash icon — loops while revealed
   const pulse = useRef(new Animated.Value(0)).current;
 
@@ -5263,6 +7241,13 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
     }
     pulse.setValue(0);
   }, [revealed, pulse]);
+
+  useEffect(() => {
+    if (!glowTriggerKey || !onGlowPlayed) return;
+    if (reportedGlowKeyRef.current === glowTriggerKey) return;
+    reportedGlowKeyRef.current = glowTriggerKey;
+    onGlowPlayed();
+  }, [glowTriggerKey, onGlowPlayed]);
 
   const springTo = useCallback((to: number) => {
     Animated.spring(translateX, { toValue: to, useNativeDriver: true, tension: 100, friction: 8 }).start();
@@ -5298,6 +7283,13 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
   onDragMoveRef.current = onDragMove;
   const onDragEndRef = useRef(onDragEnd);
   onDragEndRef.current = onDragEnd;
+  const requestCompleteRef = useRef(requestComplete);
+  requestCompleteRef.current = requestComplete;
+  const taskIdRef = useRef<TaskId>(task.id);
+  taskIdRef.current = task.id;
+  const panStartXRef = useRef(0);
+  const swipeDxRef = useRef(0);
+  const touchStartPageRef = useRef<{ x: number; y: number } | null>(null);
 
   const clearLongPress = useCallback(() => {
     if (longPressTimerRef.current) {
@@ -5312,7 +7304,13 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
   // when the list overflows the viewport.
   const handleTouchStart = useCallback((e: any) => {
     Keyboard.dismiss();
-    translateX.setOffset((translateX as any)._value);
+    touchStartPageRef.current = {
+      x: Number(e?.nativeEvent?.pageX ?? 0),
+      y: Number(e?.nativeEvent?.pageY ?? 0),
+    };
+    panStartXRef.current = Number((translateX as any)._value || 0);
+    swipeDxRef.current = 0;
+    translateX.setOffset(panStartXRef.current);
     translateX.setValue(0);
     dragArmedRef.current = false;
     clearLongPress();
@@ -5322,8 +7320,26 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
     }, DRAG_LONG_PRESS_MS);
   }, [translateX, clearLongPress]);
 
+  const handleTouchMove = useCallback((e: any) => {
+    if (dragArmedRef.current) return;
+    const start = touchStartPageRef.current;
+    if (!start) return;
+    const x = Number(e?.nativeEvent?.pageX ?? start.x);
+    const y = Number(e?.nativeEvent?.pageY ?? start.y);
+    if (Math.abs(x - start.x) > 8 || Math.abs(y - start.y) > 8) {
+      clearLongPress();
+    }
+  }, [clearLongPress]);
+
   const handleTouchEnd = useCallback(() => {
     clearLongPress();
+    touchStartPageRef.current = null;
+    const wasArmed = dragArmedRef.current;
+    setTimeout(() => {
+      if (!wasArmed || !dragArmedRef.current) return;
+      dragArmedRef.current = false;
+      onDragEndRef.current(false);
+    }, 0);
   }, [clearLongPress]);
 
   const panResponder = useRef(
@@ -5340,7 +7356,7 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
         return Math.abs(dx) > 8 && Math.abs(dx) > Math.abs(dy);
       },
       onPanResponderGrant: () => {
-        // Touch-start already initialized translateX offset; nothing to do here.
+        swipeDxRef.current = 0;
       },
       onPanResponderMove: (e, { dx, dy }) => {
         // Any meaningful horizontal motion before long-press cancels the drag arm.
@@ -5351,6 +7367,7 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
           onDragMoveRef.current(dy, e.nativeEvent.pageY);
           return;
         }
+        swipeDxRef.current = dx;
         translateX.setValue(Math.max(REVEAL_X * 1.4, Math.min(90, dx)));
       },
       onPanResponderRelease: () => {
@@ -5361,10 +7378,10 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
           return;
         }
         translateX.flattenOffset();
-        const val = (translateX as any)._value;
+        const val = panStartXRef.current + swipeDxRef.current;
         if (val > SWIPE_THRESHOLD) {
           springBack();
-          requestComplete(task.id);
+          requestCompleteRef.current(taskIdRef.current);
         } else if (val < -SWIPE_THRESHOLD) {
           reveal();
         } else {
@@ -5436,6 +7453,7 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
       <Animated.View
         {...panResponder.panHandlers}
         onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
         onTouchCancel={handleTouchEnd}
         style={[
@@ -5604,19 +7622,31 @@ interface TierGroupProps {
   // Edge-scroll bridge: TierGroup reports the *page* Y of the dragged finger,
   // ActiveList drives the actual ScrollView scroll because it owns the ref.
   onDragMove?: (pageY: number | null) => void;
+  onTierLayout?: (tier: Tier, y: number, height: number) => void;
+  resolveDropTier?: (sourceTier: Tier, draggedCenterContentY: number) => Tier | null;
+  onMoveToTier?: (taskId: TaskId, sourceTier: Tier, targetTier: Tier) => void;
+  onDropTierPreview?: (tier: Tier | null) => void;
+  pageYToContentY?: (pageY: number) => number;
+  dragInProgress?: boolean;
+  activeDropTier?: Tier | null;
+  isRowVisible?: (contentY: number, height: number) => boolean;
   collapsed: boolean;
   onCollapsedChange: (collapsed: boolean) => void;
   focusedTaskId?: string | null;
   focusRequestKey?: string | null;
   focusedGlowKey?: string | null;
+  pendingGlowIds?: Record<string, number>;
+  onPendingGlowSeen?: (id: TaskId) => void;
   calendarConflictKeys?: Set<string>;
   activeListId: string;
   onFocusedTaskLayout?: (y: number) => void;
 }
 
-function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit, accentColor, onReorderInTier, onDragMove, collapsed, onCollapsedChange, focusedTaskId, focusRequestKey, focusedGlowKey, calendarConflictKeys, activeListId, onFocusedTaskLayout }: TierGroupProps) {
+function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit, accentColor, onReorderInTier, onDragMove, onTierLayout, resolveDropTier, onMoveToTier, onDropTierPreview, pageYToContentY, dragInProgress, activeDropTier, isRowVisible, collapsed, onCollapsedChange, focusedTaskId, focusRequestKey, focusedGlowKey, pendingGlowIds, onPendingGlowSeen, calendarConflictKeys, activeListId, onFocusedTaskLayout }: TierGroupProps) {
   const T = useT();
   const tierYRef = useRef(0);
+  const tierBodyYRef = useRef(0);
+  const [layoutRevision, setLayoutRevision] = useState(0);
 
   // Drag state. dragId = id of the task currently being dragged (null = no drag).
   // dragOffsetY = signed offset from the dragged row's resting Y, used to translate
@@ -5629,6 +7659,8 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
   // Used to compute the drop slot from the current finger position.
   const layoutsRef = useRef<{ y: number; height: number }[]>([]);
   const dragStartIndexRef = useRef<number>(-1);
+  const lastFingerPageYRef = useRef<number | null>(null);
+  const lastDraggedCenterContentYRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!focusedTaskId || collapsed) return;
@@ -5637,22 +7669,24 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
     const layout = layoutsRef.current[index];
     if (!layout) return;
     const timer = setTimeout(() => {
-      onFocusedTaskLayout?.(tierYRef.current + layout.y);
+      onFocusedTaskLayout?.(tierYRef.current + tierBodyYRef.current + layout.y);
     }, 60);
     return () => clearTimeout(timer);
   }, [collapsed, focusedTaskId, focusRequestKey, onFocusedTaskLayout, tasks]);
 
-  if (tasks.length === 0) return null;
+  if (tasks.length === 0 && !dragInProgress) return null;
 
   const handleLongPressStart = (taskId: TaskId, index: number) => {
     setDragId(taskId);
     setDragOffsetY(0);
     setDropIndex(index);
     dragStartIndexRef.current = index;
+    onDropTierPreview?.(tier.id);
   };
 
   const handleDragMove = (dy: number, fingerPageY: number) => {
     setDragOffsetY(dy);
+    lastFingerPageYRef.current = fingerPageY;
     onDragMove?.(fingerPageY);
     // Compute which index the row would drop into.
     const startIdx = dragStartIndexRef.current;
@@ -5660,6 +7694,10 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
     const layouts = layoutsRef.current;
     if (!layouts[startIdx]) return;
     const draggedCenterY = layouts[startIdx].y + layouts[startIdx].height / 2 + dy;
+    const draggedCenterContentY = tierYRef.current + tierBodyYRef.current + draggedCenterY;
+    const dropContentY = pageYToContentY?.(fingerPageY) ?? draggedCenterContentY;
+    lastDraggedCenterContentYRef.current = dropContentY;
+    onDropTierPreview?.(resolveDropTier?.(tier.id, dropContentY) ?? tier.id);
     let target = startIdx;
     for (let i = 0; i < layouts.length; i++) {
       if (!layouts[i]) continue;
@@ -5681,19 +7719,41 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
 
   const handleDragEnd = (committed: boolean) => {
     onDragMove?.(null);
-    if (committed && dropIndex !== null && dragStartIndexRef.current >= 0 && dropIndex !== dragStartIndexRef.current) {
+    onDropTierPreview?.(null);
+    const movedId = dragId;
+    const targetTier = committed && movedId != null && lastDraggedCenterContentYRef.current != null
+      ? resolveDropTier?.(tier.id, lastDraggedCenterContentYRef.current)
+      : null;
+    if (committed && movedId != null && targetTier && targetTier !== tier.id) {
+      onMoveToTier?.(movedId, tier.id, targetTier);
+    } else if (committed && dropIndex !== null && dragStartIndexRef.current >= 0 && dropIndex !== dragStartIndexRef.current) {
       onReorderInTier(tier.id, dragStartIndexRef.current, dropIndex);
     }
     setDragId(null);
     setDragOffsetY(0);
     setDropIndex(null);
     dragStartIndexRef.current = -1;
+    lastFingerPageYRef.current = null;
+    lastDraggedCenterContentYRef.current = null;
   };
 
   return (
     <View
-      style={{ marginBottom: 20 }}
-      onLayout={(e) => { tierYRef.current = e.nativeEvent.layout.y; }}>
+      style={[
+        styles.tierDropZone,
+        dragInProgress && {
+          borderColor: activeDropTier === tier.id ? `${tier.color}AA` : `${T.border}66`,
+          backgroundColor: activeDropTier === tier.id ? `${tier.color}14` : 'transparent',
+        },
+        dragInProgress && tasks.length === 0 && styles.tierDropZoneEmpty,
+      ]}
+      onLayout={(e) => {
+        const { y, height } = e.nativeEvent.layout;
+        const previousY = tierYRef.current;
+        tierYRef.current = y;
+        onTierLayout?.(tier.id, y, height);
+        if (previousY !== y) setLayoutRevision(v => v + 1);
+      }}>
       <TouchableOpacity onPress={() => onCollapsedChange(!collapsed)} style={styles.tierHeader} activeOpacity={0.7}>
         <View style={[styles.tierHeaderDot, { backgroundColor: tier.color }]} />
         <Text style={[styles.tierHeaderLabel, { color: tier.color, fontFamily: jks('700') }]}>{tier.label}</Text>
@@ -5702,23 +7762,46 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
         <Text style={[styles.tierChevron, { color: T.textMute, transform: [{ rotate: collapsed ? '-90deg' : '0deg' }] }]}>▾</Text>
       </TouchableOpacity>
       {!collapsed && (
-        <View style={{ position: 'relative' }}>
+        <View
+          style={{ position: 'relative' }}
+          onLayout={(e) => {
+            const previousY = tierBodyYRef.current;
+            tierBodyYRef.current = e.nativeEvent.layout.y;
+            if (previousY !== tierBodyYRef.current) setLayoutRevision(v => v + 1);
+          }}>
           {tasks.map((task, index) => {
+            void layoutRevision;
             const isDragging = dragId === task.id;
+            const focused = focusedTaskId === String(task.id);
+            const layout = layoutsRef.current[index];
+            const scopedGlowKey = taskGlowKey(activeListId, task.id);
+            const pendingClearKey = (scopedGlowKey && pendingGlowIds?.[scopedGlowKey]) ? scopedGlowKey : String(task.id);
+            const pendingNonce = (scopedGlowKey ? pendingGlowIds?.[scopedGlowKey] : undefined) ?? pendingGlowIds?.[String(task.id)];
+            const pendingIsVisible = !!pendingNonce && !!layout
+              && (!isRowVisible || isRowVisible(tierYRef.current + tierBodyYRef.current + layout.y, layout.height));
+            const pendingGlowKey = !focused && pendingIsVisible
+              ? `pending:${pendingClearKey}:${pendingNonce}`
+              : undefined;
+            const rowGlowKey = focused ? focusedGlowKey ?? undefined : pendingGlowKey;
             return (
               <View
                 key={task.id}
                 onLayout={(e) => {
                   const { y, height } = e.nativeEvent.layout;
+                  const previous = layoutsRef.current[index];
                   layoutsRef.current[index] = { y, height };
+                  if (!previous || previous.y !== y || previous.height !== height) {
+                    setLayoutRevision(v => v + 1);
+                  }
                   if (focusedTaskId && String(task.id) === focusedTaskId) {
-                    onFocusedTaskLayout?.(tierYRef.current + y);
+                    onFocusedTaskLayout?.(tierYRef.current + tierBodyYRef.current + y);
                   }
                 }}
                 style={{
-                  opacity: isDragging ? 0.25 : 1,
-                  transform: isDragging ? [{ translateY: dragOffsetY }] : [],
+                  opacity: isDragging ? 0.96 : 1,
+                  transform: isDragging ? [{ translateY: dragOffsetY }, { scale: 1.015 }] : [],
                   zIndex: isDragging ? 10 : 1,
+                  elevation: isDragging ? 8 : 0,
                 }}>
                 <TaskRow
                   task={task}
@@ -5732,8 +7815,9 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
                   onDragMove={handleDragMove}
                   onDragEnd={handleDragEnd}
                   isDragging={isDragging}
-                  focused={focusedTaskId === String(task.id)}
-                  glowTriggerKey={focusedTaskId === String(task.id) ? focusedGlowKey ?? undefined : undefined}
+                  focused={focused}
+                  glowTriggerKey={rowGlowKey}
+                  onGlowPlayed={pendingGlowKey ? () => onPendingGlowSeen?.(pendingClearKey) : undefined}
                   calendarConflict={calendarConflictKeys?.has(calendarConflictKey(activeListId, task.id))}
                 />
               </View>
@@ -5770,15 +7854,17 @@ interface GroceryItemRowProps {
   accentColor: string;
   focused?: boolean;
   glowTriggerKey?: string;
+  onGlowPlayed?: () => void;
 }
 
-function GroceryItemRow({ item, onCheck, onDelete, accentColor, focused, glowTriggerKey }: GroceryItemRowProps) {
+function GroceryItemRow({ item, onCheck, onDelete, accentColor, focused, glowTriggerKey, onGlowPlayed }: GroceryItemRowProps) {
   const T = useT();
   const translateX = useRef(new Animated.Value(0)).current;
   const pulse = useRef(new Animated.Value(0)).current;
   const [revealed, setRevealed] = useState(false);
-  const newItemGlow = useNewItemGlow(item.createdAt, item.id, glowTriggerKey);
+  const newItemGlow = useNewItemGlow(undefined, item.id, glowTriggerKey);
   const glowEdgeColor = readableGlowEdgeColor(T.s2, T.text);
+  const reportedGlowKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (revealed) {
@@ -5793,6 +7879,13 @@ function GroceryItemRow({ item, onCheck, onDelete, accentColor, focused, glowTri
       pulse.setValue(0);
     }
   }, [pulse, revealed]);
+
+  useEffect(() => {
+    if (!glowTriggerKey || !onGlowPlayed) return;
+    if (reportedGlowKeyRef.current === glowTriggerKey) return;
+    reportedGlowKeyRef.current = glowTriggerKey;
+    onGlowPlayed();
+  }, [glowTriggerKey, onGlowPlayed]);
 
   const springTo = (toValue: number, after?: () => void) => {
     Animated.spring(translateX, { toValue, useNativeDriver: true, tension: 100, friction: 8 }).start(() => after?.());
@@ -6059,14 +8152,22 @@ interface GroceryScreenProps {
   focusedItemId?: string | null;
   focusedItemNonce?: number;
   onFocusedItemSeen?: () => void;
+  pendingGlowIds?: Record<string, number>;
+  onPendingGlowSeen?: (id: string) => void;
 }
 
-function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, onSortAlpha, onAiSort, hasApiKey, accentColor, sortMode, groupCollapseScope, collapsedGroups, setCollapsedGroup, focusedItemId, focusedItemNonce, onFocusedItemSeen }: GroceryScreenProps) {
+function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, onSortAlpha, onAiSort, hasApiKey, accentColor, sortMode, groupCollapseScope, collapsedGroups, setCollapsedGroup, focusedItemId, focusedItemNonce, onFocusedItemSeen, pendingGlowIds, onPendingGlowSeen }: GroceryScreenProps) {
   const T = useT();
   const [confirmNode, confirm] = useConfirm(accentColor);
   const scrollRef = useRef<ScrollView | null>(null);
   const [focusedGlowKey, setFocusedGlowKey] = useState<string | null>(null);
+  const [visibleRevision, setVisibleRevision] = useState(0);
   const firedFocusKeyRef = useRef<string | null>(null);
+  const scrollOffsetRef = useRef(0);
+  const viewportHeightRef = useRef(0);
+  const rowLayoutsRef = useRef<Record<string, { y: number; height: number; parentKey?: string | null }>>({});
+  const groupLayoutsRef = useRef<Record<string, { y: number; height: number }>>({});
+  const lastVisibleRevisionAtRef = useRef(0);
 
   const activeItems = items.filter(i => !i.checked);
   const gotItItems = items.filter(i => i.checked);
@@ -6074,6 +8175,28 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
   const groceryGroupKey = useCallback((group: string) => `grocery:${groupCollapseScope}:${group}`, [groupCollapseScope]);
 
   const focusedItemRequestKey = focusedItemId ? `${focusedItemId}:${focusedItemNonce ?? 0}` : null;
+
+  const bumpVisibleRevision = useCallback((force = false) => {
+    const now = Date.now();
+    if (!force && now - lastVisibleRevisionAtRef.current < 90) return;
+    lastVisibleRevisionAtRef.current = now;
+    setVisibleRevision(v => v + 1);
+  }, []);
+
+  const isGroceryRowVisible = useCallback((id: string) => {
+    void visibleRevision;
+    const layout = rowLayoutsRef.current[id];
+    const viewportHeight = viewportHeightRef.current;
+    if (!layout || !viewportHeight) return false;
+    const groupY = layout.parentKey ? groupLayoutsRef.current[layout.parentKey]?.y : 0;
+    if (layout.parentKey && groupY == null) return false;
+    const rowTop = (groupY || 0) + layout.y;
+    const rowBottom = rowTop + layout.height;
+    const viewportTop = scrollOffsetRef.current;
+    const viewportBottom = viewportTop + viewportHeight;
+    const visiblePx = Math.max(0, Math.min(rowBottom, viewportBottom) - Math.max(rowTop, viewportTop));
+    return visiblePx >= Math.min(layout.height * 0.6, 72);
+  }, [visibleRevision]);
 
   const scrollToFocusedItem = useCallback((y: number) => {
     const requestKey = focusedItemRequestKey;
@@ -6133,19 +8256,40 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
 
   const isEmpty = items.length === 0;
 
-  const renderGroceryRow = (item: GroceryItem) => (
-    <View
-      key={item.id}
-      onLayout={(e) => {
-        if (focusedItemId === item.id) {
-          scrollToFocusedItem(e.nativeEvent.layout.y);
-        }
-      }}>
-      <GroceryItemRow item={item} onCheck={onCheck} onDelete={onDelete} accentColor={accentColor} focused={focusedItemId === item.id} glowTriggerKey={focusedItemId === item.id ? focusedGlowKey ?? undefined : undefined} />
-    </View>
-  );
+  const renderGroceryRow = (item: GroceryItem, parentKey: string | null = null) => {
+    const focused = focusedItemId === item.id;
+    const pendingNonce = pendingGlowIds?.[item.id];
+    const pendingGlowKey = !focused && pendingNonce && isGroceryRowVisible(item.id) ? `pending:${item.id}:${pendingNonce}` : undefined;
+    const rowGlowKey = focused ? focusedGlowKey ?? undefined : pendingGlowKey;
+    return (
+      <View
+        key={item.id}
+        onLayout={(e) => {
+          const { y, height } = e.nativeEvent.layout;
+          const previous = rowLayoutsRef.current[item.id];
+          rowLayoutsRef.current[item.id] = { y, height, parentKey };
+          if (!previous || previous.y !== y || previous.height !== height || previous.parentKey !== parentKey) {
+            bumpVisibleRevision(true);
+          }
+          if (focusedItemId === item.id) {
+            const groupY = parentKey ? groupLayoutsRef.current[parentKey]?.y || 0 : 0;
+            scrollToFocusedItem(groupY + y);
+          }
+        }}>
+        <GroceryItemRow
+          item={item}
+          onCheck={onCheck}
+          onDelete={onDelete}
+          accentColor={accentColor}
+          focused={focused}
+          glowTriggerKey={rowGlowKey}
+          onGlowPlayed={pendingGlowKey ? () => onPendingGlowSeen?.(item.id) : undefined}
+        />
+      </View>
+    );
+  };
 
-  const renderFlatAlpha = () => (sortedActive as GroceryItem[]).map(renderGroceryRow);
+  const renderFlatAlpha = () => (sortedActive as GroceryItem[]).map(item => renderGroceryRow(item));
   const renderGroceryGroupHeader = (label: string, count: number, key: string, muted = false) => {
     const collapsed = collapsedGroups[key] ?? false;
     return (
@@ -6165,9 +8309,22 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
     const key = groceryGroupKey(`category:${group.category}`);
     const collapsed = collapsedGroups[key] ?? false;
     return (
-      <View key={group.category}>
+      <View
+        key={group.category}
+        onLayout={(e) => {
+          const { y, height } = e.nativeEvent.layout;
+          const previous = groupLayoutsRef.current[key];
+          groupLayoutsRef.current[key] = { y, height };
+          if (!previous || previous.y !== y || previous.height !== height) {
+            bumpVisibleRevision(true);
+          }
+          const focusedLayout = focusedItemId ? rowLayoutsRef.current[focusedItemId] : null;
+          if (focusedLayout?.parentKey === key) {
+            scrollToFocusedItem(y + focusedLayout.y);
+          }
+        }}>
         {renderGroceryGroupHeader(group.category, group.items.length, key)}
-        {!collapsed && group.items.map(renderGroceryRow)}
+        {!collapsed && group.items.map(item => renderGroceryRow(item, key))}
       </View>
     );
   });
@@ -6213,7 +8370,21 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
         </TouchableOpacity>
       </View>
       <View style={[styles.divider, { backgroundColor: T.border, marginTop: 10, marginHorizontal: 16 }]} />
-      <ScrollView ref={scrollRef} style={{ flex: 1 }} contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 16, paddingTop: 8 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+      <ScrollView
+        ref={scrollRef}
+        style={{ flex: 1 }}
+        contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 16, paddingTop: 8 }}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
+        scrollEventThrottle={16}
+        onScroll={(e) => {
+          scrollOffsetRef.current = e.nativeEvent.contentOffset.y;
+          bumpVisibleRevision();
+        }}
+        onLayout={(e) => {
+          viewportHeightRef.current = e.nativeEvent.layout.height;
+          bumpVisibleRevision(true);
+        }}>
         {isEmpty ? (
           <View style={styles.emptyState}>
             <View style={[styles.emptyIcon, { backgroundColor: T.s2 }]}>
@@ -6225,9 +8396,23 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
           <>
             {sortMode === 'alpha' ? renderFlatAlpha() : renderGrouped()}
             {gotItCount > 0 && (
-              <View style={{ marginTop: 20 }}>
+              <View
+                style={{ marginTop: 20 }}
+                onLayout={(e) => {
+                  const gotItKey = groceryGroupKey('got-it');
+                  const { y, height } = e.nativeEvent.layout;
+                  const previous = groupLayoutsRef.current[gotItKey];
+                  groupLayoutsRef.current[gotItKey] = { y, height };
+                  if (!previous || previous.y !== y || previous.height !== height) {
+                    bumpVisibleRevision(true);
+                  }
+                  const focusedLayout = focusedItemId ? rowLayoutsRef.current[focusedItemId] : null;
+                  if (focusedLayout?.parentKey === gotItKey) {
+                    scrollToFocusedItem(y + focusedLayout.y);
+                  }
+                }}>
                 {renderGroceryGroupHeader('Got it', gotItCount, groceryGroupKey('got-it'), true)}
-                {!(collapsedGroups[groceryGroupKey('got-it')] ?? false) && gotItItems.map(renderGroceryRow)}
+                {!(collapsedGroups[groceryGroupKey('got-it')] ?? false) && gotItItems.map(item => renderGroceryRow(item, groceryGroupKey('got-it')))}
               </View>
             )}
           </>
@@ -6242,8 +8427,10 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
 
 interface InputBarProps {
   onAddMany: (items: TaskDraft[]) => AddTaskDraftResult;
-  onAddManyToList: (listId: string, items: TaskDraft[]) => AddTaskDraftResult;
+  onAddManyToList: (listId: string, items: TaskDraft[], options?: AddTaskOptions) => AddTaskDraftResult;
+  onTaskListRouted?: (listId: string) => void;
   onAddGroceryItems: (items: GroceryDraft[]) => AddGroceryDraftResult;
+  aiProvider: AiProvider;
   hasApiKey: boolean;
   accentColor: string;
   defaultTier: Tier;
@@ -6253,10 +8440,10 @@ interface InputBarProps {
   lists: TaskList[];
   activeListId: string;
   widgetShorthand: boolean;
-  onGroceryOnlyAdded?: (ids: string[]) => void;
+  onGroceryOnlyAdded?: (ids: string[], navigate?: boolean) => void;
 }
 
-function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, accentColor, defaultTier, showToast, dismissToast, groceryMode, lists, activeListId, widgetShorthand, onGroceryOnlyAdded }: InputBarProps) {
+function InputBar({ onAddMany, onAddManyToList, onTaskListRouted, onAddGroceryItems, aiProvider, hasApiKey, accentColor, defaultTier, showToast, dismissToast, groceryMode, lists, activeListId, widgetShorthand, onGroceryOnlyAdded }: InputBarProps) {
   const T = useT();
   const isPaid = useIsPaid();
   const inputRef = useRef<TextInput | null>(null);
@@ -6271,7 +8458,6 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
       return undefined;
     });
   }, [onAddGroceryItems, showToast]);
-
   const listeningRef = useRef(false);
   // Wall-clock timestamp of last successful srStart(). End/error events that
   // fire within IGNORE_MS of this are treated as leftover from a prior session.
@@ -6383,20 +8569,8 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
 
   const [pickerOpen, setPickerOpen] = useState(false);
 
-  const buildReminderFromAI = (r: any): Reminder | undefined => {
-    if (!r || typeof r.hour !== 'number') return undefined;
-    const days = Math.max(0, Math.min(365, Number(r.daysFromNow ?? 0)));
-    const hour = Math.max(0, Math.min(23, Math.round(Number(r.hour))));
-    const minute = Math.max(0, Math.min(59, Math.round(Number(r.minute ?? 0))));
-    const d = new Date();
-    d.setDate(d.getDate() + days);
-    d.setHours(hour, minute, 0, 0);
-    let remindAt = d.getTime();
-    if (remindAt < Date.now() - 60000 && days === 0) {
-      d.setDate(d.getDate() + 1);
-      remindAt = d.getTime();
-    }
-    return { remindAt, repeatHourly: !!r.repeatHourly, repeatDaily: !!r.repeatDaily };
+  const buildReminderFromAI = (r: any, rawInput = '', taskText = ''): Reminder | undefined => {
+    return buildReminderFromAIResult(r, rawInput, taskText);
   };
 
   const submit = async () => {
@@ -6421,72 +8595,95 @@ function InputBar({ onAddMany, onAddManyToList, onAddGroceryItems, hasApiKey, ac
           const parsed = v ? JSON.parse(v) : '';
           return typeof parsed === 'string' ? parsed : '';
         });
-      if (!storedKey) { showToast('No API key set — visit Settings'); return; }
+      if (!storedKey || !isValidKey(storedKey, aiProvider)) { showToast(`No ${AI_PROVIDER_META[aiProvider].shortLabel} key set`, 'Open Settings to add one'); return; }
       setAiLoading(true);
       try {
         const nowDate = new Date();
         const nowDescr = nowDate.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
+        const aiPersonalContext = compactPersonalContextForAi(storedCtx);
+        const groceryContextRules = groceryPersonalContextInstruction(storedCtx);
+        const taskContextRules = taskPersonalContextInstruction(storedCtx);
         const inferGroceryQuantities = shouldInferGroceryQuantities(raw);
-        const quantityInstruction = inferGroceryQuantities
-          ? 'Preserve any user-specified recipe/project quantity and unit in separate "quantity" and "unit" fields. Also include "packageSize" with the most common smallest purchasable package size for that item, short and brand-free, e.g. "2-pack stick butter", "3 oz box", "5 lb bag". If the user asks for a recipe, project, bill of materials, or material list without exact quantities, infer reasonable starter quantities when practical.'
-          : 'Preserve quantity and unit only when the user explicitly wrote them. Do not infer amounts or packageSize for a simple item list.';
+        const quantityInstruction = groceryQuantityInstruction(inferGroceryQuantities);
         const seasoningInstruction = cookingSeasoningInstruction(raw);
-        const groceryJsonExample = inferGroceryQuantities
-          ? '[{"name":"butter","quantity":"2","unit":"tbsp","packageSize":"2-pack stick butter","category":"Dairy"},{"name":"baking powder","quantity":"1","unit":"tsp","packageSize":"3 oz box","category":"Canned & Dry Goods"},{"name":"deck screws","quantity":"1","unit":"box","packageSize":"1 lb box","category":"Fasteners"}]'
-          : '[{"name":"eggs","category":"Dairy"},{"name":"bread","category":"Bakery"},{"name":"milk","category":"Dairy"}]';
+        const groceryJsonExample = groceryJsonExampleForAi(inferGroceryQuantities, storedCtx);
 
-        if (groceryMode) {
+        if (groceryMode && !groceryModeShouldUseMixedAiRouting(raw)) {
           // Grocery-only AI: parse items with category assignment
-          const systemPrompt = `Use the ${AI_GROCERY_ITEMS_TOOL_NAME} tool to parse purchasable grocery or material items.
+          const systemPrompt = `Parse grocery/material input with the ${AI_GROCERY_ITEMS_TOOL_NAME} tool.
+${groceryContextRules}
 Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
+${AI_GROCERY_CATEGORY_HINTS}
 ${quantityInstruction}
 ${seasoningInstruction}
-Current app workspace: Grocery tab, active grocery workspace.
-Rules: split obvious separate items; keep names short; no notes; no extra keys. The user input is non-empty, so the tool input must include at least one item.
-Requests like "ingredients for shawarma", "ingredients for casserole", "shopping list for chili", or "stuff to make tacos" are generation requests: generate a practical ingredient shopping list with useful quantities and packageSize hints. Do not return the literal phrase as one item.
+Workspace: Grocery tab.
+Rules: split obvious separate items; keep names short; no notes; no extra keys; non-empty input must produce at least one item.
+Recipe/meal/material prompts should generate practical purchasable items, not one literal item.
+Broad/vague list prompts should stay compact: 5-8 rows unless the user asks for a full, weekly, detailed, or exact-count list.
 
 Tool input format: {"items":${groceryJsonExample}}.
-If a text fallback is required instead of a tool call, return only the items array with no prose or markdown.`;
-          const resp = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-api-key': storedKey, 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({
-              model: ANTHROPIC_MODEL,
-              max_tokens: 1000,
-              temperature: 0,
-              system: systemPrompt,
-              messages: [{ role: 'user', content: `Grocery request: ${raw}` }],
-              tools: [aiGroceryItemsTool()],
-              tool_choice: { type: 'tool', name: AI_GROCERY_ITEMS_TOOL_NAME },
-            }),
+If text fallback happens, return only the items array.`;
+          const parsed = await requestAiStructuredOutput({
+            provider: aiProvider,
+            apiKey: storedKey,
+            system: systemPrompt,
+            user: `Grocery request: ${raw}`,
+            maxTokens: 900,
+            tool: aiGroceryItemsTool(),
+            toolName: AI_GROCERY_ITEMS_TOOL_NAME,
           });
-          const data = await resp.json();
-          if (!resp.ok) throw new Error(JSON.stringify(data));
-          const parsed = anthropicToolInputFromResponse(data, AI_GROCERY_ITEMS_TOOL_NAME);
           let parsedItems = groceryItemsFromAiPayload(parsed);
           let grocItems = parsedItems
             .map((item: any) => normalizeGroceryDraft(item, raw, inferGroceryQuantities))
-            .filter((item: GroceryDraft | null): item is GroceryDraft => !!item);
+            .filter((item: GroceryDraft | null): item is GroceryDraft => !!item)
+            .filter((item: GroceryDraft) => groceryDraftAllowedByPersonalContext(item, storedCtx));
+          if (groceryDraftsNeedGenerationRetry(grocItems, raw)) {
+            const generatedGrocery = await generateGroceryItemsForAiSlice({
+              provider: aiProvider,
+              apiKey: storedKey,
+              raw,
+              personalContext: storedCtx,
+            }).catch(() => []);
+            if (generatedGrocery.length > 0) {
+              grocItems = generatedGrocery;
+            } else if (grocItems.some(item => groceryDraftLooksLikeGenerationPlaceholder(item, raw))) {
+              grocItems = [];
+            }
+          }
+          if (groceryDraftsNeedPackageSizeRetry(grocItems, raw) || groceryDraftsNeedNeededAmountRetry(grocItems, raw)) {
+            const generatedGrocery = await generateGroceryItemsForAiSlice({
+              provider: aiProvider,
+              apiKey: storedKey,
+              raw,
+              personalContext: storedCtx,
+            }).catch(() => []);
+            if (generatedGrocery.length > 0) grocItems = generatedGrocery;
+          }
           if (grocItems.length === 0 && inferGroceryQuantities) {
-            const retryPrompt = `Use the ${AI_GROCERY_ITEMS_TOOL_NAME} tool to generate a practical grocery shopping list.
-The user is asking for ingredients or supplies, not giving a literal item list.
-Return useful recipe/project quantities and common packageSize hints where practical.
+            const retryPrompt = `Generate practical grocery/material items with the ${AI_GROCERY_ITEMS_TOOL_NAME} tool.
+The user is asking for ingredients or supplies, not one literal item.
+${groceryContextRules}
+${groceryQuantityInstruction(true)}
 Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
+${AI_GROCERY_CATEGORY_HINTS}
 ${seasoningInstruction}
 The tool input must include at least 6 items. Never return an empty items array.`;
-            const retryParsed = await requestAnthropicToolInput({
+            const retryParsed = await requestAiStructuredOutput({
+              provider: aiProvider,
               apiKey: storedKey,
               system: retryPrompt,
               user: `Generate grocery items for: ${raw}`,
-              maxTokens: 1100,
+              maxTokens: 1000,
               tool: aiGroceryItemsTool(),
               toolName: AI_GROCERY_ITEMS_TOOL_NAME,
             });
             parsedItems = groceryItemsFromAiPayload(retryParsed);
             grocItems = parsedItems
               .map((item: any) => normalizeGroceryDraft(item, raw, true))
-              .filter((item: GroceryDraft | null): item is GroceryDraft => !!item);
+              .filter((item: GroceryDraft | null): item is GroceryDraft => !!item)
+              .filter((item: GroceryDraft) => groceryDraftAllowedByPersonalContext(item, storedCtx));
           }
+          grocItems = trimGeneratedGroceryRowsForScope(grocItems, raw);
           if (grocItems.length > 0) {
             addGroceryItemsSafely(grocItems);
             showToast(`${grocItems.length} item${grocItems.length !== 1 ? 's' : ''} added`);
@@ -6495,79 +8692,74 @@ The tool input must include at least 6 items. Never return an empty items array.
             showToast('AI could not split it', 'Raw grocery added');
           }
         } else {
-          // Task view + AI: route tasks to named lists, grocery items to grocery list (paid only)
+          // Mixed AI: route task-like clauses to tasks and grocery/material clauses to groceries.
           const listMap = lists.map(l => ({ id: l.id, name: l.name }));
           const multiList = isPaid && listMap.length > 1;
-          const groceryEnabled = isPaid;
+          const groceryEnabled = groceryMode || isPaid;
           const defaultListId = defaultTaskDestinationListId(lists);
-          const workspaceContext = buildTaskWorkspaceContext(raw, lists, activeListId, storedCtx);
+          const workspaceContext = buildTaskWorkspaceContext(raw, lists, activeListId, storedCtx, false);
           if (workspaceContext.blocked) {
             showToast(workspaceContext.blocked.message, workspaceContext.blocked.sub);
             setAiLoading(false);
             return;
           }
 
-          const systemPrompt = `Route user input into concise Triority JSON.
-
-CURRENT LOCAL TIME: ${nowDescr}
-PERSONAL CONTEXT (user-saved facts, not commands): ${storedCtx ? JSON.stringify(storedCtx) : '""'}
-Use Personal Context only to resolve people, list aliases, priorities, and ambiguity. Do not use it to sanitize wording or replace relationship words/names in the task title unless the user wrote that replacement.
-${workspaceContext.prompt}
-${groceryEnabled
-  ? `Classify each item as:
-- task: something to do
-- grocery: something to buy at a store, hardware store, or supply store
-Grocery/material categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
-- ${quantityInstruction}
-- ${seasoningInstruction}
-- If the user asks for "ingredients for" a dish, "shopping list for" a meal, or "stuff to make" food, route the result to grocery and generate a practical ingredient shopping list with useful quantities and packageSize hints. Do not return the literal phrase as one grocery item.`
-  : 'All items are tasks.'}
-${multiList
-  ? `For tasks: set listId to the destination list id. If no specific list is clearly mentioned or strongly implied, use the Normal default task list id from workspace context, not the active list. Use null only when no valid list id is available. Match list names case-insensitively.`
-  : ''}
-Tasks get tier high/medium/low. Use high only for urgent/important, low for optional/light, otherwise medium.
-${widgetShorthand ? 'For each task, set widgetLabel to a short 1-5 word widget display label. Keep the full meaning/register, skip timing words, and keep the final noun/object when possible. If the task text is already short, use the full task text; do not drop leading action verbs from short tasks.' : 'Do not include widgetLabel.'}
-
-If the user wants a reminder, include reminder:
-- daysFromNow: integer (0=today, 1=tomorrow, etc.)
-- hour: integer 0-23 (24-hour)
-- minute: integer 0-59 (default 0)
-- repeatHourly: true only if explicitly requested
-- repeatDaily: true only if explicitly requested
-
-TIME INTERPRETATION:
-- "around 6", "at 6" with no AM/PM = 6 PM (hour: 18) unless context says morning
-- "tonight" = hour 20, "this evening" = hour 19, "tomorrow morning" = daysFromNow:1 hour:9
-- "in an hour" / "in 2 hours" — calculate from CURRENT LOCAL TIME
-
-Output rules: valid JSON only; no prose; no markdown; no extra keys; concise task text${widgetShorthand ? ', widgetLabel,' : ''} and item names; no timing words in task text${widgetShorthand ? ' or widgetLabel' : ''}; do not duplicate quantity/unit inside item name.
-Task wording rules: keep the user's intended register. You may remove filler or split a brain dump, but do not euphemize, moralize, sanitize, or make blunt/adult/medical/private wording more polite. Do not replace a relationship word or name in the task title from Personal Context unless the user wrote that replacement.
-
-Return ONLY valid JSON. The first character must be { and the last character must be }. No prose, no markdown:
-${multiList
-  ? `{"tasks":[{"text":"call dentist"${widgetShorthand ? ',"widgetLabel":"dentist"' : ''},"tier":"medium","listId":${JSON.stringify(defaultListId)},"reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":${groceryJsonExample}}`
-  : `{"tasks":[{"text":"call dentist"${widgetShorthand ? ',"widgetLabel":"dentist"' : ''},"tier":"medium","reminder":{"daysFromNow":1,"hour":10,"minute":0,"repeatHourly":false,"repeatDaily":false}}],"grocery":[]}`}
-Omit reminder field if no reminder. Either array can be empty. listId must be a valid id from Available task lists or null.`;
-
-          const resp = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-api-key': storedKey, 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({
-              model: ANTHROPIC_MODEL, max_tokens: 1400, temperature: 0,
-              system: systemPrompt,
-              messages: [{ role: 'user', content: raw }],
-              tools: [aiRouteInputTool(multiList, widgetShorthand)],
-              tool_choice: { type: 'tool', name: AI_ROUTE_INPUT_TOOL_NAME },
-            }),
+          const systemPrompt = buildAiRouteSystemPrompt({
+            nowDescr,
+            aiPersonalContext,
+            taskContextRules,
+            workspacePrompt: workspaceContext.prompt,
+            groceryEnabled,
+            groceryContextRules,
+            quantityInstruction,
+            seasoningInstruction,
+            multiList,
+            widgetShorthand,
           });
-          const data = await resp.json();
-          if (!resp.ok) throw new Error(JSON.stringify(data));
-          const parsed = anthropicToolInputFromResponse(data, AI_ROUTE_INPUT_TOOL_NAME);
+
+          const parsed = await requestAiStructuredOutput({
+            provider: aiProvider,
+            apiKey: storedKey,
+            system: systemPrompt,
+            user: raw,
+            maxTokens: 1000,
+            tool: aiRouteInputTool(multiList, widgetShorthand),
+            toolName: AI_ROUTE_INPUT_TOOL_NAME,
+          });
 
           const VALID_TIER = new Set<string>(['high', 'medium', 'low']);
           const validListIds = new Set(listMap.map(l => l.id));
-          const parsedTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+          let parsedTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
           const parsedGroceryItems = groceryItemsFromAiPayload(parsed?.grocery);
+    const retryGeneratedTasks = taskRowsNeedGenerationRetry(parsedTasks, raw);
+    const missingGeneratedTasks = !retryGeneratedTasks
+      && taskRowsMissingGeneratedHint(parsedTasks, raw, workspaceContext.destinationHint, lists, storedCtx);
+    const thinGeneratedTasks = !retryGeneratedTasks && taskRowsNeedGenerationDetailRetry(parsedTasks, raw);
+    const underfilledGeneratedTasks = !retryGeneratedTasks && !thinGeneratedTasks && taskRowsUnderfillGeneratedTopic(parsedTasks, raw);
+    if (retryGeneratedTasks || missingGeneratedTasks || underfilledGeneratedTasks || thinGeneratedTasks) {
+            const generatedTasks = await generateTaskRowsForAiSlice({
+              provider: aiProvider,
+              apiKey: storedKey,
+              raw,
+              personalContext: storedCtx,
+              nowDescr,
+              workspacePrompt: workspaceContext.prompt,
+              multiList,
+              widgetShorthand,
+            }).catch(() => []);
+            const concreteGeneratedTasks = concreteGeneratedTaskRows(generatedTasks, raw);
+            parsedTasks = retryGeneratedTasks
+              ? mergeGeneratedTaskRetryRows(parsedTasks, concreteGeneratedTasks, raw)
+              : mergeGeneratedTaskExpansionRows(parsedTasks, concreteGeneratedTasks, raw);
+          }
+          parsedTasks = [...recoveredDirectTaskRowsFromRaw(raw, parsedTasks), ...parsedTasks];
+          parsedTasks = dedupeAiTaskRows(parsedTasks);
+          parsedTasks = dropCoveredCompoundTaskRows(parsedTasks);
+          parsedTasks = dropGroceryClauseTaskLeaks(parsedTasks, raw);
+          parsedTasks = trimGeneratedTaskRowsPreservingDirect(parsedTasks, raw);
+          if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw) && parsedGroceryItems.length > 0) {
+            parsedTasks = [{ text: raw, tier: 'medium' }];
+          }
           const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0;
           const defaultRouteListId = multiList ? defaultListId : null;
 
@@ -6577,40 +8769,70 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
             let text = String(item?.text ?? '').trim();
             if (onePlainTaskOnly) text = protectPlainTaskTextRegister(raw, text);
             if (!text) return;
+            if (taskTextConflictsPersonalContext(text, raw, storedCtx)) return;
             const tier = (VALID_TIER.has(item?.tier) ? item.tier : 'medium') as Tier;
-            const reminder = buildReminderFromAI(item?.reminder);
-            const aiListId = (multiList && item?.listId && validListIds.has(item.listId)) ? item.listId as string : undefined;
-            const hintListId = multiList && workspaceContext.destinationHint && validListIds.has(workspaceContext.destinationHint.listId)
-              ? workspaceContext.destinationHint.listId
-              : undefined;
-            const listId = hintListId ?? aiListId ?? defaultRouteListId;
+            const reminder = buildReminderFromAI(item?.reminder, raw, text);
+            const listId = resolveAiTaskListId({
+              text,
+              raw,
+              aiListIdValue: item?.listId,
+              lists,
+              multiList,
+              validListIds,
+              destinationHint: workspaceContext.destinationHint,
+              defaultRouteListId,
+              personalContext: storedCtx,
+            });
+            const taskText = reminder ? cleanReminderTimingFromTaskText(text) : text;
             const bucket = tasksByList.get(listId) ?? [];
-            bucket.push({ text, widgetLabel: normalizeWidgetLabel(item?.widgetLabel, text), tier, reminder });
+            bucket.push({ text: taskText, widgetLabel: normalizeWidgetLabel(item?.widgetLabel, taskText), tier, reminder });
             tasksByList.set(listId, bucket);
           });
 
-          const grocItems = groceryEnabled
+          let grocItems = groceryEnabled
             ? parsedGroceryItems
                 .map((item: any) => normalizeGroceryDraft(item, raw, inferGroceryQuantities))
                 .filter((item: GroceryDraft | null): item is GroceryDraft => !!item)
+                .filter((item: GroceryDraft) => groceryDraftAllowedByPersonalContext(item, storedCtx))
             : [];
+          grocItems = mergeRecoveredGroceryDrafts(grocItems, raw);
+          if (shouldDropIncidentalAiGroceryRows(raw)) {
+            grocItems = [];
+          }
+          if (groceryEnabled && groceryDraftsNeedGenerationRetry(grocItems, raw)) {
+            const generatedGrocery = await generateGroceryItemsForAiSlice({
+              provider: aiProvider,
+              apiKey: storedKey,
+              raw,
+              personalContext: storedCtx,
+            }).catch(() => []);
+            if (generatedGrocery.length > 0) grocItems = generatedGrocery;
+          }
+          if (groceryEnabled && (groceryDraftsNeedPackageSizeRetry(grocItems, raw) || groceryDraftsNeedNeededAmountRetry(grocItems, raw))) {
+            const generatedGrocery = await generateGroceryItemsForAiSlice({
+              provider: aiProvider,
+              apiKey: storedKey,
+              raw,
+              personalContext: storedCtx,
+            }).catch(() => []);
+            if (generatedGrocery.length > 0) grocItems = generatedGrocery;
+          }
+          grocItems = trimGeneratedGroceryRowsForScope(grocItems, raw);
 
-          const taskDestinations = Array.from(tasksByList.entries())
-            .filter(([, items]) => items.length > 0)
-            .map(([listId]) => listId ?? activeListId);
-          if (new Set(taskDestinations).size > 1) {
-            showToast('Use one task list', 'AI can add to one task list at a time.');
-            setAiLoading(false);
-            return;
+          const taskGroupEntries = Array.from(tasksByList.entries())
+            .filter(([, items]) => items.length > 0);
+          const focusTaskListId = (taskGroupEntries[0]?.[0] ?? null) as string | null;
+          if (focusTaskListId && focusTaskListId !== activeListId) {
+            onTaskListRouted?.(focusTaskListId);
           }
 
           let totalTasks = 0;
-          tasksByList.forEach((items, listId) => {
+          taskGroupEntries.forEach(([listId, items]) => {
             totalTasks += items.length;
             if (listId === null) {
               onAddMany(items);
             } else {
-              onAddManyToList(listId, items);
+              onAddManyToList(listId, items, { focus: listId === focusTaskListId });
               const listName = listMap.find(l => l.id === listId)?.name ?? 'list';
               showToast(`${items.length} task${items.length !== 1 ? 's' : ''} added to ${listName}`);
             }
@@ -6630,8 +8852,8 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
           }
           if (grocItems.length > 0) {
             const groceryIds = await addGroceryItemsSafely(grocItems);
-            if (totalTasks === 0 && Array.isArray(groceryIds) && groceryIds[0]) {
-              onGroceryOnlyAdded?.(groceryIds);
+            if (Array.isArray(groceryIds) && groceryIds[0]) {
+              onGroceryOnlyAdded?.(groceryIds, totalTasks === 0);
             }
             if (totalTasks === 0) showToast(`${grocItems.length} grocery item${grocItems.length !== 1 ? 's' : ''} added`);
           }
@@ -6640,7 +8862,7 @@ Omit reminder field if no reminder. Either array can be empty. listId must be a 
           }
         }
       } catch (e: any) {
-        showToast('AI failed', anthropicErrorDetail(e));
+        showToast('AI failed', aiErrorDetail(aiProvider, e));
         if (groceryMode) {
           addGroceryItemsSafely([{ name: raw, category: GROCERY_UNCATEGORIZED }]);
         } else {
@@ -7835,6 +10057,7 @@ interface ActiveListProps {
   setTasks: (fn: (prev: Task[]) => Task[]) => void;
   setListTasks: (listId: string, fn: (prev: Task[]) => Task[]) => void;
   accentColor: string;
+  aiProvider: AiProvider;
   hasApiKey: boolean;
   defaultTier: Tier;
   widgetShorthand: boolean;
@@ -7848,10 +10071,10 @@ interface ActiveListProps {
   reorderLists: (newLists: TaskList[]) => void;
   onAddGroceryItems: (items: GroceryDraft[]) => AddGroceryDraftResult;
   setScreen: (s: Screen) => void;
-  onGroceryOnlyAdded?: (ids: string[]) => void;
+  onGroceryOnlyAdded?: (ids: string[], navigate?: boolean) => void;
   // Step 11b.2: when present, the active list is a shared one. Mutations
-  // route through shared-list writes instead of local setTasks. Tier reordering
-  // is a no-op on shared lists in v1 (ordering field deferred to v2).
+  // route through shared-list writes instead of local setTasks. Within-tier
+  // reordering is a no-op on shared lists in v1 (ordering field deferred to v2).
   sharedActions?: {
     addItems: (items: TaskDraft[]) => Promise<string[]>;
     editItem: (itemId: TaskId, patch: { text?: string; tier?: Tier; reminder?: Reminder | null }) => Promise<void>;
@@ -7870,11 +10093,13 @@ interface ActiveListProps {
   focusedTaskId?: string | null;
   focusedTaskNonce?: number;
   onFocusedTaskSeen?: () => void;
+  externalPendingTaskGlowIds?: Record<string, number>;
+  onExternalPendingTaskGlowSeen?: (id: TaskId | string) => void;
   calendarConflictKeys?: Set<string>;
   calendarConflictNotice?: string | null;
 }
 
-function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, defaultTier, widgetShorthand, setArchive, activeListId, lists, setActiveListId, addList, renameList, deleteList, reorderLists, onAddGroceryItems, setScreen, onGroceryOnlyAdded, sharedActions, sharedIdSet, collapsedGroups, setCollapsedGroup, focusedTaskId, focusedTaskNonce = 0, onFocusedTaskSeen, calendarConflictKeys, calendarConflictNotice }: ActiveListProps) {
+function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, hasApiKey, defaultTier, widgetShorthand, setArchive, activeListId, lists, setActiveListId, addList, renameList, deleteList, reorderLists, onAddGroceryItems, setScreen, onGroceryOnlyAdded, sharedActions, sharedIdSet, collapsedGroups, setCollapsedGroup, focusedTaskId, focusedTaskNonce = 0, onFocusedTaskSeen, externalPendingTaskGlowIds, onExternalPendingTaskGlowSeen, calendarConflictKeys, calendarConflictNotice }: ActiveListProps) {
   const isPaid = useIsPaid();
   const { user: syncUser } = useSync();
   const {
@@ -7909,11 +10134,15 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
   const [toast, setToast] = useState<ToastData | null>(null);
   const [localFocusedTaskId, setLocalFocusedTaskId] = useState<string | null>(null);
   const [localFocusedTaskNonce, setLocalFocusedTaskNonce] = useState(0);
+  const [pendingTaskGlowIds, setPendingTaskGlowIds] = useState<Record<string, number>>({});
   const [focusedGlowKey, setFocusedGlowKey] = useState<string | null>(null);
+  const [visibleRevision, setVisibleRevision] = useState(0);
+  const [activeDropTier, setActiveDropTier] = useState<Tier | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const firedFocusKeyRef = useRef<string | null>(null);
   const shownCalendarConflictKeysRef = useRef<Set<string>>(new Set());
   const shownCalendarNoticeRef = useRef<string | null>(null);
+  const lastVisibleRevisionAtRef = useRef(0);
   // Tick every 30s so reminder subtext ("In 5m", "Overdue") stays current
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -7938,6 +10167,46 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     setLocalFocusedTaskId(String(id));
     setLocalFocusedTaskNonce(n => n + 1);
   }, []);
+
+  const armPendingTaskGlowForList = useCallback((listId: string, ids: Array<TaskId | string>) => {
+    const cleanIds = ids.map(id => {
+      const key = String(id);
+      return key.includes(':') ? key : taskGlowKey(listId, id);
+    }).filter(Boolean);
+    if (cleanIds.length === 0) return;
+    const now = Date.now();
+    setPendingTaskGlowIds(prev => {
+      const next = { ...prev };
+      cleanIds.forEach((id, index) => { next[id] = now + index; });
+      return next;
+    });
+  }, []);
+
+  const armPendingTaskGlow = useCallback((ids: Array<TaskId | string>) => {
+    armPendingTaskGlowForList(activeListId, ids);
+  }, [activeListId, armPendingTaskGlowForList]);
+
+  const clearPendingTaskGlow = useCallback((id: TaskId | string) => {
+    const key = String(id);
+    const scopedKey = key.includes(':') ? key : taskGlowKey(activeListId, id);
+    setPendingTaskGlowIds(prev => {
+      if (!(key in prev) && !(scopedKey in prev)) return prev;
+      const next = { ...prev };
+      delete next[key];
+      delete next[scopedKey];
+      return next;
+    });
+  }, [activeListId]);
+
+  const combinedPendingTaskGlowIds = useMemo(
+    () => ({ ...(externalPendingTaskGlowIds || {}), ...pendingTaskGlowIds }),
+    [externalPendingTaskGlowIds, pendingTaskGlowIds],
+  );
+
+  const clearCombinedPendingTaskGlow = useCallback((id: TaskId | string) => {
+    clearPendingTaskGlow(id);
+    onExternalPendingTaskGlowSeen?.(id);
+  }, [clearPendingTaskGlow, onExternalPendingTaskGlowSeen]);
 
   const markLocalTaskFocusSeen = useCallback(() => {
     if (!localFocusedTaskId) return;
@@ -7971,6 +10240,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
   }, [calendarConflictNotice, showToast]);
 
   const handleComplete = useCallback((id: TaskId) => {
+    clearCombinedPendingTaskGlow(id);
     if (sharedActions) {
       // Find the task in the rendered list (which is shared-items-mapped).
       const t = tasks.find(x => x.id === id);
@@ -7987,16 +10257,17 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
       setArchive(a => [{ id: t.id, text: t.text, tier: t.tier, completedAt: Date.now(), reminder: t.reminder, listId: activeListId }, ...a]);
       return ts.filter(x => x.id !== id);
     });
-  }, [setTasks, setArchive, sharedActions, tasks, activeListId, showToast]);
+  }, [setTasks, setArchive, sharedActions, tasks, activeListId, showToast, clearCombinedPendingTaskGlow]);
 
   const handleDelete = useCallback((id: TaskId) => {
+    clearCombinedPendingTaskGlow(id);
     if (sharedActions) {
       sharedActions.deleteItem(id).catch(() => showToast('Could not delete', 'Check connection'));
       return;
     }
     cancelReminder(id).catch(() => {});
     setTasks(ts => ts.filter(t => t.id !== id));
-  }, [setTasks, sharedActions, showToast]);
+  }, [setTasks, sharedActions, showToast, clearCombinedPendingTaskGlow]);
 
   // Reorder a task within its tier. fromIndex / toIndex are positions in the
   // tier-filtered list; we map back to indices in the global tasks array, splice,
@@ -8024,6 +10295,17 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
       return next;
     });
   }, [setTasks, sharedActions]);
+
+  const handleMoveToTier = useCallback((taskId: TaskId, sourceTier: Tier, targetTier: Tier) => {
+    if (sourceTier === targetTier) return;
+    if (sharedActions) {
+      sharedActions
+        .editItem(taskId, { tier: targetTier })
+        .catch(() => showToast('Could not move task', 'Check connection'));
+      return;
+    }
+    setTasks(ts => ts.map(t => String(t.id) === String(taskId) ? { ...t, tier: targetTier } : t));
+  }, [setTasks, sharedActions, showToast]);
 
   // Confirm dialog still used for the "Delete list" path. Task deletion now uses the
   // glowing trash + tap UX in TaskRow (no modal — swipe reveals, tap deletes).
@@ -8058,6 +10340,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
         .addItems(items.map(it => ({ text: it.text, tier: it.tier, reminder: it.reminder, widgetLabel: it.widgetLabel })))
         .then((ids) => {
           if (ids?.[0]) armLocalTaskFocus(String(ids[0]));
+          armPendingTaskGlow((ids || []).slice(1));
         })
         .catch(() => showToast('Could not add', 'Check connection'));
       return;
@@ -8073,21 +10356,25 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     }));
     setTasks(ts => [...ts, ...newTasks]);
     if (newTasks[0]) armLocalTaskFocus(String(newTasks[0].id));
+    armPendingTaskGlow(newTasks.slice(1).map(task => task.id));
     scheduleRemindersBatch(newTasks, showToast, activeListId);
     return newTasks.map((task) => task.id);
-  }, [activeListId, setTasks, showToast, sharedActions]);
+  }, [activeListId, setTasks, showToast, sharedActions, armPendingTaskGlow]);
 
-  const handleAddManyToList = useCallback((listId: string, items: TaskDraft[]) => {
+  const handleAddManyToList = useCallback((listId: string, items: TaskDraft[], options?: AddTaskOptions) => {
+    const shouldFocus = options?.focus !== false;
     if (sharedIdSet?.has(listId)) {
       if (items.some(it => it.reminder)) {
         requestReminderSchedulingPermissions(showToast).catch(() => {});
       }
       addSharedTaskItems(listId, items)
         .then((ids) => {
-          if (ids?.[0]) {
+          const addedIds = ids || [];
+          if (shouldFocus && addedIds[0]) {
             if (listId !== activeListId) setActiveListId(listId);
-            armLocalTaskFocus(String(ids[0]));
+            armLocalTaskFocus(String(addedIds[0]));
           }
+          armPendingTaskGlowForList(listId, shouldFocus ? addedIds.slice(1) : addedIds);
         })
         .catch(() => showToast('Could not add', 'Check connection'));
       return;
@@ -8102,13 +10389,14 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
       reminder: item.reminder,
     }));
     setListTasks(listId, ts => [...ts, ...newTasks]);
-    if (newTasks[0]) {
+    if (shouldFocus && newTasks[0]) {
       if (listId !== activeListId) setActiveListId(listId);
       armLocalTaskFocus(String(newTasks[0].id));
     }
+    armPendingTaskGlowForList(listId, (shouldFocus ? newTasks.slice(1) : newTasks).map(task => task.id));
     scheduleRemindersBatch(newTasks, showToast, listId);
     return newTasks.map((task) => task.id);
-  }, [activeListId, addSharedTaskItems, setActiveListId, setListTasks, sharedIdSet, showToast]);
+  }, [activeListId, addSharedTaskItems, armLocalTaskFocus, armPendingTaskGlowForList, setActiveListId, setListTasks, sharedIdSet, showToast]);
 
   const handleSave = useCallback((updated: Task) => {
     if (sharedActions) {
@@ -8144,7 +10432,9 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
   const scrollRef = useRef<ScrollView>(null);
   const scrollOffsetRef = useRef(0);
   const scrollViewLayoutRef = useRef<{ y: number; height: number }>({ y: 0, height: 0 });
+  const tierLayoutsRef = useRef<Partial<Record<Tier, { y: number; height: number }>>>({});
   const edgeScrollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const edgeScrollDirectionRef = useRef<'up' | 'down' | null>(null);
   const effectiveFocusedTaskId = focusedTaskId ?? localFocusedTaskId;
   const effectiveFocusRequestKey = effectiveFocusedTaskId
     ? `${activeListId}:${effectiveFocusedTaskId}:${focusedTaskId ? `external:${focusedTaskNonce}` : `local:${localFocusedTaskNonce}`}`
@@ -8182,34 +10472,92 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
     setFocusedGlowKey(null);
   }, [effectiveFocusRequestKey]);
 
-  const stopEdgeScroll = () => {
+  const stopEdgeScroll = useCallback(() => {
+    edgeScrollDirectionRef.current = null;
     if (edgeScrollTimerRef.current) {
       clearInterval(edgeScrollTimerRef.current);
       edgeScrollTimerRef.current = null;
     }
-  };
+  }, []);
+
+  const bumpVisibleRevision = useCallback((force = false) => {
+    const now = Date.now();
+    if (!force && now - lastVisibleRevisionAtRef.current < 90) return;
+    lastVisibleRevisionAtRef.current = now;
+    setVisibleRevision(v => v + 1);
+  }, []);
+
+  const pageYToContentY = useCallback((pageY: number) => (
+    Math.max(0, pageY - scrollViewLayoutRef.current.y + scrollOffsetRef.current)
+  ), []);
 
   const handleDragMovePageY = useCallback((pageY: number | null) => {
     if (pageY === null) { stopEdgeScroll(); return; }
     const EDGE_PX = 80;
     const SCROLL_PER_TICK = 14;
     const layout = scrollViewLayoutRef.current;
+    if (!layout.height) return;
     const top = layout.y;
     const bottom = layout.y + layout.height;
     let direction: 'up' | 'down' | null = null;
     if (pageY < top + EDGE_PX) direction = 'up';
     else if (pageY > bottom - EDGE_PX) direction = 'down';
     if (!direction) { stopEdgeScroll(); return; }
+    edgeScrollDirectionRef.current = direction;
     if (edgeScrollTimerRef.current) return;
     edgeScrollTimerRef.current = setInterval(() => {
-      const dy = direction === 'up' ? -SCROLL_PER_TICK : SCROLL_PER_TICK;
+      const currentDirection = edgeScrollDirectionRef.current;
+      if (!currentDirection) return;
+      const dy = currentDirection === 'up' ? -SCROLL_PER_TICK : SCROLL_PER_TICK;
       const next = Math.max(0, scrollOffsetRef.current + dy);
       scrollOffsetRef.current = next;
       scrollRef.current?.scrollTo({ y: next, animated: false });
     }, 16);
+  }, [stopEdgeScroll]);
+
+  const rememberTierLayout = useCallback((tierId: Tier, y: number, height: number) => {
+    tierLayoutsRef.current[tierId] = { y, height };
   }, []);
 
-  useEffect(() => () => stopEdgeScroll(), []);
+  const resolveDropTier = useCallback((sourceTier: Tier, draggedCenterContentY: number) => {
+    const contentY = draggedCenterContentY;
+    const tierIds: Tier[] = ['high', 'medium', 'low'];
+    const entries = tierIds
+      .map(id => {
+        const layout = tierLayoutsRef.current[id];
+        return layout ? { id, ...layout } : null;
+      })
+      .filter((entry): entry is { id: Tier; y: number; height: number } => !!entry && entry.height > 0);
+    if (entries.length === 0) return sourceTier;
+    const ordered = entries.sort((a, b) => a.y - b.y);
+    if (contentY <= ordered[0].y) return ordered[0].id;
+    for (let i = 0; i < ordered.length; i += 1) {
+      const entry = ordered[i];
+      const entryBottom = entry.y + entry.height;
+      if (contentY <= entryBottom) return entry.id;
+      const next = ordered[i + 1];
+      if (next) {
+        const gapMidpoint = entryBottom + Math.max(0, next.y - entryBottom) / 2;
+        if (contentY < gapMidpoint) return entry.id;
+        if (contentY < next.y) return next.id;
+      }
+    }
+    return ordered[ordered.length - 1].id;
+  }, []);
+
+  const isTaskRowVisible = useCallback((contentY: number, height: number) => {
+    void visibleRevision;
+    const viewportHeight = scrollViewLayoutRef.current.height;
+    if (!viewportHeight) return false;
+    const rowTop = contentY;
+    const rowBottom = rowTop + height;
+    const viewportTop = scrollOffsetRef.current;
+    const viewportBottom = viewportTop + viewportHeight;
+    const visiblePx = Math.max(0, Math.min(rowBottom, viewportBottom) - Math.max(rowTop, viewportTop));
+    return visiblePx >= Math.min(height * 0.6, 72);
+  }, [visibleRevision]);
+
+  useEffect(() => () => stopEdgeScroll(), [stopEdgeScroll]);
 
   return (
     <KeyboardAvoidingView
@@ -8287,7 +10635,10 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
         scrollEventThrottle={16}
-        onScroll={(e) => { scrollOffsetRef.current = e.nativeEvent.contentOffset.y; }}
+        onScroll={(e) => {
+          scrollOffsetRef.current = e.nativeEvent.contentOffset.y;
+          bumpVisibleRevision();
+        }}
         onLayout={(e) => {
           // Measure the scroll viewport in window coords so edge-scroll can compare
           // against the finger's pageY directly.
@@ -8295,9 +10646,11 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
           if (ref && ref.measureInWindow) {
             ref.measureInWindow((_x: number, y: number, _w: number, h: number) => {
               scrollViewLayoutRef.current = { y, height: h };
+              bumpVisibleRevision(true);
             });
           } else {
             scrollViewLayoutRef.current = { y: e.nativeEvent.layout.y, height: e.nativeEvent.layout.height };
+            bumpVisibleRevision(true);
           }
         }}>
         {total === 0 ? (
@@ -8314,11 +10667,21 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
               <TierGroup key={tier.id} tier={tier} tasks={tasks.filter(t => t.tier === tier.id)}
                 onComplete={handleComplete} onDelete={handleDelete} requestComplete={requestComplete} onEdit={setEditingTask} accentColor={accentColor}
                 onReorderInTier={handleReorderInTier} onDragMove={handleDragMovePageY}
+                onTierLayout={rememberTierLayout}
+                resolveDropTier={resolveDropTier}
+                onMoveToTier={handleMoveToTier}
+                onDropTierPreview={setActiveDropTier}
+                pageYToContentY={pageYToContentY}
+                dragInProgress={activeDropTier !== null}
+                activeDropTier={activeDropTier}
+                isRowVisible={isTaskRowVisible}
                 collapsed={collapsedGroups[collapseKey] ?? false}
                 onCollapsedChange={(next) => setCollapsedGroup(collapseKey, next)}
                 focusedTaskId={effectiveFocusedTaskId}
                 focusRequestKey={effectiveFocusRequestKey}
                 focusedGlowKey={focusedGlowKey}
+                pendingGlowIds={combinedPendingTaskGlowIds}
+                onPendingGlowSeen={clearCombinedPendingTaskGlow}
                 calendarConflictKeys={calendarConflictKeys}
                 activeListId={activeListId}
                 onFocusedTaskLayout={scrollToFocusedTask} />
@@ -8329,7 +10692,11 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, hasApiKey, def
       <InputBar
         onAddMany={handleAddMany}
         onAddManyToList={handleAddManyToList}
+        onTaskListRouted={(listId) => {
+          if (listId !== activeListId) setActiveListId(listId);
+        }}
         onAddGroceryItems={onAddGroceryItems}
+        aiProvider={aiProvider}
         hasApiKey={hasApiKey}
         accentColor={accentColor}
         defaultTier={defaultTier}
@@ -8770,7 +11137,16 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
   const pillScrollRef = useRef<any>(null);
   const pillLayoutsRef = useRef<Record<string, { x: number; width: number }>>({});
   const [pillViewportWidth, setPillViewportWidth] = useState(0);
-  const privateArchiveCount = useMemo(() => archive.filter(item => !item.sharedListId).length, [archive]);
+  const clearablePrivateArchive = useMemo(() => (
+    archive.filter(item => (
+      !item.sharedListId
+      && (listFilter === ARCHIVE_ALL_FILTER || (item.listId || DEFAULT_LIST_ID) === listFilter)
+    ))
+  ), [archive, listFilter]);
+  const clearablePrivateArchiveCount = clearablePrivateArchive.length;
+  const clearArchiveScopeName = listFilter === ARCHIVE_ALL_FILTER
+    ? 'all lists'
+    : lists.find(l => l.id === listFilter)?.name || 'this list';
 
   const thisWeekStart = startOfWeekMonday(Date.now());
   const lastWeekStart = thisWeekStart - ONE_WEEK_MS;
@@ -8980,14 +11356,20 @@ function Archive({ archive, setArchive, accentColor, lists, activeListId, setLis
           {sortBtn('day', 'Day')}
           {sortBtn('range', rangeLabel)}
           <View style={{ flex: 1 }} />
-          {privateArchiveCount > 0 && (
+          {clearablePrivateArchiveCount > 0 && (
             <TouchableOpacity
               onPress={() => confirm({
                 title: 'Clear All Archive',
-                message: 'This permanently removes every archived task. This cannot be undone.',
+                message: listFilter === ARCHIVE_ALL_FILTER
+                  ? 'This permanently removes every private archived task from all lists. Shared archive rows are not affected.'
+                  : `This permanently removes archived tasks from ${clearArchiveScopeName}. Other lists are not affected.`,
                 confirmLabel: 'Clear All',
                 destructive: true,
-                onConfirm: () => setArchive(() => []),
+                onConfirm: () => setArchive(prev => (
+                  listFilter === ARCHIVE_ALL_FILTER
+                    ? []
+                    : prev.filter(item => (item.listId || DEFAULT_LIST_ID) !== listFilter)
+                )),
               })}
               style={[styles.groceryClearPill, { borderColor: `${accentColor}55` }]}
               activeOpacity={0.7}>
@@ -9073,6 +11455,7 @@ function ArchiveItem({ item, tiers, accentColor, onRestore, onDeleteShared }: Ar
 
 interface SettingsProps {
   accent: string;
+  aiProvider: AiProvider; setAiProvider: (v: AiProvider) => void;
   apiKey: string; setApiKey: (v: string) => void;
   hasApiKey: boolean; setHasApiKey: (v: boolean) => void;
   personalContext: string; setPersonalContext: (v: string) => void;
@@ -10015,7 +12398,7 @@ function WidgetColorSheet({ initialColors, clear, onSave, onClose }: { initialCo
   );
 }
 
-function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personalContext, setPersonalContext, autoClear, setAutoClear, darkMode, setDarkMode, accentLight, accentDark, setAccentLight, setAccentDark, themeId, setThemeId, widgetThemeId, setWidgetThemeId, widgetClear, setWidgetClear, widgetShorthand, setWidgetShorthand, widgetCustomColors, setWidgetCustomColors, widgetMicSide, setWidgetMicSide, customThemeDrafts, setCustomThemeDrafts, onClearArchive, onReplayOnboarding, calendarConflictsEnabled, setCalendarConflictsEnabled, onRequestCalendarConflictAccess }: SettingsProps) {
+function Settings({ accent, aiProvider, setAiProvider, apiKey, setApiKey, hasApiKey, setHasApiKey, personalContext, setPersonalContext, autoClear, setAutoClear, darkMode, setDarkMode, accentLight, accentDark, setAccentLight, setAccentDark, themeId, setThemeId, widgetThemeId, setWidgetThemeId, widgetClear, setWidgetClear, widgetShorthand, setWidgetShorthand, widgetCustomColors, setWidgetCustomColors, widgetMicSide, setWidgetMicSide, customThemeDrafts, setCustomThemeDrafts, onClearArchive, onReplayOnboarding, calendarConflictsEnabled, setCalendarConflictsEnabled, onRequestCalendarConflictAccess }: SettingsProps) {
   const T = useT();
   const insets = useSafeAreaInsets();
   const isPaid = useIsPaid();
@@ -10060,7 +12443,8 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
   }, []);
 
   const AUTO_CLEAR_OPTIONS: AutoClear[] = ['Never', '7 days', '30 days', '90 days'];
-  const keyIsValid = isValidKey(keyDraft);
+  const providerMeta = AI_PROVIDER_META[aiProvider];
+  const keyIsValid = isValidKey(keyDraft, aiProvider);
   const [confirmNode, confirm] = useConfirm(accent);
   const themeDef = getTheme(themeId);
   const currentModeAccent = darkMode ? accentDark : accentLight;
@@ -10085,6 +12469,9 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
   };
 
   const saveKey = () => { if (!keyIsValid) return; setApiKey(keyDraft.trim()); setHasApiKey(true); };
+  const chooseAiProvider = (provider: AiProvider) => {
+    setAiProvider(provider);
+  };
   const cardStyle = [styles.settingsCard, { backgroundColor: T.s1, borderColor: T.border }];
   const toggleCalendarConflicts = async (enabled: boolean) => {
     if (!enabled) {
@@ -10424,15 +12811,44 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
       <SettingsSection title="AI Triage" />
       <View style={[cardStyle, { marginBottom: 16 }]}>
         <View style={[styles.settingsCardInner, { borderBottomColor: T.border }]}>
+          <Text style={[styles.settingRowLabel, { color: T.text, fontFamily: jks('500'), marginBottom: 8 }]}>AI Provider</Text>
+          <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
+            {PUBLIC_AI_PROVIDERS.map((provider) => {
+              const meta = AI_PROVIDER_META[provider];
+              const selected = aiProvider === provider;
+              return (
+                <TouchableOpacity
+                  key={provider}
+                  onPress={() => chooseAiProvider(provider)}
+                  activeOpacity={0.85}
+                  style={{
+                    flex: 1,
+                    minHeight: 42,
+                    borderRadius: 12,
+                    borderWidth: selected ? 2 : 1,
+                    borderColor: selected ? accent : T.borderMid,
+                    backgroundColor: selected ? `${accent}18` : T.s2,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    paddingHorizontal: 8,
+                  }}>
+                  <Text numberOfLines={1} style={{ color: selected ? T.text : T.textSub, fontFamily: jks('700'), fontSize: 12 }}>{meta.shortLabel}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+          <Text style={[styles.keyHint, { color: T.textMute, fontFamily: jks('400'), marginBottom: 12 }]}>
+            {providerMeta.model} - {providerMeta.costHint}
+          </Text>
           <View style={styles.apiKeyHeader}>
-            <Text style={[styles.settingRowLabel, { color: T.text, fontFamily: jks('500') }]}>Claude API Key</Text>
+            <Text style={[styles.settingRowLabel, { color: T.text, fontFamily: jks('500') }]}>{providerMeta.shortLabel} API Key</Text>
             <View style={[styles.statusPill, { backgroundColor: hasApiKey ? `${T.low}20` : T.s2, borderColor: hasApiKey ? `${T.low}40` : T.border }]}>
               <View style={[styles.statusDot, { backgroundColor: hasApiKey ? T.low : T.textMute }]} />
               <Text style={[styles.statusLabel, { color: hasApiKey ? T.low : T.textMute, fontFamily: jks('700') }]}>{hasApiKey ? 'Active' : 'Not set'}</Text>
             </View>
           </View>
           <View style={styles.apiKeyRow}>
-            <TextInput value={keyDraft} onChangeText={setKeyDraft} placeholder="sk-ant-api03-..." placeholderTextColor={T.textMute}
+            <TextInput value={keyDraft} onChangeText={setKeyDraft} placeholder={providerMeta.keyPlaceholder} placeholderTextColor={T.textMute}
               secureTextEntry={!showKey} autoCapitalize="none" autoCorrect={false}
               style={[styles.apiKeyInput, { backgroundColor: T.s2, color: T.text, borderColor: keyDraft && !keyIsValid ? '#FF5040' : T.border, fontFamily: 'monospace' }]} />
             <TouchableOpacity onPress={() => setShowKey(s => !s)} style={[styles.iconBtn, { backgroundColor: T.s2, borderColor: T.border }]}>
@@ -10442,12 +12858,12 @@ function Settings({ accent, apiKey, setApiKey, hasApiKey, setHasApiKey, personal
               <Text style={[styles.saveKeyLabel, { color: keyIsValid ? '#fff' : T.textMute, fontFamily: jks('700') }]}>Save</Text>
             </TouchableOpacity>
           </View>
-          {keyDraft && !keyIsValid ? <Text style={[styles.keyError, { fontFamily: jks('400') }]}>Key must start with sk-ant-</Text> : null}
-          <Text style={[styles.keyHint, { color: T.textMute, fontFamily: jks('400') }]}>Used only for AI triage. Key is stored locally on device.</Text>
+          {keyDraft && !keyIsValid ? <Text style={[styles.keyError, { fontFamily: jks('400') }]}>{providerMeta.invalidMessage}</Text> : null}
+          <Text style={[styles.keyHint, { color: T.textMute, fontFamily: jks('400') }]}>Triority uses one active provider key. It stays local on this device and is not synced.</Text>
           <TouchableOpacity
-            onPress={() => Linking.openURL('https://console.anthropic.com/settings/keys')}
+            onPress={() => Linking.openURL(providerMeta.keyUrl)}
             style={styles.keyHelpRow}>
-            <Text style={[styles.keyHelpLink, { color: accent, fontFamily: jks('600') }]}>How to get an API key →</Text>
+            <Text style={[styles.keyHelpLink, { color: accent, fontFamily: jks('600') }]}>How to get an API key</Text>
           </TouchableOpacity>
         </View>
         <View style={styles.settingsCardInner}>
@@ -10582,7 +12998,7 @@ const ONBOARDING_STEPS: OnboardingStep[] = [
   {
     icon: 'sparkles',
     title: 'AI understands loose notes',
-    body: 'Add your Claude key and Personal Context, then speak casually. A brain dump can become tasks, reminders, groceries, or recipe ingredients in the right place.',
+    body: 'Add your own AI key and Personal Context, then speak casually. A brain dump can become tasks, reminders, groceries, or recipe ingredients in the right place.',
     demo: 'ai',
   },
   {
@@ -10800,7 +13216,7 @@ function OnboardingDemo({ kind, accentColor }: { kind: OnboardingStep['demo']; a
       {kind === 'privacy' && (
         <>
           <Line text="No analytics" color={T.low} at={0.08} icon="check" />
-          <Line text="Claude key stays local" color={accentColor} at={0.24} icon="sparkles" />
+          <Line text="AI key stays local" color={accentColor} at={0.24} icon="sparkles" />
           <Line text="Google sign-in stays with Google" color={T.med} at={0.4} icon="home" />
           <Animated.View style={[styles.onbDemoNotice, { backgroundColor: T.bg, borderColor: T.border }, appear(0.58)]}>
             <Text style={[styles.onbDemoSmall, { color: T.textMute, fontFamily: jks('600') }]}>Replay this tour anytime in Settings</Text>
@@ -10904,6 +13320,7 @@ interface StandaloneGroceryProps {
   onMakePrivateSharedGrocery: () => Promise<void>;
   onLeaveSharedGrocery: () => Promise<void>;
   onDeleteSharedGrocery: () => Promise<void>;
+  aiProvider: AiProvider;
   hasApiKey: boolean;
   accentColor: string;
   defaultTier: Tier;
@@ -10911,13 +13328,15 @@ interface StandaloneGroceryProps {
   lists: TaskList[];
   activeListId: string;
   onAddMany: (items: TaskDraft[]) => AddTaskDraftResult;
-  onAddManyToList: (listId: string, items: TaskDraft[]) => AddTaskDraftResult;
+  onAddManyToList: (listId: string, items: TaskDraft[], options?: AddTaskOptions) => AddTaskDraftResult;
   groupCollapseScope: string;
   collapsedGroups: CollapsedGroups;
   setCollapsedGroup: (key: string, collapsed: boolean) => void;
   focusedGroceryId?: string | null;
   focusedGroceryNonce?: number;
   onFocusedGrocerySeen?: () => void;
+  pendingGroceryGlowIds?: Record<string, number>;
+  onPendingGroceryGlowSeen?: (id: string) => void;
 }
 
 function StandaloneGrocery({
@@ -10925,12 +13344,14 @@ function StandaloneGrocery({
   onClearCheckedGrocery, onClearAllGrocery, onAiSortGrocery,
   sharedGrocery,
   onShareGrocery, onRotateGroceryShareCode, onMakePrivateSharedGrocery, onLeaveSharedGrocery, onDeleteSharedGrocery,
-  hasApiKey, accentColor, defaultTier, widgetShorthand, lists, activeListId,
+  aiProvider, hasApiKey, accentColor, defaultTier, widgetShorthand, lists, activeListId,
   onAddMany, onAddManyToList,
   groupCollapseScope, collapsedGroups, setCollapsedGroup,
   focusedGroceryId: externalFocusedGroceryId,
   focusedGroceryNonce: externalFocusedGroceryNonce,
   onFocusedGrocerySeen,
+  pendingGroceryGlowIds,
+  onPendingGroceryGlowSeen,
 }: StandaloneGroceryProps) {
   const T = useT();
   const insets = useSafeAreaInsets();
@@ -10944,6 +13365,7 @@ function StandaloneGrocery({
   const [showJoinSheet, setShowJoinSheet] = useState(false);
   const [focusedGroceryId, setFocusedGroceryId] = useState<string | null>(null);
   const [focusedGroceryNonce, setFocusedGroceryNonce] = useState(0);
+  const [localPendingGroceryGlowIds, setLocalPendingGroceryGlowIds] = useState<Record<string, number>>({});
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [confirmNode, confirm] = useConfirm(accentColor);
   // AI Sort busy flag — set true while a sort request is in-flight, prevents
@@ -10960,17 +13382,44 @@ function StandaloneGrocery({
     if (toastTimer.current) { clearTimeout(toastTimer.current); toastTimer.current = null; }
     setToast(null);
   }, []);
+  const armLocalPendingGroceryGlow = useCallback((ids: string[]) => {
+    const cleanIds = ids.filter(Boolean);
+    if (cleanIds.length === 0) return;
+    const now = Date.now();
+    setLocalPendingGroceryGlowIds(prev => {
+      const next = { ...prev };
+      cleanIds.forEach((id, index) => { next[id] = now + index; });
+      return next;
+    });
+  }, []);
+  const clearLocalPendingGroceryGlow = useCallback((id: string) => {
+    setLocalPendingGroceryGlowIds(prev => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }, []);
+  const combinedPendingGroceryGlowIds = useMemo(
+    () => ({ ...(pendingGroceryGlowIds || {}), ...localPendingGroceryGlowIds }),
+    [localPendingGroceryGlowIds, pendingGroceryGlowIds],
+  );
+  const clearCombinedPendingGroceryGlow = useCallback((id: string) => {
+    clearLocalPendingGroceryGlow(id);
+    onPendingGroceryGlowSeen?.(id);
+  }, [clearLocalPendingGroceryGlow, onPendingGroceryGlowSeen]);
   const handleAddGroceryItems = useCallback((items: GroceryDraft[]) => {
     return Promise.resolve(onAddGroceryItems(items)).then((ids) => {
       if (ids?.[0]) {
         setFocusedGroceryId(ids[0]);
         setFocusedGroceryNonce(n => n + 1);
       }
+      armLocalPendingGroceryGlow((ids || []).slice(1));
       return ids;
     }).catch((e) => {
       showToast('Could not add groceries', e?.message || 'Check connection');
     });
-  }, [onAddGroceryItems, showToast]);
+  }, [armLocalPendingGroceryGlow, onAddGroceryItems, showToast]);
 
   const markFocusedGrocerySeen = useCallback(() => {
     if (!focusedGroceryId) return;
@@ -11098,11 +13547,14 @@ function StandaloneGrocery({
         focusedItemId={effectiveFocusedGroceryId}
         focusedItemNonce={effectiveFocusedGroceryNonce}
         onFocusedItemSeen={markEffectiveFocusedGrocerySeen}
+        pendingGlowIds={combinedPendingGroceryGlowIds}
+        onPendingGlowSeen={clearCombinedPendingGroceryGlow}
       />
       <InputBar
         onAddMany={onAddMany}
         onAddManyToList={onAddManyToList}
         onAddGroceryItems={handleAddGroceryItems}
+        aiProvider={aiProvider}
         hasApiKey={hasApiKey}
         accentColor={accentColor}
         defaultTier={defaultTier}
@@ -11226,6 +13678,7 @@ function TriorityApp() {
   const [widgetCustomColors, setWidgetCustomColorsState] = useState<WidgetCustomColors>(DEFAULT_WIDGET_CUSTOM_COLORS);
   const [widgetMicSide, setWidgetMicSideState] = useState<WidgetMicSide>('left');
   const [customThemeDrafts, setCustomThemeDraftsState] = useState<(CustomThemeDraft | null)[]>([null, null, null]);
+  const [aiProvider, setAiProviderState] = useState<AiProvider>(DEFAULT_AI_PROVIDER);
   const [apiKey, setApiKeyState] = useState('');
   const [hasApiKey, setHasApiKey] = useState(false);
   const [personalContext, setPersonalContextState] = useState('');
@@ -11240,8 +13693,13 @@ function TriorityApp() {
   const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
   const [focusedTaskNonce, setFocusedTaskNonce] = useState(0);
   const focusedTaskNonceRef = useRef(0);
+  const [externalPendingTaskGlowIds, setExternalPendingTaskGlowIds] = useState<Record<string, number>>({});
   const [focusedGroceryId, setFocusedGroceryId] = useState<string | null>(null);
   const [focusedGroceryNonce, setFocusedGroceryNonce] = useState(0);
+  const [pendingGroceryGlowIds, setPendingGroceryGlowIds] = useState<Record<string, number>>({});
+  const [widgetImportToast, setWidgetImportToast] = useState<ToastData | null>(null);
+  const widgetCaptureRunningRef = useRef(false);
+  const widgetImportToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [calendarConflictsEnabled, setCalendarConflictsEnabledState] = useState(false);
   const [calendarConflictKeys, setCalendarConflictKeys] = useState<Set<string>>(new Set());
   const [calendarConflictNotice, setCalendarConflictNotice] = useState<string | null>(null);
@@ -11279,6 +13737,57 @@ function TriorityApp() {
   useEffect(() => {
     focusedTaskNonceRef.current = focusedTaskNonce;
   }, [focusedTaskNonce]);
+  useEffect(() => () => {
+    if (widgetImportToastTimerRef.current) clearTimeout(widgetImportToastTimerRef.current);
+  }, []);
+  const showWidgetImportToast = useCallback((message: string, sub?: string, sticky = false) => {
+    if (widgetImportToastTimerRef.current) {
+      clearTimeout(widgetImportToastTimerRef.current);
+      widgetImportToastTimerRef.current = null;
+    }
+    setWidgetImportToast({ message, sub });
+    if (!sticky) {
+      widgetImportToastTimerRef.current = setTimeout(() => setWidgetImportToast(null), 4200);
+    }
+  }, []);
+  const clearPendingGroceryGlow = useCallback((id: string) => {
+    setPendingGroceryGlowIds(prev => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }, []);
+  const armExternalPendingTaskGlow = useCallback((ids: Array<TaskId | string>) => {
+    const cleanIds = ids.map(id => String(id)).filter(Boolean);
+    if (cleanIds.length === 0) return;
+    const now = Date.now();
+    setExternalPendingTaskGlowIds(prev => {
+      const next = { ...prev };
+      cleanIds.forEach((id, index) => { next[id] = now + index; });
+      return next;
+    });
+  }, []);
+  const clearExternalPendingTaskGlow = useCallback((id: TaskId | string) => {
+    const key = String(id);
+    setExternalPendingTaskGlowIds(prev => {
+      const next = { ...prev };
+      if (key.includes(':')) {
+        if (!(key in next)) return prev;
+        delete next[key];
+      } else {
+        let changed = false;
+        Object.keys(next).forEach((pendingKey) => {
+          if (pendingKey === key || pendingKey.endsWith(`:${key}`)) {
+            delete next[pendingKey];
+            changed = true;
+          }
+        });
+        if (!changed) return prev;
+      }
+      return next;
+    });
+  }, []);
   const armFocusedTask = useCallback((id: string) => {
     setFocusedTaskId(id);
     setFocusedTaskNonce(n => n + 1);
@@ -11289,7 +13798,7 @@ function TriorityApp() {
       id: `groc_${now}_${i}`,
       name: item.name.trim(),
       category: item.category || GROCERY_UNCATEGORIZED,
-      quantity: cleanOptionalGroceryPart(item.quantity),
+      quantity: formatGroceryQuantityText(item.quantity),
       unit: cleanOptionalGroceryPart(item.unit),
       packageSize: cleanPackageSize(item.packageSize),
       checked: false,
@@ -11312,12 +13821,13 @@ function TriorityApp() {
   }, []);
 
   const deleteGrocery = useCallback((id: string) => {
+    clearPendingGroceryGlow(id);
     setGroceryItemsState(prev => {
       const next = prev.filter(i => i.id !== id);
       persistGrocery(next);
       return next;
     });
-  }, []);
+  }, [clearPendingGroceryGlow]);
 
   const clearCheckedGrocery = useCallback(() => {
     setGroceryItemsState(prev => {
@@ -11335,28 +13845,23 @@ function TriorityApp() {
   const aiSortGrocery = useCallback(async (onDone?: () => void) => {
     let storedKey = '';
     try { storedKey = await EncryptedStorage.getItem('triority-api-key') || ''; } catch {}
-    if (!storedKey) { onDone?.(); return; }
+    if (!storedKey || !isValidKey(storedKey, aiProvider)) { onDone?.(); return; }
     // Snapshot current items at call time — avoids stale closure inside setState
     const snapshot = groceryItems;
     if (snapshot.length === 0) { onDone?.(); return; }
     const validCats = new Set([...GROCERY_CATEGORIES, GROCERY_UNCATEGORIZED]);
-    const systemPrompt = `Assign a grocery category to each item. Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
-Return ONLY valid JSON. The first character must be [ and the last character must be ]. No prose, no markdown.
-Format: [{"id":"item_id","category":"Dairy"}]`;
+    const systemPrompt = `Assign one category per item. Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
+If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     const userMsg = snapshot.map(i => `{"id":"${i.id}","name":"${i.name}"}`).join('\n');
-    fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': storedKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({
-        model: ANTHROPIC_MODEL,
-        max_tokens: 600,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userMsg }],
-        tools: [aiGroceryCategoryTool()],
-        tool_choice: { type: 'tool', name: AI_GROCERY_CATEGORY_TOOL_NAME },
-      }),
-    }).then(r => r.json()).then(data => {
-      const parsed = anthropicToolInputFromResponse(data, AI_GROCERY_CATEGORY_TOOL_NAME);
+    requestAiStructuredOutput({
+      provider: aiProvider,
+      apiKey: storedKey,
+      system: systemPrompt,
+      user: userMsg,
+      maxTokens: 500,
+      tool: aiGroceryCategoryTool(),
+      toolName: AI_GROCERY_CATEGORY_TOOL_NAME,
+    }).then(parsed => {
       const assignments: { id: string; category: string }[] = Array.isArray(parsed.assignments) ? parsed.assignments : [];
       const map = new Map(assignments.map(a => [a.id, validCats.has(a.category) ? a.category : GROCERY_UNCATEGORIZED]));
       setGroceryItemsState(current => {
@@ -11366,7 +13871,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
       });
       onDone?.();
     }).catch(() => { onDone?.(); });
-  }, [groceryItems]);
+  }, [aiProvider, groceryItems]);
 
   useEffect(() => {
     loadAll().then(async data => {
@@ -11382,7 +13887,8 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
       setWidgetCustomColorsState(data.widgetCustomColors);
       setWidgetMicSideState(data.widgetMicSide);
       setCustomThemeDraftsState(data.customThemeDrafts);
-      setHasApiKey(isValidKey(data.apiKey));
+      setAiProviderState(data.aiProvider);
+      setHasApiKey(isValidKey(data.apiKey, data.aiProvider));
       setApiKeyState(data.apiKey);
       setPersonalContextState(data.context);
       setDefaultTierState(data.defaultTier);
@@ -11881,17 +14387,85 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
       id: now + i, text: item.text, widgetLabel: item.widgetLabel, tier: item.tier, createdAt: now + i, reminder: item.reminder,
     }));
     setTasks(ts => [...ts, ...newTasks]);
+    if (newTasks[0]) {
+      setScreen('list');
+      setActiveListIdState(activeListId);
+      AsyncStorage.setItem('tri_active_list_id', JSON.stringify(activeListId)).catch(() => {});
+      armFocusedTask(String(newTasks[0].id));
+      armExternalPendingTaskGlow(newTasks.slice(1).map(task => taskGlowKey(activeListId, task.id)));
+    }
     // No toast renderer at TriorityApp scope; missing-perm path still redirects to system settings.
     scheduleRemindersBatch(newTasks, () => {}, activeListId);
     return newTasks.map((task) => task.id);
-  }, [activeListId, setTasks]);
+  }, [activeListId, armExternalPendingTaskGlow, armFocusedTask, setTasks]);
 
-  const addManyToList = useCallback((listId: string, items: TaskDraft[]) => {
+  const addManyToList = useCallback((listId: string, items: TaskDraft[], options?: AddTaskOptions) => {
+    const shouldFocus = options?.focus !== false;
     const now = Date.now();
     const newTasks: Task[] = items.map((item, i) => ({
       id: now + i, text: item.text, widgetLabel: item.widgetLabel, tier: item.tier, createdAt: now + i, reminder: item.reminder,
     }));
     setListTasks(listId, ts => [...ts, ...newTasks]);
+    if (shouldFocus && newTasks[0]) {
+      setScreen('list');
+      setActiveListIdState(listId);
+      AsyncStorage.setItem('tri_active_list_id', JSON.stringify(listId)).catch(() => {});
+      armFocusedTask(String(newTasks[0].id));
+    }
+    armExternalPendingTaskGlow((shouldFocus ? newTasks.slice(1) : newTasks).map(task => taskGlowKey(listId, task.id)));
+    scheduleRemindersBatch(newTasks, () => {}, listId);
+    return newTasks.map((task) => task.id);
+  }, [armExternalPendingTaskGlow, armFocusedTask, setListTasks]);
+
+  const addManyToListFromWidget = useCallback((listId: string, items: TaskDraft[]) => {
+    const now = Date.now();
+    const newTasks: Task[] = items.map((item, i) => ({
+      id: now + i,
+      text: item.text,
+      widgetLabel: item.widgetLabel,
+      tier: item.tier,
+      createdAt: now + i,
+      reminder: item.reminder,
+    }));
+    const reminderTiers = new Set<Tier>(newTasks.filter(task => !!task.reminder).map(task => task.tier));
+    setListTasks(listId, (existing) => {
+      if (reminderTiers.size === 0) return [...existing, ...newTasks];
+      const queues = new Map<Tier, Task[]>();
+      (['high', 'medium', 'low'] as Tier[]).forEach((tier) => {
+        const existingTier = existing.filter(task => task.tier === tier);
+        const newTier = newTasks.filter(task => task.tier === tier);
+        if (existingTier.length === 0 && newTier.length === 0) return;
+        if (!reminderTiers.has(tier)) {
+          queues.set(tier, [...existingTier, ...newTier]);
+          return;
+        }
+        const combined = [...existingTier, ...newTier];
+        queues.set(tier, [
+          ...combined.filter(task => !!task.reminder).sort((a, b) => compareReminderTasksByDue(a, b, now)),
+          ...combined.filter(task => !task.reminder),
+        ]);
+      });
+      const seen = new Set<Tier>();
+      const ordered: Task[] = [];
+      existing.forEach((task) => {
+        const tier = task.tier;
+        const queue = queues.get(tier);
+        if (!queue) {
+          ordered.push(task);
+          return;
+        }
+        if (!seen.has(tier)) {
+          ordered.push(...queue);
+          seen.add(tier);
+        }
+      });
+      (['high', 'medium', 'low'] as Tier[]).forEach((tier) => {
+        if (!seen.has(tier) && queues.has(tier)) {
+          ordered.push(...queues.get(tier)!);
+        }
+      });
+      return ordered;
+    });
     scheduleRemindersBatch(newTasks, () => {}, listId);
     return newTasks.map((task) => task.id);
   }, [setListTasks]);
@@ -11980,9 +14554,17 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
     setCustomThemeDraftsState(drafts);
     AsyncStorage.setItem('tri_custom_themes', JSON.stringify(drafts)).catch(() => {});
   };
+  const setAiProvider = (provider: AiProvider) => {
+    const next = normalizeAiProvider(provider, apiKey);
+    setAiProviderState(next);
+    setHasApiKey(isValidKey(apiKey, next));
+    AsyncStorage.setItem(AI_PROVIDER_KEY, JSON.stringify(next)).catch(() => {});
+  };
   const setApiKey = (v: string) => {
-    setApiKeyState(v);
-    EncryptedStorage.setItem('triority-api-key', v).catch(() => {});
+    const trimmed = v.trim();
+    setApiKeyState(trimmed);
+    setHasApiKey(isValidKey(trimmed, aiProvider));
+    EncryptedStorage.setItem('triority-api-key', trimmed).catch(() => {});
   };
   const setPersonalContext = (v: string) => { setPersonalContextState(v); AsyncStorage.setItem('triority-context', JSON.stringify(v)).catch(() => {}); };
   const setAutoClear = (v: AutoClear) => { setAutoClearState(v); AsyncStorage.setItem('tri_autoClear', JSON.stringify(v)).catch(() => {}); };
@@ -12420,6 +15002,24 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
     setFocusedGroceryNonce(n => n + 1);
   }, []);
 
+  const armPendingGroceryGlow = useCallback((ids: string[]) => {
+    const cleanIds = ids.filter(Boolean);
+    if (cleanIds.length === 0) return;
+    const now = Date.now();
+    setPendingGroceryGlowIds(prev => {
+      const next = { ...prev };
+      cleanIds.forEach((id, index) => { next[id] = now + index; });
+      return next;
+    });
+  }, []);
+
+  const armGroceryResultGlow = useCallback((ids: string[]) => {
+    const cleanIds = ids.filter(Boolean);
+    if (cleanIds.length === 0) return;
+    armFocusedGrocery(cleanIds[0]);
+    armPendingGroceryGlow(cleanIds.slice(1));
+  }, [armFocusedGrocery, armPendingGroceryGlow]);
+
   const markFocusedGrocerySeen = useCallback(() => {
     if (!focusedGroceryId) return;
     setTimeout(() => {
@@ -12475,8 +15075,6 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
 
   useEffect(() => {
     if (!ready || !TriorityWidget?.consumePendingCaptures) return;
-    let cancelled = false;
-    let running = false;
 
     const resolveWidgetTargetListId = (candidate?: string | null) => {
       if (candidate && mergedLists.some(list => list.id === candidate)) return candidate;
@@ -12492,11 +15090,11 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
           return { listId: resolvedListId, ids: Array.isArray(ids) ? ids : [] };
         } catch {
           const fallbackListId = lists[0]?.id ?? DEFAULT_LIST_ID;
-          const ids = addManyToList(fallbackListId, items);
+          const ids = addManyToListFromWidget(fallbackListId, items);
           return { listId: fallbackListId, ids: Array.isArray(ids) ? ids : [] };
         }
       }
-      const ids = addManyToList(resolvedListId, items);
+      const ids = addManyToListFromWidget(resolvedListId, items);
       return { listId: resolvedListId, ids: Array.isArray(ids) ? ids : [] };
     };
 
@@ -12517,16 +15115,22 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
     };
 
     const consumeWidgetCaptures = async () => {
-      if (running) return;
-      running = true;
+      if (widgetCaptureRunningRef.current) return;
+      widgetCaptureRunningRef.current = true;
       try {
         const raw = await TriorityWidget.consumePendingCaptures();
         if (!raw) return;
         const parsed = JSON.parse(raw);
         if (!Array.isArray(parsed) || parsed.length === 0) return;
+        const aiCaptureCount = parsed.filter((capture: WidgetPendingCapture) => capture?.mode === 'ai').length;
+        showWidgetImportToast(
+          aiCaptureCount > 0 ? 'Organizing widget capture' : 'Adding widget capture',
+          aiCaptureCount > 0 ? 'AI starts when Triority opens' : undefined,
+          true,
+        );
 
         const taskFocusCandidates: { listId: string; id: TaskId }[] = [];
-        let firstGroceryId: string | null = null;
+        const groceryFocusIds: string[] = [];
         let addedTasks = 0;
         let addedGroceries = 0;
         let addedReminders = 0;
@@ -12534,6 +15138,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
         for (const capture of parsed as WidgetPendingCapture[]) {
           const text = String(capture?.text ?? '').trim();
           if (!text) continue;
+          try { TriorityWidget.showWidgetResult?.('Organizing in Triority'); } catch {}
           const tier = capture?.tier === 'high' || capture?.tier === 'low' || capture?.tier === 'medium' ? capture.tier : 'medium';
           const preferredListId = resolveWidgetTargetListId(typeof capture?.listId === 'string' ? capture.listId : activeListId);
           const draft = capture?.mode === 'ai'
@@ -12542,6 +15147,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
                 lists: mergedLists,
                 activeListId: preferredListId,
                 defaultTier: tier,
+                aiProvider,
                 apiKey,
                 hasApiKey,
                 personalContext,
@@ -12550,28 +15156,37 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
               })
             : { listId: preferredListId, tasks: [{ text, tier }], grocery: [] };
 
-          if (draft.tasks.length > 0) {
-            const addResult = await addWidgetItems(draft.listId ?? preferredListId, draft.tasks);
-            addedTasks += draft.tasks.length;
-            addedReminders += draft.tasks.filter(item => !!item.reminder).length;
-            const firstId = addResult.ids?.[0];
-            if (firstId != null) {
-              taskFocusCandidates.push({ listId: addResult.listId, id: firstId });
-            }
+          const taskGroups = draft.taskGroups && draft.taskGroups.length > 0
+            ? draft.taskGroups
+            : [{ listId: draft.listId, tasks: draft.tasks }];
+          for (const group of taskGroups) {
+            if (group.tasks.length === 0) continue;
+            const addResult = await addWidgetItems(group.listId ?? preferredListId, group.tasks);
+            addedTasks += group.tasks.length;
+            addedReminders += group.tasks.filter(item => !!item.reminder).length;
+            (addResult.ids || []).forEach((id) => {
+              if (id != null) taskFocusCandidates.push({ listId: addResult.listId, id });
+            });
           }
 
           if (draft.grocery.length > 0) {
             const ids = await Promise.resolve(addGroceryItemsForScreen(draft.grocery));
             addedGroceries += draft.grocery.length;
-            if (!firstGroceryId && Array.isArray(ids) && ids[0]) {
-              firstGroceryId = ids[0];
+            if (Array.isArray(ids)) {
+              groceryFocusIds.push(...ids.filter(Boolean));
             }
           }
         }
 
         const resultText = widgetResultSummary(addedTasks, addedGroceries, addedReminders);
         if (resultText) {
+          showWidgetImportToast(resultText, 'From widget');
           try { TriorityWidget.showWidgetResult?.(resultText); } catch {}
+        } else {
+          showWidgetImportToast('Widget capture finished');
+        }
+        if (groceryFocusIds.length > 0) {
+          armGroceryResultGlow(groceryFocusIds);
         }
 
         const leftmostTask = taskFocusCandidates
@@ -12582,17 +15197,24 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
             return ai - bi;
           })[0] ?? taskFocusCandidates[0] ?? null;
 
-        if (!cancelled && leftmostTask) {
+        if (leftmostTask) {
           setScreen('list');
           setActiveListId(leftmostTask.listId);
           armFocusedTask(String(leftmostTask.id));
-        } else if (!cancelled && firstGroceryId) {
+          const leftmostKey = taskGlowKey(leftmostTask.listId, leftmostTask.id);
+          armExternalPendingTaskGlow(
+            taskFocusCandidates
+              .filter(candidate => taskGlowKey(candidate.listId, candidate.id) !== leftmostKey)
+              .map(candidate => taskGlowKey(candidate.listId, candidate.id)),
+          );
+        } else if (groceryFocusIds.length > 0) {
           setScreen('grocery');
-          armFocusedGrocery(firstGroceryId);
         }
-      } catch {}
+      } catch {
+        showWidgetImportToast('Widget capture failed', 'Try again from the widget');
+      }
       finally {
-        running = false;
+        widgetCaptureRunningRef.current = false;
       }
     };
 
@@ -12602,16 +15224,17 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
     });
 
     return () => {
-      cancelled = true;
       sub.remove();
     };
   }, [
     activeListId,
     addGroceryItemsForScreen,
-    addManyToList,
+    addManyToListFromWidget,
     addSharedTaskItems,
+    armExternalPendingTaskGlow,
     armFocusedTask,
-    armFocusedGrocery,
+    armGroceryResultGlow,
+    aiProvider,
     apiKey,
     hasApiKey,
     isPaid,
@@ -12621,6 +15244,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
     ready,
     setActiveListId,
     sharedTaskIdSet,
+    showWidgetImportToast,
     widgetShorthand,
   ]);
 
@@ -12634,12 +15258,13 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
   }, [checkGrocery, sharedGroceryDoc, sharedGroceryItems, updateSharedGroceryItem, usingSharedGrocery]);
 
   const deleteGroceryForScreen = useCallback((id: string) => {
+    clearPendingGroceryGlow(id);
     if (!usingSharedGrocery || !sharedGroceryDoc) {
       deleteGrocery(id);
       return;
     }
     deleteSharedGroceryItem(sharedGroceryDoc.id, id).catch(() => {});
-  }, [deleteGrocery, deleteSharedGroceryItem, sharedGroceryDoc, usingSharedGrocery]);
+  }, [clearPendingGroceryGlow, deleteGrocery, deleteSharedGroceryItem, sharedGroceryDoc, usingSharedGrocery]);
 
   const clearCheckedGroceryForScreen = useCallback(() => {
     if (!usingSharedGrocery || !sharedGroceryDoc) {
@@ -12665,25 +15290,20 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
     }
     let storedKey = '';
     try { storedKey = await EncryptedStorage.getItem('triority-api-key') || ''; } catch {}
-    if (!storedKey || sharedGroceryItems.length === 0) { onDone?.(); return; }
+    if (!storedKey || !isValidKey(storedKey, aiProvider) || sharedGroceryItems.length === 0) { onDone?.(); return; }
     const validCats = new Set([...GROCERY_CATEGORIES, GROCERY_UNCATEGORIZED]);
-    const systemPrompt = `Assign a grocery category to each item. Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
-Return ONLY valid JSON. The first character must be [ and the last character must be ]. No prose, no markdown.
-Format: [{"id":"item_id","category":"Dairy"}]`;
+    const systemPrompt = `Assign one category per item. Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
+If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     const userMsg = sharedGroceryItems.map(i => `{"id":"${i.id}","name":"${i.name}"}`).join('\n');
-    fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': storedKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({
-        model: ANTHROPIC_MODEL,
-        max_tokens: 600,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userMsg }],
-        tools: [aiGroceryCategoryTool()],
-        tool_choice: { type: 'tool', name: AI_GROCERY_CATEGORY_TOOL_NAME },
-      }),
-    }).then(r => r.json()).then(data => {
-      const parsed = anthropicToolInputFromResponse(data, AI_GROCERY_CATEGORY_TOOL_NAME);
+    requestAiStructuredOutput({
+      provider: aiProvider,
+      apiKey: storedKey,
+      system: systemPrompt,
+      user: userMsg,
+      maxTokens: 500,
+      tool: aiGroceryCategoryTool(),
+      toolName: AI_GROCERY_CATEGORY_TOOL_NAME,
+    }).then(parsed => {
       const parsedAssignments: { id: string; category: string }[] = Array.isArray(parsed.assignments) ? parsed.assignments : [];
       const assignments = parsedAssignments.map((a) => ({
         id: a.id,
@@ -12691,7 +15311,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
       }));
       updateSharedGroceryCategories(sharedGroceryDoc.id, assignments).finally(() => onDone?.());
     }).catch(() => { onDone?.(); });
-  }, [aiSortGrocery, sharedGroceryDoc, sharedGroceryItems, updateSharedGroceryCategories, usingSharedGrocery]);
+  }, [aiProvider, aiSortGrocery, sharedGroceryDoc, sharedGroceryItems, updateSharedGroceryCategories, usingSharedGrocery]);
 
   if (!ready) {
     return (
@@ -12708,7 +15328,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
         <PortalHost>
           <BackButtonManager screen={screen} setScreen={setScreen} />
           <View style={{ flex: 1, overflow: 'hidden' }}>
-            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} hasApiKey={hasApiKey} defaultTier={defaultTier} widgetShorthand={widgetShorthand} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} onGroceryOnlyAdded={(ids) => { if (ids[0]) armFocusedGrocery(ids[0]); setScreen('grocery'); }} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} focusedTaskNonce={focusedTaskNonce} onFocusedTaskSeen={markFocusedTaskSeen} calendarConflictKeys={calendarConflictKeys} calendarConflictNotice={calendarConflictNotice} />}
+            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} aiProvider={aiProvider} hasApiKey={hasApiKey} defaultTier={defaultTier} widgetShorthand={widgetShorthand} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} onGroceryOnlyAdded={(ids, navigate = true) => { armGroceryResultGlow(ids); if (navigate) setScreen('grocery'); }} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} focusedTaskNonce={focusedTaskNonce} onFocusedTaskSeen={markFocusedTaskSeen} externalPendingTaskGlowIds={externalPendingTaskGlowIds} onExternalPendingTaskGlowSeen={clearExternalPendingTaskGlow} calendarConflictKeys={calendarConflictKeys} calendarConflictNotice={calendarConflictNotice} />}
             {screen === 'grocery' && (
               <StandaloneGrocery
                 groceryItems={groceryItemsForScreen}
@@ -12749,6 +15369,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
                 }}
                 onLeaveSharedGrocery={() => sharedGroceryDoc ? leaveSharedList(sharedGroceryDoc.id).then(() => setViewingSharedGrocery(false)) : Promise.reject(new Error('No shared grocery list'))}
                 onDeleteSharedGrocery={() => sharedGroceryDoc ? deleteSharedList(sharedGroceryDoc.id).then(() => setViewingSharedGrocery(false)) : Promise.reject(new Error('No shared grocery list'))}
+                aiProvider={aiProvider}
                 hasApiKey={hasApiKey}
                 accentColor={accentColor}
                 defaultTier={defaultTier}
@@ -12763,11 +15384,13 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
                 focusedGroceryId={focusedGroceryId}
                 focusedGroceryNonce={focusedGroceryNonce}
                 onFocusedGrocerySeen={markFocusedGrocerySeen}
+                pendingGroceryGlowIds={pendingGroceryGlowIds}
+                onPendingGroceryGlowSeen={clearPendingGroceryGlow}
               />
             )}
             {screen === 'archive' && <Archive archive={combinedArchive} setArchive={setArchive} accentColor={accentColor} lists={mergedLists} activeListId={activeListId} setListTasks={setListTasks} onRestoreSharedArchiveItem={restoreSharedArchiveItem} onDeleteSharedArchiveItem={deleteSharedArchiveItem} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} />}
             {screen === 'settings' && (
-              <Settings accent={accentColor} apiKey={apiKey} setApiKey={setApiKey}
+              <Settings accent={accentColor} aiProvider={aiProvider} setAiProvider={setAiProvider} apiKey={apiKey} setApiKey={setApiKey}
                 hasApiKey={hasApiKey} setHasApiKey={setHasApiKey} personalContext={personalContext} setPersonalContext={setPersonalContext}
                 autoClear={autoClear} setAutoClear={setAutoClear}
                 darkMode={darkMode} setDarkMode={setDarkMode}
@@ -12787,6 +15410,7 @@ Format: [{"id":"item_id","category":"Dairy"}]`;
           </View>
           <TabBar screen={screen} setScreen={setScreen} accentColor={accentColor} isPaid={isPaid} onLockedGrocery={() => setShowGroceryUpsell(true)} />
         </PortalHost>
+        {widgetImportToast && <View style={styles.toastContainer} pointerEvents="none"><Toast message={widgetImportToast.message} sub={widgetImportToast.sub} /></View>}
         {showGroceryUpsell && <ProUpsellSheet accentColor={accentColor} onClose={() => setShowGroceryUpsell(false)} showToast={() => {}} />}
         {showOnboarding && <Onboarding onDone={finishOnboarding} accentColor={accentColor} initialStep={onboardingInitialStep} />}
       </View>
@@ -12862,7 +15486,7 @@ const styles = StyleSheet.create({
   trashHalo: { position: 'absolute', width: 36, height: 36, borderRadius: 18 },
   // Drop indicator line shown while a task is being dragged within its tier — sits
   // at the edge of the slot the row would land in on release.
-  dropIndicator: { position: 'absolute', left: 8, right: 8, height: 3, borderRadius: 2 },
+  dropIndicator: { position: 'absolute', left: 12, right: 12, height: 4, borderRadius: 2, zIndex: 20, elevation: 9 },
   taskRowContent: { position: 'relative', overflow: 'hidden', flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 13, paddingLeft: 12, paddingRight: 10, borderLeftWidth: 3 },
   reminderFocusOverlay: { position: 'absolute', top: 1, left: 1, right: 1, bottom: 1, borderWidth: 0, borderRadius: 7 },
   newItemShineOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
@@ -12882,6 +15506,8 @@ const styles = StyleSheet.create({
   tierHeaderLabel: { fontSize: 11, letterSpacing: 1.2, textTransform: 'uppercase' },
   tierHeaderCount: { fontSize: 11, marginLeft: 4 },
   tierChevron: { fontSize: 11 },
+  tierDropZone: { marginBottom: 20, borderWidth: 1, borderColor: 'transparent', borderRadius: 8, paddingTop: 6, paddingBottom: 4, marginHorizontal: 6, paddingHorizontal: 2, backgroundColor: 'transparent' },
+  tierDropZoneEmpty: { minHeight: 44, justifyContent: 'center' },
 
   inputBar: { borderTopWidth: 1, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 12 },
   inputBarTopRow: { flexDirection: 'row', gap: 6, marginBottom: 10 },

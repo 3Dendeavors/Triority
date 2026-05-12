@@ -1,6 +1,31 @@
 # Changelog
 
-## Unreleased
+## v1.4.9 - 2026-05-12
+
+- Simplified public AI choices to Gemini 2.5 Flash-Lite for the fast/low-cost lane and Claude Sonnet 4.6 for the premium lane. Legacy saved GPT selections now migrate to Gemini, and legacy Claude Haiku selections migrate to Sonnet.
+- Kept bring-your-own-key behavior: keys stay local, no hosted AI fallback was added, and AI errors now distinguish temporary provider overload from key/model rejection.
+- Reworked Gemini routing around the stable `gemini-2.5-flash-lite` model with JSON-only prompting, structured-output fallbacks, bounded 429/5xx retry/backoff, larger output headroom, cut-off JSON detection, and recovery for common wrapper/alternate-key response shapes.
+- Tightened mixed AI routing so natural prompts can split into To-do rows, reminders, destination task lists, and grocery/material rows without relying on exact phrasing.
+- Improved direct-task recovery and de-duping so model-cleaned rows do not stack beside literal filler versions like `call grandma at some point`, `email Alex later`, or `text Sam at some point`; direct action terms such as `test` are now preserved more reliably.
+- Improved list routing so a row's own unique list-name signal can win inside a broader generated prompt, including Biomed/Biomedical-style matches, while unrelated rows fall back to the normal To-do list.
+- Added stronger generated-plan handling for routines, checklists, workout plans, advice, and similar prompts: thin/meta rows retry into concrete app-sized rows, weak generated rows are replaced instead of duplicated, and chest/workout prompts can fall back to practical starter rows with sets/reps/time details.
+- Restored AI mode to non-sticky behavior so leaving a screen or reopening the app does not leave the input bar unexpectedly armed.
+- Added starter-sized output limits for broad assistant prompts unless the user asks for a full, weekly, detailed, or exact-count result.
+- Tightened Personal Context handling so broad task suggestions respect accessibility, mobility, sensory, health, and lifestyle notes, and grocery/recipe generation treats vegan, no-meat, allergy, and product-ban notes as hard constraints.
+- Improved grocery/material generation for recipes, smoothies, projects, repairs, packing, and casual phrases such as `smoothie stuff`, `crap to buy`, and `things for the repair`.
+- Clarified generated grocery row semantics: needed recipe/project amounts render on the left as `quantity` + `unit`, while the smallest common purchase/container hint renders on the right as `packageSize`.
+- Cleaned generated grocery quantities by stripping bare `1` guesses, moving one-container guesses into package hints, retrying rows that miss most amounts/package hints, and rendering common decimal recipe amounts such as `0.5 cup` as `1/2 cup`.
+- Preserved direct grocery requests such as `get eggs` as grocery rows instead of To-do tasks.
+- Made Grocery-tab AI mixed-input aware, so prompts that include obvious task language can create both task rows and grocery/material rows instead of being forced through grocery-only parsing.
+- Improved new-row focus/shine behavior for AI, manual, shared, and widget-created rows: focused rows no longer double-shine, off-screen generated rows shine once when they become visible, and multi-list task results focus one destination instead of snapping through every affected list.
+- Fixed delayed widget AI imports so opening the app while parsing is in flight no longer cancels the final focus/shine step.
+- Ordered widget-created reminder tasks to the top of their own High/Medium/Low tier, with overdue reminders first and upcoming reminders by soonest due.
+- Clarified widget AI progress with organizing/result messages and scoped pending task shine by list plus task id so rows added to multiple lists still get their visual confirmation.
+- Added a Patch notes action to Android update prompts when `latest.json` includes a GitHub release-notes URL, with the manifest summary shown in the prompt and the full changelog one tap away on GitHub.
+- Improved task drag/drop clarity and accuracy: rows stay visibly lifted, within-tier reorder uses a stronger slot line, priority tiers highlight under the finger, empty priority tiers appear as temporary drop targets, normal scrolling cancels the long-press drag arm, and edge-scroll can reverse direction mid-drag.
+- Fixed first-swipe task completion misses by using the actual release distance instead of the animated value.
+- Made shared-grocery swipe/check/delete paths update locally first and guard pending remote writes from stale listener refreshes.
+- Added an internal local AI smoke-test harness for regression coverage across routing, grocery, reminders, Personal Context, and provider behavior. It is ignored from runtime app behavior and uses local-only keys.
 
 ## v1.4.7 - 2026-05-10
 

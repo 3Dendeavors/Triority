@@ -155,7 +155,7 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
       val mode = if (hasApiKey) "ai" else "manual"
       val activeListId = prefs.getString("activeListId", "default") ?: "default"
       queueCapture(context, transcript, mode, activeListId)
-      showTemporaryResult(context, if (hasApiKey) "Ready in Triority" else "Task saved")
+      showTemporaryResult(context, if (hasApiKey) "Queued for Triority" else "Task saved")
     }
 
     private fun queueCapture(context: Context, text: String, mode: String, activeListId: String) {
