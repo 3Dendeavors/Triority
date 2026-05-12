@@ -37,6 +37,20 @@ android/keystore.properties
 .kotlin/
 
 # Secrets / tester artifacts (must never be committed)
+_local_secrets/
+.secrets/
+.env
+.env.*
+*API KEY*.txt
+*api key*.txt
+*token*.txt
+*Token*.txt
+*secret*.txt
+*Secret*.txt
+*recovery-codes*.txt
+*recovery codes*.txt
+*.pem
+*.p12
 revenuecat-*.json
 promotion_codes.csv
 github-recovery-codes.txt
