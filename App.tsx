@@ -598,7 +598,7 @@ function groceryDraftLooksLikeGenerationPlaceholder(item: GroceryDraft, input: s
   if (!hasGroceryGenerationIntent(input)) return false;
   const name = String(item.name || '').replace(/\s+/g, ' ').trim();
   if (!name) return false;
-  if (/\b(ingredients?|shopping list|grocery list|groceries|supplies|materials?|equipment|accessories|gear|tools?|items|meal[-\s]?prep list|meal plan list|packing list|pack list|buy list|purchase list)\b/i.test(name)) return true;
+  if (/\b(ingredients?|shopping list|grocery list|groceries|snacks?|supplies|materials?|equipment|accessories|gear|tools?|items|meal[-\s]?prep list|meal plan list|packing list|pack list|buy list|purchase list)\b/i.test(name)) return true;
   if (/^(for|to make|to build|needed for)\b/i.test(name)) return true;
   return false;
 }
@@ -652,7 +652,7 @@ function groceryModeShouldUseMixedAiRouting(input: string) {
 function hasDirectTaskActionIntent(input: string) {
   const normalized = input.replace(/\s+/g, ' ').trim();
   if (/\b(remind me|set a reminder|add (a )?task|todo|to-do)\b/i.test(normalized)) return true;
-  const actionVerb = /\b(call|text|email|schedule|book|pay|order|fix|repair|clean|finish|submit|send|test|workout|exercise|train|walk|walking|rub)\b/i;
+  const actionVerb = /\b(call|text|email|schedule|book|pay|order|fix|repair|clean|finish|submit|send|test|workout|exercise|train|walk|walking|wake|rub)\b/i;
   if (new RegExp(`^\\s*${actionVerb.source}`, 'i').test(normalized)) return true;
   if (actionVerb.test(normalized)
     && /\b(today|tomorrow|tonight|later|this morning|this afternoon|this evening|morning|afternoon|evening|noon|midnight|at\s+\d{1,2}|around\s+\d{1,2}|round\s+\d{1,2}|by\s+\d{1,2}|in\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)|\d{1,2}(:\d{2})?\s*(am|pm|a|p))\b/i.test(normalized)) {
@@ -661,14 +661,21 @@ function hasDirectTaskActionIntent(input: string) {
   return false;
 }
 
+function hasScheduledEventStatement(input: string) {
+  const normalized = input.replace(/\s+/g, ' ').trim();
+  if (!aiTextHasReminderCue(normalized)) return false;
+  return /\b(appointment|appt|meeting|event|reservation|interview|class|shift|therapy|physical therapy|pt|doctor|dentist|visit|pickup|pick\s+up|flight|ride)\b/i.test(normalized)
+    && /\b(i have|ive got|i've got|got|have|my|there(?:'| i)?s|there is|need to be|supposed to be)\b/i.test(normalized);
+}
+
 function aiTextHasReminderCue(input: string) {
   const normalized = input.replace(/\s+/g, ' ').trim();
   if (!normalized) return false;
   return /\b(remind me|reminder|set a reminder|alarm|notify|notification|repeat|repeating|hourly|daily|weekly)\b/i.test(normalized)
-    || /\b(at|around|round|by|before|after)\s+\d{1,2}(:\d{2})?\s*(am|pm|a|p)?\b/i.test(normalized)
+    || /\b(at|around|round|by|before|after)\s+(?:\d{1,2}(?::\d{2}|\s+[0-5]\d)?|\d{3,4})\s*(am|pm|a|p)?\b/i.test(normalized)
     || /\bevery\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?|weeks?)\b/i.test(normalized)
     || /\bin\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)\b/i.test(normalized)
-    || /\b\d{1,2}(:\d{2})?\s*(am|pm)\b/i.test(normalized);
+    || /\b(?:\d{1,2}:\d{2}|\d{3,4}|\d{1,2})\s*(am|pm)\b/i.test(normalized);
 }
 
 function aiReminderTaskTokens(value: string) {
@@ -706,14 +713,14 @@ const AI_REMINDER_ACTION_BOUNDARY_TOKENS = new Set([
   'ask', 'book', 'build', 'buy', 'call', 'clean', 'create', 'do', 'draft', 'email', 'exercise',
   'feed', 'finish', 'fix', 'get', 'grab', 'make', 'message', 'order', 'pack', 'pay', 'pick',
   'prepare', 'repair', 'review', 'rub', 'schedule', 'send', 'set', 'submit', 'take', 'tell',
-  'test', 'text', 'train', 'walk', 'walking', 'wash', 'workout', 'write',
+  'test', 'text', 'train', 'wake', 'walk', 'walking', 'wash', 'workout', 'write',
 ]);
 
 const AI_REMINDER_MATCH_STOP_TOKENS = new Set([
   'ask', 'book', 'build', 'buy', 'call', 'clean', 'create', 'do', 'draft', 'email', 'exercise',
   'feed', 'finish', 'fix', 'get', 'grab', 'make', 'message', 'order', 'pack', 'pay', 'pick',
   'prepare', 'repair', 'review', 'rub', 'schedule', 'send', 'set', 'submit', 'take', 'tell',
-  'test', 'text', 'train', 'walk', 'walking', 'wash', 'workout', 'write',
+  'test', 'text', 'train', 'wake', 'walk', 'walking', 'wash', 'workout', 'write',
   'advice', 'checklist', 'item', 'items', 'plan', 'program', 'routine', 'row', 'rows',
   'session', 'sessions', 'step', 'steps', 'task', 'tasks', 'thing', 'things', 'tip', 'tips',
   'hour', 'hours', 'hr', 'hrs', 'minute', 'minutes', 'min', 'mins', 'today', 'tomorrow', 'tonight',
@@ -787,36 +794,65 @@ function aiInputAllowsReminder(raw: string, taskText?: string) {
   return aiTextHasReminderCue(clause) && aiReminderClauseMatchesTask(clause, taskText, raw);
 }
 
-function reminderDateFromClockClause(clause: string) {
-  const clockMatch = clause.match(/\b(?:at|around|round|by|before|after)?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm|a|p)?\b/i);
+function reminderDateFromClockClause(clause: string, nowMs = Date.now()) {
+  const clockMatch = clause.match(/\b(?:at|around|round|by|before|after)?\s*(?:(\d{3,4})|(\d{1,2})(?::(\d{2})|\s+([0-5]\d))?)\s*(am|pm|a|p)?\b/i);
   if (!clockMatch) return null;
-  let hour = Math.max(0, Math.min(23, Number(clockMatch[1])));
-  const minute = Math.max(0, Math.min(59, Number(clockMatch[2] ?? 0)));
-  const suffix = clockMatch[3]?.toLowerCase();
+  const compactTime = clockMatch[1];
+  let hour = compactTime
+    ? Number(compactTime.slice(0, -2))
+    : Number(clockMatch[2]);
+  const minute = Math.max(0, Math.min(59, Number(compactTime ? compactTime.slice(-2) : (clockMatch[3] ?? clockMatch[4] ?? 0))));
+  const suffix = clockMatch[5]?.toLowerCase();
+  hour = Math.max(0, Math.min(23, hour));
   if (suffix === 'pm' || suffix === 'p') {
     if (hour < 12) hour += 12;
   } else if (suffix === 'am' || suffix === 'a') {
     if (hour === 12) hour = 0;
+  } else if (/\b(wake\s+(?:me\s+)?up|wake|alarm|breakfast|morning)\b/i.test(clause)) {
+    if (hour === 12) hour = 0;
+  } else if (/\bmorning\b/i.test(clause) && hour === 12) {
+    hour = 0;
+  } else if (/\b(afternoon|evening|tonight)\b/i.test(clause) && hour >= 1 && hour <= 11) {
+    hour += 12;
   } else if (hour >= 1 && hour <= 7) {
     hour += 12;
+  } else if (hour >= 8 && hour <= 11) {
+    const amCandidate = new Date(nowMs);
+    amCandidate.setHours(hour, minute, 0, 0);
+    const pmCandidate = new Date(nowMs);
+    pmCandidate.setHours(hour + 12, minute, 0, 0);
+    if (amCandidate.getTime() >= nowMs - 60000) {
+      // Keep AM when it is still the nearest sensible occurrence.
+    } else if (pmCandidate.getTime() >= nowMs - 60000) {
+      hour += 12;
+    }
   }
-  const date = new Date();
+  const date = new Date(nowMs);
   if (/\btomorrow\b/i.test(clause)) date.setDate(date.getDate() + 1);
   date.setHours(hour, minute, 0, 0);
-  if (date.getTime() < Date.now() - 60000 && !/\btomorrow\b/i.test(clause)) {
+  if (date.getTime() < nowMs - 60000 && !/\btomorrow\b/i.test(clause)) {
     date.setDate(date.getDate() + 1);
   }
   return date;
 }
 
-function buildReminderFallbackFromRaw(raw: string, taskText = ''): Reminder | undefined {
+function buildReminderFallbackFromRaw(raw: string, taskText = '', nowMs = Date.now()): Reminder | undefined {
   const clause = aiReminderLocalClauseForTask(raw, taskText);
   if (!aiTextHasReminderCue(clause)) return undefined;
-  const now = Date.now();
+  const now = nowMs;
   const relativeMatch = clause.match(/\bin\s+(\d+)\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)\b/i);
   if (relativeMatch) {
     const amount = Math.max(1, Number(relativeMatch[1]));
     const unit = relativeMatch[2].toLowerCase();
+    if (/^days?$/i.test(unit)) {
+      const clockDate = reminderDateFromClockClause(clause, nowMs);
+      if (clockDate) {
+        const date = new Date(nowMs);
+        date.setDate(date.getDate() + amount);
+        date.setHours(clockDate.getHours(), clockDate.getMinutes(), 0, 0);
+        return { remindAt: date.getTime(), repeatHourly: false, repeatDaily: false };
+      }
+    }
     const ms = /^m/.test(unit)
       ? amount * 60000
       : /^h/.test(unit)
@@ -828,22 +864,39 @@ function buildReminderFallbackFromRaw(raw: string, taskText = ''): Reminder | un
   if (everyMatch) {
     const amount = Math.max(1, Number(everyMatch[1] ?? 1));
     const unit = everyMatch[2].toLowerCase();
-    const clockDate = reminderDateFromClockClause(clause);
+    const clockDate = reminderDateFromClockClause(clause, nowMs);
     if (/^m/.test(unit) || /^h/.test(unit)) {
       const fallbackDelay = /^m/.test(unit) ? amount * 60000 : amount * 3600000;
       return { remindAt: clockDate?.getTime() ?? (now + fallbackDelay), repeatHourly: true, repeatDaily: false };
     }
     const first = clockDate ?? (() => {
-      const date = new Date();
+      const date = new Date(nowMs);
       date.setDate(date.getDate() + 1);
       date.setHours(9, 0, 0, 0);
       return date;
     })();
     return { remindAt: first.getTime(), repeatHourly: false, repeatDaily: true };
   }
-  const clockDate = reminderDateFromClockClause(clause);
+  const clockDate = reminderDateFromClockClause(clause, nowMs);
   if (clockDate) return { remindAt: clockDate.getTime(), repeatHourly: false, repeatDaily: false };
   return undefined;
+}
+
+function buildLocalReminderFromTaskText(text: string, nowMs = Date.now()): Reminder | undefined {
+  const raw = text.replace(/\s+/g, ' ').trim();
+  if (!raw || (!hasDirectTaskActionIntent(raw) && !hasScheduledEventStatement(raw))) return undefined;
+  if (!aiInputAllowsReminder(raw, raw)) return undefined;
+  return buildReminderFallbackFromRaw(raw, raw, nowMs);
+}
+
+function taskDraftWithLocalReminder(text: string, tier: Tier, reminder?: Reminder): TaskDraft {
+  const raw = text.replace(/\s+/g, ' ').trim();
+  const resolvedReminder = reminder ?? buildLocalReminderFromTaskText(raw);
+  return {
+    text: resolvedReminder ? cleanReminderTimingFromTaskText(raw) : raw,
+    tier,
+    reminder: resolvedReminder,
+  };
 }
 
 function shouldAllowAiReminderForTask(raw: string, taskText = '') {
@@ -1104,6 +1157,7 @@ function concreteGeneratedTaskRows(items: any[], input: string) {
     .filter(item => !taskLooksLikeGenerationPlaceholder(String(item?.text ?? ''), input));
   const fallback = fallbackGeneratedTaskRowsFromRaw(input);
   if (concrete.length === 0) return fallback;
+  if (taskRowsUnderfillGeneratedTopic(concrete, input) && fallback.length > 0) return fallback;
   if (taskRowsNeedGenerationDetailRetry(concrete, input) && fallback.length > 0) return fallback;
   if (taskRowsMissRequestedWorkoutFocus(concrete, input) && fallback.length > 0) return fallback;
   return concrete;
@@ -1154,7 +1208,7 @@ function trimGeneratedTaskRowsPreservingDirect<T>(items: T[], input: string): T[
 
 const AI_DIRECT_TASK_RECOVERY_TOKENS = new Set([
   'call', 'text', 'email', 'schedule', 'book', 'pay', 'order', 'fix', 'repair', 'clean',
-  'do', 'finish', 'submit', 'send', 'test', 'walk', 'walking', 'rub',
+  'do', 'finish', 'submit', 'send', 'test', 'wake', 'walk', 'walking', 'rub',
 ]);
 
 const AI_DIRECT_TASK_SEGMENT_SPLIT_TOKENS = new Set([
@@ -1317,7 +1371,7 @@ function normalizeAiListText(value: string) {
 
 const AI_LIST_GENERIC_TOKENS = new Set([
   'a', 'an', 'and', 'for', 'in', 'list', 'main', 'my', 'need', 'needs', 'of', 'on', 'our',
-  'shared', 'task', 'tasks', 'the', 'to', 'todo', 'work',
+  'body', 'shared', 'task', 'tasks', 'the', 'to', 'todo', 'work',
 ]);
 
 const AI_RELATIONSHIP_TERM_GROUPS = [
@@ -1454,11 +1508,13 @@ function protectPlainTaskTextRegister(input: string, aiText: string) {
 
 function cleanReminderTimingFromTaskText(text: string) {
   const cleaned = text
-    .replace(/\b(?:at|around|round|by|before|after)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a|p)?\b/gi, ' ')
+    .replace(/\b(?:at|around|round|by|before|after)\s+(?:\d{1,2}(?::\d{2}|\s+[0-5]\d)?|\d{3,4})\s*(?:am|pm|a|p)?\b/gi, ' ')
     .replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a|p)\b/gi, ' ')
     .replace(/\bin\s+\d+\s*(?:m|min|mins|minutes|h|hr|hrs|hours|days?)\b/gi, ' ')
     .replace(/\bevery\s+\d*\s*(?:m|min|mins|minutes|h|hr|hrs|hours|days?|weeks?)\b/gi, ' ')
     .replace(/\b(today|tomorrow|tonight|this morning|this afternoon|this evening|morning|afternoon|evening|noon|midnight)\b/gi, ' ')
+    .replace(/^(?:please\s+)?(?:remind me to|remember to|notify me to|set(?: a)? reminder to|i need to|need to|gotta|have to)\s+/i, '')
+    .replace(/^(?:i have|i've got|ive got|got|have)\s+(?:an?\s+)?/i, '')
     .replace(/\s+/g, ' ')
     .replace(/\s+([,.;:!?])/g, '$1')
     .replace(/^[,.;:\s-]+|[,.;:\s-]+$/g, '')
@@ -1923,7 +1979,7 @@ function widgetDisplayLabel(task: Pick<Task, 'text' | 'widgetLabel'>): string {
 }
 
 function fallbackWidgetCapture(raw: string, defaultTier: Tier, listId: string | null = null): WidgetAiCaptureDraft {
-  const tasks = [{ text: raw, tier: defaultTier }];
+  const tasks = [taskDraftWithLocalReminder(raw, defaultTier)];
   return { listId, tasks, taskGroups: [{ listId, tasks }], grocery: [] };
 }
 
@@ -2025,8 +2081,14 @@ async function parseWidgetAiCapture({
     parsedTasks = dropCoveredCompoundTaskRows(parsedTasks);
     parsedTasks = dropGroceryClauseTaskLeaks(parsedTasks, raw);
     parsedTasks = trimGeneratedTaskRowsPreservingDirect(parsedTasks, raw);
+    if (taskRowsUnderfillGeneratedTopic(parsedTasks, raw)) {
+      parsedTasks = mergeGeneratedTaskExpansionRows(parsedTasks, fallbackGeneratedTaskRowsFromRaw(raw), raw);
+    }
+    if (parsedTasks.length === 0 && (hasDirectTaskActionIntent(raw) || hasScheduledEventStatement(raw))) {
+      parsedTasks = [taskDraftWithLocalReminder(raw, defaultTier)];
+    }
     if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw) && parsedGroceryItems.length > 0) {
-      parsedTasks = [{ text: raw, tier: defaultTier }];
+      parsedTasks = [taskDraftWithLocalReminder(raw, defaultTier)];
     }
     const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0;
     const validTier = new Set<string>(['high', 'medium', 'low']);
@@ -2274,6 +2336,7 @@ ${taskContextRules}
 ${workspacePrompt}
 Rows:
 - Short app rows, not prose. One task = one useful action; one grocery/material row = one buyable item.
+- Use intent frames over memorized phrases: action verb + object = task; event/appointment noun + date/time = task with reminder; ingredients/supplies/materials + topic = grocery/material rows; plan/routine/checklist/tips + topic = concrete task rows.
 - Plans/routines/checklists/tips/advice become concrete task rows, not meta rows like choose/create/schedule/plan the plan.
 - Ingredients/recipes/shopping/groceries/supplies/materials/equipment/accessories/gear/tools/packing/buy lists become grocery/material rows.
 - Casual words like stuff, junk, crap, or things also mean grocery/material rows when attached to a recipe, meal, smoothie, project, repair, packing, or buying clause.
@@ -2291,8 +2354,8 @@ ${groceryContextRules}
 ${multiList ? '- Tasks set listId from WORKSPACE when named/implied; otherwise use default, not active.' : ''}
 - Tasks get tier high/medium/low; high only for urgent/important, low for optional/light, otherwise medium.
 - ${widgetShorthand ? 'Set widgetLabel to 1-5 words. Keep meaning/action/final object; if text is already short, use full text.' : 'Do not include widgetLabel.'}
-- Reminders only for explicit reminder/alarm/notify/repeat wording or clear clock time like "at 4"; date-only today/tomorrow/later is not a reminder. repeat* only if explicit.
-- Time: "at/around/round 6" no AM/PM = 6 PM unless morning context; tonight=20; evening=19; tomorrow morning=day+1 hour 9; relative hours calculate from NOW.
+- Reminders only for explicit reminder/alarm/notify/repeat wording, scheduled-event wording with a time ("appointment tomorrow at 330"), or a clear clock time ("at 4", "at 12:30", "at 1230"). Date-only today/tomorrow/later is not a reminder. repeat* only if explicit.
+- Time: infer the next sensible occurrence from NOW. "at/around/round 6" usually means next 6 PM unless morning/wake/alarm context; "at 9" at 8 PM means 9 PM, while "at 9" at 11 PM means tomorrow 9 AM. Compact "1230" means 12:30. "wake up at 8 in 3 days" means 8 AM three days from NOW.
 - Output concise text; remove timing words only when a reminder is created; keep user wording/register and do not sanitize names/relationships.
 
 Return only schema fields. Either array can be empty, but actionable input must not return both empty.`;
@@ -5720,8 +5783,8 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 25;
-const CURRENT_APP_VERSION_NAME = '1.4.9';
+const CURRENT_APP_VERSION_CODE = 26;
+const CURRENT_APP_VERSION_NAME = '1.4.10';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {
@@ -7076,7 +7139,7 @@ interface TaskRowProps {
   // and the row enters drag mode. While in drag mode, vertical pan reports back
   // via onDragMove (signed dy from origin + finger pageY for edge-scroll). On
   // release, onDragEnd reports whether the drag was committed (true) or aborted.
-  onLongPressStart: () => void;
+  onLongPressStart: (fingerPageY: number) => void;
   onDragMove: (dy: number, fingerPageY: number) => void;
   onDragEnd: (committed: boolean) => void;
   isDragging: boolean;
@@ -7274,7 +7337,7 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
 
   // Latest-callback refs. PanResponder is created once via useRef and would
   // otherwise close over stale prop callbacks — meaning onDragEnd would run
-  // with the parent's *initial* state (dropIndex=null) and the reorder would
+  // with the parent's *initial* state (drop slot=null) and the reorder would
   // never commit. Reading through refs gives us the freshest closure on each
   // gesture event.
   const onLongPressStartRef = useRef(onLongPressStart);
@@ -7290,6 +7353,7 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
   const panStartXRef = useRef(0);
   const swipeDxRef = useRef(0);
   const touchStartPageRef = useRef<{ x: number; y: number } | null>(null);
+  const latestTouchPageRef = useRef<{ x: number; y: number } | null>(null);
 
   const clearLongPress = useCallback(() => {
     if (longPressTimerRef.current) {
@@ -7308,6 +7372,7 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
       x: Number(e?.nativeEvent?.pageX ?? 0),
       y: Number(e?.nativeEvent?.pageY ?? 0),
     };
+    latestTouchPageRef.current = touchStartPageRef.current;
     panStartXRef.current = Number((translateX as any)._value || 0);
     swipeDxRef.current = 0;
     translateX.setOffset(panStartXRef.current);
@@ -7315,8 +7380,9 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
     dragArmedRef.current = false;
     clearLongPress();
     longPressTimerRef.current = setTimeout(() => {
+      const fingerPageY = Number(latestTouchPageRef.current?.y ?? touchStartPageRef.current?.y ?? 0);
       dragArmedRef.current = true;
-      onLongPressStartRef.current();
+      onLongPressStartRef.current(fingerPageY);
     }, DRAG_LONG_PRESS_MS);
   }, [translateX, clearLongPress]);
 
@@ -7326,6 +7392,7 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
     if (!start) return;
     const x = Number(e?.nativeEvent?.pageX ?? start.x);
     const y = Number(e?.nativeEvent?.pageY ?? start.y);
+    latestTouchPageRef.current = { x, y };
     if (Math.abs(x - start.x) > 8 || Math.abs(y - start.y) > 8) {
       clearLongPress();
     }
@@ -7334,6 +7401,7 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
   const handleTouchEnd = useCallback(() => {
     clearLongPress();
     touchStartPageRef.current = null;
+    latestTouchPageRef.current = null;
     const wasArmed = dragArmedRef.current;
     setTimeout(() => {
       if (!wasArmed || !dragArmedRef.current) return;
@@ -7608,6 +7676,9 @@ function TaskRow({ task, onComplete, onDelete, requestComplete, onEdit, accentCo
 
 // ─── TierGroup ────────────────────────────────────────────────────────────────
 
+type TaskRowLayoutInfo = { y: number; height: number };
+type TaskDropTarget = { tier: Tier; slotIndex: number };
+
 interface TierGroupProps {
   tier: { id: Tier; label: string; color: string; bg: string };
   tasks: Task[];
@@ -7618,17 +7689,19 @@ interface TierGroupProps {
   accentColor: string;
   // Reorder a task within this tier. fromIndex/toIndex are indices in the tier's
   // filtered task list (not the full lists). Returns nothing — parent updates state.
-  onReorderInTier: (tierId: Tier, fromIndex: number, toIndex: number) => void;
+  onReorderInTier: (tierId: Tier, fromIndex: number, toSlotIndex: number) => void;
   // Edge-scroll bridge: TierGroup reports the *page* Y of the dragged finger,
   // ActiveList drives the actual ScrollView scroll because it owns the ref.
   onDragMove?: (pageY: number | null) => void;
   onTierLayout?: (tier: Tier, y: number, height: number) => void;
-  resolveDropTier?: (sourceTier: Tier, draggedCenterContentY: number) => Tier | null;
-  onMoveToTier?: (taskId: TaskId, sourceTier: Tier, targetTier: Tier) => void;
-  onDropTierPreview?: (tier: Tier | null) => void;
+  onTierRowsLayout?: (tier: Tier, bodyY: number, rows: TaskRowLayoutInfo[]) => void;
+  resolveDropTarget?: (sourceTier: Tier, contentY: number) => TaskDropTarget | null;
+  onMoveToTier?: (taskId: TaskId, sourceTier: Tier, targetTier: Tier, targetSlotIndex?: number) => void;
+  onDropTargetPreview?: (target: TaskDropTarget | null) => void;
   pageYToContentY?: (pageY: number) => number;
   dragInProgress?: boolean;
-  activeDropTier?: Tier | null;
+  activeDropTarget?: TaskDropTarget | null;
+  dragScrollRevision?: number;
   isRowVisible?: (contentY: number, height: number) => boolean;
   collapsed: boolean;
   onCollapsedChange: (collapsed: boolean) => void;
@@ -7642,25 +7715,93 @@ interface TierGroupProps {
   onFocusedTaskLayout?: (y: number) => void;
 }
 
-function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit, accentColor, onReorderInTier, onDragMove, onTierLayout, resolveDropTier, onMoveToTier, onDropTierPreview, pageYToContentY, dragInProgress, activeDropTier, isRowVisible, collapsed, onCollapsedChange, focusedTaskId, focusRequestKey, focusedGlowKey, pendingGlowIds, onPendingGlowSeen, calendarConflictKeys, activeListId, onFocusedTaskLayout }: TierGroupProps) {
+function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit, accentColor, onReorderInTier, onDragMove, onTierLayout, onTierRowsLayout, resolveDropTarget, onMoveToTier, onDropTargetPreview, pageYToContentY, dragInProgress, activeDropTarget, dragScrollRevision, isRowVisible, collapsed, onCollapsedChange, focusedTaskId, focusRequestKey, focusedGlowKey, pendingGlowIds, onPendingGlowSeen, calendarConflictKeys, activeListId, onFocusedTaskLayout }: TierGroupProps) {
   const T = useT();
   const tierYRef = useRef(0);
   const tierBodyYRef = useRef(0);
   const [layoutRevision, setLayoutRevision] = useState(0);
 
   // Drag state. dragId = id of the task currently being dragged (null = no drag).
-  // dragOffsetY = signed offset from the dragged row's resting Y, used to translate
-  // its floating clone. dropIndex = the slot the row would land in on release.
+  // dragOffsetY anchors the lifted row to the original finger grab point.
+  // dropSlotIndex is the insertion slot after removing the dragged row.
   const [dragId, setDragId] = useState<TaskId | null>(null);
   const [dragOffsetY, setDragOffsetY] = useState(0);
-  const [dropIndex, setDropIndex] = useState<number | null>(null);
+  const [dropSlotIndex, setDropSlotIndex] = useState<number | null>(null);
 
   // Per-row layout info — measured y (relative to the tier body) and height.
   // Used to compute the drop slot from the current finger position.
-  const layoutsRef = useRef<{ y: number; height: number }[]>([]);
+  const layoutsRef = useRef<TaskRowLayoutInfo[]>([]);
   const dragStartIndexRef = useRef<number>(-1);
+  const dragFingerOffsetYRef = useRef<number | null>(null);
   const lastFingerPageYRef = useRef<number | null>(null);
-  const lastDraggedCenterContentYRef = useRef<number | null>(null);
+  const lastDropContentYRef = useRef<number | null>(null);
+
+  const publishTierRowsLayout = useCallback(() => {
+    const rows = layoutsRef.current
+      .slice(0, tasks.length)
+      .filter((layout): layout is TaskRowLayoutInfo => !!layout)
+      .map(layout => ({ y: layout.y, height: layout.height }));
+    onTierRowsLayout?.(tier.id, tierBodyYRef.current, rows);
+  }, [onTierRowsLayout, tasks.length, tier.id]);
+
+  useEffect(() => {
+    layoutsRef.current = layoutsRef.current.slice(0, tasks.length);
+    publishTierRowsLayout();
+    setLayoutRevision(v => v + 1);
+  }, [publishTierRowsLayout, tasks.length]);
+
+  const slotIndexFromBodyY = useCallback((bodyY: number, excludeIndex: number | null = null) => {
+    const layouts = layoutsRef.current.slice(0, tasks.length);
+    let slotIndex = 0;
+    for (let i = 0; i < layouts.length; i += 1) {
+      if (excludeIndex != null && i === excludeIndex) continue;
+      const layout = layouts[i];
+      if (!layout) continue;
+      if (bodyY > layout.y + layout.height / 2) slotIndex += 1;
+    }
+    const maxSlot = Math.max(0, tasks.length - (excludeIndex == null ? 0 : 1));
+    return Math.max(0, Math.min(slotIndex, maxSlot));
+  }, [tasks.length]);
+
+  const lineYForSlot = useCallback((slotIndex: number, excludeIndex: number | null = null) => {
+    const rows = layoutsRef.current
+      .slice(0, tasks.length)
+      .map((layout, index) => (layout ? { ...layout, index } : null))
+      .filter((layout): layout is TaskRowLayoutInfo & { index: number } => !!layout);
+    const remaining = excludeIndex == null ? rows : rows.filter(row => row.index !== excludeIndex);
+    if (remaining.length === 0) return rows[0]?.y ?? 0;
+    if (slotIndex <= 0) return remaining[0].y - 2;
+    if (slotIndex >= remaining.length) {
+      const last = remaining[remaining.length - 1];
+      return last.y + last.height - 2;
+    }
+    return remaining[slotIndex].y - 2;
+  }, [tasks.length]);
+
+  const updateDragFromFinger = useCallback((fingerPageY: number) => {
+    const startIdx = dragStartIndexRef.current;
+    if (startIdx < 0) return;
+    const layouts = layoutsRef.current.slice(0, tasks.length);
+    const startLayout = layouts[startIdx];
+    if (!startLayout) return;
+    const fallbackContentY = tierYRef.current + tierBodyYRef.current + startLayout.y + startLayout.height / 2;
+    const contentY = pageYToContentY?.(fingerPageY) ?? fallbackContentY;
+    if (!Number.isFinite(contentY)) return;
+    const rowTopContentY = tierYRef.current + tierBodyYRef.current + startLayout.y;
+    const grabOffsetY = dragFingerOffsetYRef.current ?? startLayout.height / 2;
+    const bodyY = contentY - tierYRef.current - tierBodyYRef.current;
+    const localSlotIndex = slotIndexFromBodyY(bodyY, startIdx);
+    const target = resolveDropTarget?.(tier.id, contentY) ?? { tier: tier.id, slotIndex: localSlotIndex };
+    setDragOffsetY(contentY - grabOffsetY - rowTopContentY);
+    setDropSlotIndex(target.tier === tier.id ? localSlotIndex : null);
+    lastDropContentYRef.current = contentY;
+    onDropTargetPreview?.(target);
+  }, [onDropTargetPreview, pageYToContentY, resolveDropTarget, slotIndexFromBodyY, tasks.length, tier.id]);
+
+  useEffect(() => {
+    if (dragId == null || lastFingerPageYRef.current == null) return;
+    updateDragFromFinger(lastFingerPageYRef.current);
+  }, [dragId, dragScrollRevision, layoutRevision, updateDragFromFinger]);
 
   useEffect(() => {
     if (!focusedTaskId || collapsed) return;
@@ -7676,65 +7817,50 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
 
   if (tasks.length === 0 && !dragInProgress) return null;
 
-  const handleLongPressStart = (taskId: TaskId, index: number) => {
+  const handleLongPressStart = (taskId: TaskId, index: number, fingerPageY: number) => {
+    const layout = layoutsRef.current[index];
+    if (layout) {
+      const rowTopContentY = tierYRef.current + tierBodyYRef.current + layout.y;
+      const fallbackContentY = rowTopContentY + layout.height / 2;
+      const contentY = pageYToContentY?.(fingerPageY) ?? fallbackContentY;
+      dragFingerOffsetYRef.current = Math.max(0, Math.min(layout.height, contentY - rowTopContentY));
+    } else {
+      dragFingerOffsetYRef.current = null;
+    }
     setDragId(taskId);
     setDragOffsetY(0);
-    setDropIndex(index);
+    setDropSlotIndex(index);
     dragStartIndexRef.current = index;
-    onDropTierPreview?.(tier.id);
+    lastFingerPageYRef.current = fingerPageY;
+    updateDragFromFinger(fingerPageY);
   };
 
   const handleDragMove = (dy: number, fingerPageY: number) => {
-    setDragOffsetY(dy);
+    void dy;
     lastFingerPageYRef.current = fingerPageY;
     onDragMove?.(fingerPageY);
-    // Compute which index the row would drop into.
-    const startIdx = dragStartIndexRef.current;
-    if (startIdx < 0) return;
-    const layouts = layoutsRef.current;
-    if (!layouts[startIdx]) return;
-    const draggedCenterY = layouts[startIdx].y + layouts[startIdx].height / 2 + dy;
-    const draggedCenterContentY = tierYRef.current + tierBodyYRef.current + draggedCenterY;
-    const dropContentY = pageYToContentY?.(fingerPageY) ?? draggedCenterContentY;
-    lastDraggedCenterContentYRef.current = dropContentY;
-    onDropTierPreview?.(resolveDropTier?.(tier.id, dropContentY) ?? tier.id);
-    let target = startIdx;
-    for (let i = 0; i < layouts.length; i++) {
-      if (!layouts[i]) continue;
-      const centerY = layouts[i].y + layouts[i].height / 2;
-      if (draggedCenterY > centerY) target = i;
-    }
-    // If dragging up past several rows, target is the lowest row whose center is above
-    // the dragged center.
-    if (dy < 0) {
-      target = startIdx;
-      for (let i = layouts.length - 1; i >= 0; i--) {
-        if (!layouts[i]) continue;
-        const centerY = layouts[i].y + layouts[i].height / 2;
-        if (draggedCenterY < centerY) target = i;
-      }
-    }
-    setDropIndex(target);
+    updateDragFromFinger(fingerPageY);
   };
 
   const handleDragEnd = (committed: boolean) => {
     onDragMove?.(null);
-    onDropTierPreview?.(null);
+    onDropTargetPreview?.(null);
     const movedId = dragId;
-    const targetTier = committed && movedId != null && lastDraggedCenterContentYRef.current != null
-      ? resolveDropTier?.(tier.id, lastDraggedCenterContentYRef.current)
+    const target = committed && movedId != null && lastDropContentYRef.current != null
+      ? resolveDropTarget?.(tier.id, lastDropContentYRef.current)
       : null;
-    if (committed && movedId != null && targetTier && targetTier !== tier.id) {
-      onMoveToTier?.(movedId, tier.id, targetTier);
-    } else if (committed && dropIndex !== null && dragStartIndexRef.current >= 0 && dropIndex !== dragStartIndexRef.current) {
-      onReorderInTier(tier.id, dragStartIndexRef.current, dropIndex);
+    if (committed && movedId != null && target && target.tier !== tier.id) {
+      onMoveToTier?.(movedId, tier.id, target.tier, target.slotIndex);
+    } else if (committed && dropSlotIndex !== null && dragStartIndexRef.current >= 0 && dropSlotIndex !== dragStartIndexRef.current) {
+      onReorderInTier(tier.id, dragStartIndexRef.current, dropSlotIndex);
     }
     setDragId(null);
     setDragOffsetY(0);
-    setDropIndex(null);
+    setDropSlotIndex(null);
     dragStartIndexRef.current = -1;
+    dragFingerOffsetYRef.current = null;
     lastFingerPageYRef.current = null;
-    lastDraggedCenterContentYRef.current = null;
+    lastDropContentYRef.current = null;
   };
 
   return (
@@ -7742,8 +7868,8 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
       style={[
         styles.tierDropZone,
         dragInProgress && {
-          borderColor: activeDropTier === tier.id ? `${tier.color}AA` : `${T.border}66`,
-          backgroundColor: activeDropTier === tier.id ? `${tier.color}14` : 'transparent',
+          borderColor: activeDropTarget?.tier === tier.id ? `${tier.color}AA` : `${T.border}66`,
+          backgroundColor: activeDropTarget?.tier === tier.id ? `${tier.color}14` : 'transparent',
         },
         dragInProgress && tasks.length === 0 && styles.tierDropZoneEmpty,
       ]}
@@ -7767,7 +7893,10 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
           onLayout={(e) => {
             const previousY = tierBodyYRef.current;
             tierBodyYRef.current = e.nativeEvent.layout.y;
-            if (previousY !== tierBodyYRef.current) setLayoutRevision(v => v + 1);
+            if (previousY !== tierBodyYRef.current) {
+              publishTierRowsLayout();
+              setLayoutRevision(v => v + 1);
+            }
           }}>
           {tasks.map((task, index) => {
             void layoutRevision;
@@ -7791,6 +7920,7 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
                   const previous = layoutsRef.current[index];
                   layoutsRef.current[index] = { y, height };
                   if (!previous || previous.y !== y || previous.height !== height) {
+                    publishTierRowsLayout();
                     setLayoutRevision(v => v + 1);
                   }
                   if (focusedTaskId && String(task.id) === focusedTaskId) {
@@ -7811,7 +7941,7 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
                   requestComplete={requestComplete}
                   onEdit={onEdit}
                   accentColor={accentColor}
-                  onLongPressStart={() => handleLongPressStart(task.id, index)}
+                  onLongPressStart={(fingerPageY) => handleLongPressStart(task.id, index, fingerPageY)}
                   onDragMove={handleDragMove}
                   onDragEnd={handleDragEnd}
                   isDragging={isDragging}
@@ -7823,15 +7953,14 @@ function TierGroup({ tier, tasks, onComplete, onDelete, requestComplete, onEdit,
               </View>
             );
           })}
-          {/* Drop-indicator line — only shown while dragging. Placed at the top edge of
-              the target slot (or below the last row if dropping at the end). */}
-          {dragId !== null && dropIndex !== null && layoutsRef.current[dropIndex] && (() => {
-            const startIdx = dragStartIndexRef.current;
-            const layout = layoutsRef.current[dropIndex];
-            // Draw line above the slot when dropping up; below it when dropping down.
-            const lineY = dropIndex >= startIdx
-              ? layout.y + layout.height - 2
-              : layout.y - 2;
+          {/* Drop-indicator line at the actual insertion slot. */}
+          {(() => {
+            const externalSlot = dragId === null && dragInProgress && activeDropTarget?.tier === tier.id
+              ? activeDropTarget.slotIndex
+              : null;
+            const slotIndex = dragId !== null ? dropSlotIndex : externalSlot;
+            if (slotIndex == null) return null;
+            const lineY = lineYForSlot(slotIndex, dragId !== null ? dragStartIndexRef.current : null);
             return (
               <View
                 pointerEvents="none"
@@ -8757,8 +8886,14 @@ The tool input must include at least 6 items. Never return an empty items array.
           parsedTasks = dropCoveredCompoundTaskRows(parsedTasks);
           parsedTasks = dropGroceryClauseTaskLeaks(parsedTasks, raw);
           parsedTasks = trimGeneratedTaskRowsPreservingDirect(parsedTasks, raw);
+          if (taskRowsUnderfillGeneratedTopic(parsedTasks, raw)) {
+            parsedTasks = mergeGeneratedTaskExpansionRows(parsedTasks, fallbackGeneratedTaskRowsFromRaw(raw), raw);
+          }
+          if (parsedTasks.length === 0 && (hasDirectTaskActionIntent(raw) || hasScheduledEventStatement(raw))) {
+            parsedTasks = [taskDraftWithLocalReminder(raw, 'medium')];
+          }
           if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw) && parsedGroceryItems.length > 0) {
-            parsedTasks = [{ text: raw, tier: 'medium' }];
+            parsedTasks = [taskDraftWithLocalReminder(raw, 'medium')];
           }
           const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0;
           const defaultRouteListId = multiList ? defaultListId : null;
@@ -8866,7 +9001,7 @@ The tool input must include at least 6 items. Never return an empty items array.
         if (groceryMode) {
           addGroceryItemsSafely([{ name: raw, category: GROCERY_UNCATEGORIZED }]);
         } else {
-          onAddMany([{ text: raw, tier: defaultTier }]);
+          onAddMany([taskDraftWithLocalReminder(raw, defaultTier)]);
         }
       }
       setAiLoading(false);
@@ -8875,7 +9010,7 @@ The tool input must include at least 6 items. Never return an empty items array.
     } else {
       // Task mode + no AI: open priority picker
       if (!groceryMode && widgetTier) {
-        onAddMany([{ text: raw, tier: widgetTier }]);
+        onAddMany([taskDraftWithLocalReminder(raw, widgetTier)]);
         setValue('');
         setWidgetTier(null);
         Keyboard.dismiss();
@@ -8887,7 +9022,7 @@ The tool input must include at least 6 items. Never return an empty items array.
 
   const pickPriority = (chosen: Tier, reminder?: Reminder) => {
     const raw = value.trim();
-    if (raw) onAddMany([{ text: raw, tier: chosen, reminder }]);
+    if (raw) onAddMany([taskDraftWithLocalReminder(raw, chosen, reminder)]);
     setValue('');
     setWidgetTier(null);
     setPickerOpen(false);
@@ -10137,7 +10272,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
   const [pendingTaskGlowIds, setPendingTaskGlowIds] = useState<Record<string, number>>({});
   const [focusedGlowKey, setFocusedGlowKey] = useState<string | null>(null);
   const [visibleRevision, setVisibleRevision] = useState(0);
-  const [activeDropTier, setActiveDropTier] = useState<Tier | null>(null);
+  const [activeDropTarget, setActiveDropTarget] = useState<TaskDropTarget | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const firedFocusKeyRef = useRef<string | null>(null);
   const shownCalendarConflictKeysRef = useRef<Set<string>>(new Set());
@@ -10269,11 +10404,10 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
     setTasks(ts => ts.filter(t => t.id !== id));
   }, [setTasks, sharedActions, showToast, clearCombinedPendingTaskGlow]);
 
-  // Reorder a task within its tier. fromIndex / toIndex are positions in the
-  // tier-filtered list; we map back to indices in the global tasks array, splice,
-  // and reinsert. Tasks of other tiers keep their relative positions intact.
-  const handleReorderInTier = useCallback((tierId: Tier, fromIndex: number, toIndex: number) => {
-    if (fromIndex === toIndex) return;
+  // Reorder a task within its tier. The child gives us an insertion slot after
+  // removing the dragged row, which keeps drops accurate for variable row heights.
+  const handleReorderInTier = useCallback((tierId: Tier, fromIndex: number, toSlotIndex: number) => {
+    if (fromIndex === toSlotIndex) return;
     // Drag-reorder within tier on shared lists is a v2 want — items have no
     // explicit position field yet, so we'd need a transactional swap. For
     // now: silent no-op so the gesture doesn't crash.
@@ -10282,21 +10416,22 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
       const tierIndices: number[] = [];
       ts.forEach((t, i) => { if (t.tier === tierId) tierIndices.push(i); });
       if (fromIndex < 0 || fromIndex >= tierIndices.length) return ts;
-      if (toIndex < 0 || toIndex >= tierIndices.length) return ts;
+      if (toSlotIndex < 0 || toSlotIndex > tierIndices.length - 1) return ts;
       const fromGlobal = tierIndices[fromIndex];
-      const toGlobal = tierIndices[toIndex];
       const next = ts.slice();
       const [moved] = next.splice(fromGlobal, 1);
-      // After the splice, items that were at index >= fromGlobal+1 are now one
-      // position to the left. Inserting at `toGlobal` works in both directions:
-      // moving down lands the row after the original `toIndex` row; moving up
-      // lands the row at the original `toIndex` slot.
-      next.splice(toGlobal, 0, moved);
+      const remainingTierIndices: number[] = [];
+      next.forEach((t, i) => { if (t.tier === tierId) remainingTierIndices.push(i); });
+      const clampedSlot = Math.max(0, Math.min(toSlotIndex, remainingTierIndices.length));
+      const insertGlobal = clampedSlot >= remainingTierIndices.length
+        ? (remainingTierIndices[remainingTierIndices.length - 1] ?? next.length - 1) + 1
+        : remainingTierIndices[clampedSlot];
+      next.splice(Math.max(0, Math.min(insertGlobal, next.length)), 0, moved);
       return next;
     });
   }, [setTasks, sharedActions]);
 
-  const handleMoveToTier = useCallback((taskId: TaskId, sourceTier: Tier, targetTier: Tier) => {
+  const handleMoveToTier = useCallback((taskId: TaskId, sourceTier: Tier, targetTier: Tier, targetSlotIndex = Number.MAX_SAFE_INTEGER) => {
     if (sourceTier === targetTier) return;
     if (sharedActions) {
       sharedActions
@@ -10304,7 +10439,21 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
         .catch(() => showToast('Could not move task', 'Check connection'));
       return;
     }
-    setTasks(ts => ts.map(t => String(t.id) === String(taskId) ? { ...t, tier: targetTier } : t));
+    setTasks(ts => {
+      const fromGlobal = ts.findIndex(t => String(t.id) === String(taskId));
+      if (fromGlobal < 0) return ts;
+      const next = ts.slice();
+      const [moved] = next.splice(fromGlobal, 1);
+      const updated = { ...moved, tier: targetTier };
+      const targetTierIndices: number[] = [];
+      next.forEach((t, i) => { if (t.tier === targetTier) targetTierIndices.push(i); });
+      const clampedSlot = Math.max(0, Math.min(targetSlotIndex, targetTierIndices.length));
+      const insertGlobal = clampedSlot >= targetTierIndices.length
+        ? (targetTierIndices[targetTierIndices.length - 1] ?? next.length - 1) + 1
+        : targetTierIndices[clampedSlot];
+      next.splice(Math.max(0, Math.min(insertGlobal, next.length)), 0, updated);
+      return next;
+    });
   }, [setTasks, sharedActions, showToast]);
 
   // Confirm dialog still used for the "Delete list" path. Task deletion now uses the
@@ -10431,8 +10580,10 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
   // nudges the scroll position. Cleared on null (drag ended).
   const scrollRef = useRef<ScrollView>(null);
   const scrollOffsetRef = useRef(0);
+  const scrollContentHeightRef = useRef(0);
   const scrollViewLayoutRef = useRef<{ y: number; height: number }>({ y: 0, height: 0 });
   const tierLayoutsRef = useRef<Partial<Record<Tier, { y: number; height: number }>>>({});
+  const tierRowLayoutsRef = useRef<Partial<Record<Tier, { bodyY: number; rows: TaskRowLayoutInfo[] }>>>({});
   const edgeScrollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const edgeScrollDirectionRef = useRef<'up' | 'down' | null>(null);
   const effectiveFocusedTaskId = focusedTaskId ?? localFocusedTaskId;
@@ -10487,8 +10638,19 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
     setVisibleRevision(v => v + 1);
   }, []);
 
+  const maxScrollOffset = useCallback(() => (
+    Math.max(0, scrollContentHeightRef.current - scrollViewLayoutRef.current.height)
+  ), []);
+
+  const clampScrollOffset = useCallback((offset: number) => (
+    Math.max(0, Math.min(offset, maxScrollOffset()))
+  ), [maxScrollOffset]);
+
   const pageYToContentY = useCallback((pageY: number) => (
-    Math.max(0, pageY - scrollViewLayoutRef.current.y + scrollOffsetRef.current)
+    Math.max(0, Math.min(
+      scrollContentHeightRef.current || Number.MAX_SAFE_INTEGER,
+      pageY - scrollViewLayoutRef.current.y + scrollOffsetRef.current,
+    ))
   ), []);
 
   const handleDragMovePageY = useCallback((pageY: number | null) => {
@@ -10509,18 +10671,40 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
       const currentDirection = edgeScrollDirectionRef.current;
       if (!currentDirection) return;
       const dy = currentDirection === 'up' ? -SCROLL_PER_TICK : SCROLL_PER_TICK;
-      const next = Math.max(0, scrollOffsetRef.current + dy);
+      const next = clampScrollOffset(scrollOffsetRef.current + dy);
+      if (next === scrollOffsetRef.current) {
+        stopEdgeScroll();
+        bumpVisibleRevision(true);
+        return;
+      }
       scrollOffsetRef.current = next;
       scrollRef.current?.scrollTo({ y: next, animated: false });
+      bumpVisibleRevision(true);
     }, 16);
-  }, [stopEdgeScroll]);
+  }, [bumpVisibleRevision, clampScrollOffset, stopEdgeScroll]);
 
   const rememberTierLayout = useCallback((tierId: Tier, y: number, height: number) => {
     tierLayoutsRef.current[tierId] = { y, height };
   }, []);
 
-  const resolveDropTier = useCallback((sourceTier: Tier, draggedCenterContentY: number) => {
-    const contentY = draggedCenterContentY;
+  const rememberTierRowsLayout = useCallback((tierId: Tier, bodyY: number, rows: TaskRowLayoutInfo[]) => {
+    tierRowLayoutsRef.current[tierId] = { bodyY, rows };
+  }, []);
+
+  const slotIndexForTierContentY = useCallback((tierId: Tier, contentY: number) => {
+    const tierLayout = tierLayoutsRef.current[tierId];
+    const rowLayout = tierRowLayoutsRef.current[tierId];
+    const rows = rowLayout?.rows ?? [];
+    if (!tierLayout || rows.length === 0) return 0;
+    const bodyY = contentY - tierLayout.y - (rowLayout?.bodyY ?? 0);
+    let slotIndex = 0;
+    for (const row of rows) {
+      if (bodyY > row.y + row.height / 2) slotIndex += 1;
+    }
+    return Math.max(0, Math.min(slotIndex, rows.length));
+  }, []);
+
+  const resolveDropTarget = useCallback((sourceTier: Tier, contentY: number): TaskDropTarget => {
     const tierIds: Tier[] = ['high', 'medium', 'low'];
     const entries = tierIds
       .map(id => {
@@ -10528,22 +10712,36 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
         return layout ? { id, ...layout } : null;
       })
       .filter((entry): entry is { id: Tier; y: number; height: number } => !!entry && entry.height > 0);
-    if (entries.length === 0) return sourceTier;
+    if (entries.length === 0) return { tier: sourceTier, slotIndex: slotIndexForTierContentY(sourceTier, contentY) };
     const ordered = entries.sort((a, b) => a.y - b.y);
-    if (contentY <= ordered[0].y) return ordered[0].id;
+    let targetTier = ordered[0].id;
+    if (contentY <= ordered[0].y) {
+      targetTier = ordered[0].id;
+      return { tier: targetTier, slotIndex: slotIndexForTierContentY(targetTier, contentY) };
+    }
     for (let i = 0; i < ordered.length; i += 1) {
       const entry = ordered[i];
       const entryBottom = entry.y + entry.height;
-      if (contentY <= entryBottom) return entry.id;
+      if (contentY <= entryBottom) {
+        targetTier = entry.id;
+        return { tier: targetTier, slotIndex: slotIndexForTierContentY(targetTier, contentY) };
+      }
       const next = ordered[i + 1];
       if (next) {
         const gapMidpoint = entryBottom + Math.max(0, next.y - entryBottom) / 2;
-        if (contentY < gapMidpoint) return entry.id;
-        if (contentY < next.y) return next.id;
+        if (contentY < gapMidpoint) {
+          targetTier = entry.id;
+          return { tier: targetTier, slotIndex: slotIndexForTierContentY(targetTier, contentY) };
+        }
+        if (contentY < next.y) {
+          targetTier = next.id;
+          return { tier: targetTier, slotIndex: slotIndexForTierContentY(targetTier, contentY) };
+        }
       }
     }
-    return ordered[ordered.length - 1].id;
-  }, []);
+    targetTier = ordered[ordered.length - 1].id;
+    return { tier: targetTier, slotIndex: slotIndexForTierContentY(targetTier, contentY) };
+  }, [slotIndexForTierContentY]);
 
   const isTaskRowVisible = useCallback((contentY: number, height: number) => {
     void visibleRevision;
@@ -10636,8 +10834,13 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
         keyboardShouldPersistTaps="handled"
         scrollEventThrottle={16}
         onScroll={(e) => {
-          scrollOffsetRef.current = e.nativeEvent.contentOffset.y;
+          scrollOffsetRef.current = clampScrollOffset(e.nativeEvent.contentOffset.y);
           bumpVisibleRevision();
+        }}
+        onContentSizeChange={(_width, height) => {
+          scrollContentHeightRef.current = height;
+          scrollOffsetRef.current = clampScrollOffset(scrollOffsetRef.current);
+          bumpVisibleRevision(true);
         }}
         onLayout={(e) => {
           // Measure the scroll viewport in window coords so edge-scroll can compare
@@ -10646,10 +10849,12 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
           if (ref && ref.measureInWindow) {
             ref.measureInWindow((_x: number, y: number, _w: number, h: number) => {
               scrollViewLayoutRef.current = { y, height: h };
+              scrollOffsetRef.current = clampScrollOffset(scrollOffsetRef.current);
               bumpVisibleRevision(true);
             });
           } else {
             scrollViewLayoutRef.current = { y: e.nativeEvent.layout.y, height: e.nativeEvent.layout.height };
+            scrollOffsetRef.current = clampScrollOffset(scrollOffsetRef.current);
             bumpVisibleRevision(true);
           }
         }}>
@@ -10668,12 +10873,14 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
                 onComplete={handleComplete} onDelete={handleDelete} requestComplete={requestComplete} onEdit={setEditingTask} accentColor={accentColor}
                 onReorderInTier={handleReorderInTier} onDragMove={handleDragMovePageY}
                 onTierLayout={rememberTierLayout}
-                resolveDropTier={resolveDropTier}
+                onTierRowsLayout={rememberTierRowsLayout}
+                resolveDropTarget={resolveDropTarget}
                 onMoveToTier={handleMoveToTier}
-                onDropTierPreview={setActiveDropTier}
+                onDropTargetPreview={setActiveDropTarget}
                 pageYToContentY={pageYToContentY}
-                dragInProgress={activeDropTier !== null}
-                activeDropTier={activeDropTier}
+                dragInProgress={activeDropTarget !== null}
+                activeDropTarget={activeDropTarget}
+                dragScrollRevision={visibleRevision}
                 isRowVisible={isTaskRowVisible}
                 collapsed={collapsedGroups[collapseKey] ?? false}
                 onCollapsedChange={(next) => setCollapsedGroup(collapseKey, next)}
