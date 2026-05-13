@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.4.10 - 2026-05-13
+
+- Fixed task drag/drop accuracy on long task lists. Dragged rows now stay anchored to the finger while the list edge-scrolls, including at the bottom of the list.
+- Changed task drop targeting to use explicit insertion slots from the finger's ScrollView position instead of relying on the dragged row's original center.
+- Improved cross-priority drops so local task moves can land in the intended slot inside High, Medium, or Low rather than only changing priority.
+- Clamped drag edge-scroll to the real measured ScrollView content height so holding near the bottom cannot push the grabbed row beyond the actual list end.
+- Preserved the post-v1.4.9 AI reminder hotfix: timed action phrases, scheduled-event wording, compact times such as `1230`, and broad intent-frame prompts are handled more reliably.
+
 ## v1.4.9 - 2026-05-12
 
 - Simplified public AI choices to Gemini 2.5 Flash-Lite for the fast/low-cost lane and Claude Sonnet 4.6 for the premium lane. Legacy saved GPT selections now migrate to Gemini, and legacy Claude Haiku selections migrate to Sonnet.

@@ -45,6 +45,7 @@ const AI_ROW_STYLE_RULES = `Row style:
 - Include compact practical details when a row would be incomplete without them, like sets/reps/minutes for exercise, frequency for habits, or the concrete object/tool/location for checklist/advice rows.
 - For broad/vague requests, pick the best starter rows instead of covering every possible category.`;
 const AI_INTENT_RULES = `Intent rules:
+- Use intent frames over memorized phrases: action verb + object = task; event/appointment noun + date/time = task with reminder; ingredients/supplies/materials + topic = grocery/material rows; plan/routine/checklist/tips + topic = concrete task rows.
 - If user asks for a routine, plan, checklist, ideas, tips, advice, steps, or "what should I do", convert that clause into task rows.
 - If user asks for ingredients, recipe, shopping, groceries, supplies, materials, equipment, accessories, gear, tools, packing, or buy-list items, convert that clause into grocery/material rows.
 - Casual words like stuff, junk, crap, or things also mean grocery/material rows when attached to a recipe, meal, smoothie, project, repair, packing, or buying clause.
@@ -339,6 +340,77 @@ const CASES = {
     input: 'remind me every 2 hours to stretch',
     expect: { minTasks: 1, maxGrocery: 0, taskList: 'workout', hasReminder: true },
   },
+  'appointment-tomorrow-330': {
+    screen: 'tasks',
+    input: 'i have an appointment tomorrow at 330',
+    expect: {
+      minTasks: 1,
+      maxTasks: 1,
+      maxGrocery: 0,
+      taskList: 'personal',
+      hasReminder: true,
+      reminderTaskText: ['appointment'],
+      forbiddenTaskText: ['tomorrow', '330'],
+    },
+  },
+  'wake-up-three-days': {
+    screen: 'tasks',
+    input: 'remind me to wake up at 8 in 3 days',
+    expect: {
+      minTasks: 1,
+      maxTasks: 1,
+      maxGrocery: 0,
+      taskList: 'personal',
+      hasReminder: true,
+      reminderTaskText: ['wake'],
+      forbiddenTaskText: ['3 days'],
+    },
+  },
+  'uber-pt-compact-time': {
+    screen: 'tasks',
+    input: 'call physical therapy for Uber at 1230',
+    expect: {
+      minTasks: 1,
+      maxTasks: 1,
+      maxGrocery: 0,
+      taskList: 'personal',
+      hasReminder: true,
+      reminderTaskText: ['physical'],
+      forbiddenTaskText: ['1230'],
+    },
+  },
+  'casual-shit-to-do': {
+    screen: 'tasks',
+    input: 'shit to do today clean bathroom email Alex at 4 and fix ring doorbell',
+    expect: {
+      minTasks: 3,
+      maxGrocery: 0,
+      taskList: 'personal',
+      hasReminder: true,
+      reminderTaskText: ['alex'],
+      taskTextList: [
+        { text: 'bathroom', listId: 'personal' },
+        { text: 'alex', listId: 'personal' },
+        { text: 'ring', listId: 'personal' },
+      ],
+      noReminderTaskText: ['bathroom', 'ring'],
+    },
+  },
+  'repair-materials-casual': {
+    screen: 'grocery',
+    input: 'stuff to buy to fix a leaky sink',
+    expect: { minGrocery: 4, maxTasks: 0, noReminders: true, groceryText: ['tape'] },
+  },
+  'criteria-smoothie': {
+    screen: 'grocery',
+    input: 'ingredients for a high protein smoothie with no banana',
+    expect: { minGrocery: 4, maxTasks: 0, noReminders: true, forbiddenGroceryText: ['banana'], groceryText: ['protein'] },
+  },
+  'project-materials-budget': {
+    screen: 'grocery',
+    input: 'materials for building a small shelf under 50 bucks',
+    expect: { minGrocery: 4, maxTasks: 0, noReminders: true, groceryText: ['screw'] },
+  },
   'biomed-supplies-context': {
     screen: 'tasks',
     input: 'order quick crimps for sv4',
@@ -349,7 +421,7 @@ const CASES = {
 const PROMPT_VARIANTS = new Set(['full', 'compact', 'lean']);
 
 function parseArgs(argv) {
-  const out = { provider: 'openai', caseName: 'all', promptVariant: 'compact', measureOnly: false, modelOverride: '' };
+  const out = { provider: 'openai', caseName: 'all', promptVariant: 'compact', measureOnly: false, modelOverride: '', localReminderOnly: false };
   for (let i = 2; i < argv.length; i += 1) {
     const value = argv[i];
     if (value === '--provider') out.provider = argv[++i] || out.provider;
@@ -358,6 +430,7 @@ function parseArgs(argv) {
     else if (value === '--prompt') out.prompt = argv[++i] || '';
     else if (value === '--prompt-variant') out.promptVariant = argv[++i] || out.promptVariant;
     else if (value === '--measure') out.measureOnly = true;
+    else if (value === '--local-reminder') out.localReminderOnly = true;
   }
   return out;
 }
@@ -387,7 +460,7 @@ function normalizeAiListText(value) {
 
 const AI_LIST_GENERIC_TOKENS = new Set([
   'a', 'an', 'and', 'for', 'in', 'list', 'main', 'my', 'need', 'needs', 'of', 'on', 'our',
-  'shared', 'task', 'tasks', 'the', 'to', 'todo', 'work',
+  'body', 'shared', 'task', 'tasks', 'the', 'to', 'todo', 'work',
 ]);
 const AI_TASK_TEXT_STOP_TOKENS = new Set([
   'a', 'add', 'an', 'and', 'can', 'create', 'do', 'for', 'i', 'me', 'my', 'need',
@@ -527,7 +600,7 @@ function groceryDraftLooksLikeGenerationPlaceholder(item, input) {
   if (!hasGroceryGenerationIntent(input)) return false;
   const name = String(item.name || '').replace(/\s+/g, ' ').trim();
   if (!name) return false;
-  if (/\b(ingredients?|shopping list|grocery list|groceries|supplies|materials?|equipment|accessories|gear|tools?|items|meal[-\s]?prep list|meal plan list|packing list|pack list|buy list|purchase list)\b/i.test(name)) return true;
+  if (/\b(ingredients?|shopping list|grocery list|groceries|snacks?|supplies|materials?|equipment|accessories|gear|tools?|items|meal[-\s]?prep list|meal plan list|packing list|pack list|buy list|purchase list)\b/i.test(name)) return true;
   if (/^(for|to make|to build|needed for)\b/i.test(name)) return true;
   return false;
 }
@@ -608,20 +681,27 @@ function mergeRecoveredGroceryDrafts(items, input) {
 function hasDirectTaskActionIntent(input) {
   const normalized = input.replace(/\s+/g, ' ').trim();
   if (/\b(remind me|set a reminder|add (a )?task|todo|to-do)\b/i.test(normalized)) return true;
-  const actionVerb = /\b(call|text|email|schedule|book|pay|order|fix|repair|clean|finish|submit|send|test|workout|exercise|train|walk|walking|rub)\b/i;
+  const actionVerb = /\b(call|text|email|schedule|book|pay|order|fix|repair|clean|finish|submit|send|test|workout|exercise|train|walk|walking|wake|rub)\b/i;
   if (new RegExp(`^\\s*${actionVerb.source}`, 'i').test(normalized)) return true;
   return actionVerb.test(normalized)
     && /\b(today|tomorrow|tonight|later|this morning|this afternoon|this evening|morning|afternoon|evening|noon|midnight|at\s+\d{1,2}|around\s+\d{1,2}|round\s+\d{1,2}|by\s+\d{1,2}|in\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)|\d{1,2}(:\d{2})?\s*(am|pm|a|p))\b/i.test(normalized);
+}
+
+function hasScheduledEventStatement(input) {
+  const normalized = input.replace(/\s+/g, ' ').trim();
+  if (!aiTextHasReminderCue(normalized)) return false;
+  return /\b(appointment|appt|meeting|event|reservation|interview|class|shift|therapy|physical therapy|pt|doctor|dentist|visit|pickup|pick\s+up|flight|ride)\b/i.test(normalized)
+    && /\b(i have|ive got|i've got|got|have|my|there(?:'| i)?s|there is|need to be|supposed to be)\b/i.test(normalized);
 }
 
 function aiTextHasReminderCue(input) {
   const normalized = input.replace(/\s+/g, ' ').trim();
   if (!normalized) return false;
   return /\b(remind me|reminder|set a reminder|alarm|notify|notification|repeat|repeating|hourly|daily|weekly)\b/i.test(normalized)
-    || /\b(at|around|round|by|before|after)\s+\d{1,2}(:\d{2})?\s*(am|pm|a|p)?\b/i.test(normalized)
+    || /\b(at|around|round|by|before|after)\s+(?:\d{1,2}(?::\d{2}|\s+[0-5]\d)?|\d{3,4})\s*(am|pm|a|p)?\b/i.test(normalized)
     || /\bevery\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?|weeks?)\b/i.test(normalized)
     || /\bin\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)\b/i.test(normalized)
-    || /\b\d{1,2}(:\d{2})?\s*(am|pm)\b/i.test(normalized);
+    || /\b(?:\d{1,2}:\d{2}|\d{3,4}|\d{1,2})\s*(am|pm)\b/i.test(normalized);
 }
 
 function aiReminderTaskTokens(value) {
@@ -659,14 +739,14 @@ const AI_REMINDER_ACTION_BOUNDARY_TOKENS = new Set([
   'ask', 'book', 'build', 'buy', 'call', 'clean', 'create', 'do', 'draft', 'email', 'exercise',
   'feed', 'finish', 'fix', 'get', 'grab', 'make', 'message', 'order', 'pack', 'pay', 'pick',
   'prepare', 'repair', 'review', 'rub', 'schedule', 'send', 'set', 'submit', 'take', 'tell',
-  'test', 'text', 'train', 'walk', 'walking', 'wash', 'workout', 'write',
+  'test', 'text', 'train', 'wake', 'walk', 'walking', 'wash', 'workout', 'write',
 ]);
 
 const AI_REMINDER_MATCH_STOP_TOKENS = new Set([
   'ask', 'book', 'build', 'buy', 'call', 'clean', 'create', 'do', 'draft', 'email', 'exercise',
   'feed', 'finish', 'fix', 'get', 'grab', 'make', 'message', 'order', 'pack', 'pay', 'pick',
   'prepare', 'repair', 'review', 'rub', 'schedule', 'send', 'set', 'submit', 'take', 'tell',
-  'test', 'text', 'train', 'walk', 'walking', 'wash', 'workout', 'write',
+  'test', 'text', 'train', 'wake', 'walk', 'walking', 'wash', 'workout', 'write',
   'advice', 'checklist', 'item', 'items', 'plan', 'program', 'routine', 'row', 'rows',
   'session', 'sessions', 'step', 'steps', 'task', 'tasks', 'thing', 'things', 'tip', 'tips',
   'hour', 'hours', 'hr', 'hrs', 'minute', 'minutes', 'min', 'mins', 'today', 'tomorrow', 'tonight',
@@ -740,36 +820,65 @@ function aiInputAllowsReminder(raw, taskText) {
   return aiTextHasReminderCue(clause) && aiReminderClauseMatchesTask(clause, taskText, raw);
 }
 
-function reminderDateFromClockClause(clause) {
-  const clockMatch = clause.match(/\b(?:at|around|round|by|before|after)?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm|a|p)?\b/i);
+function reminderDateFromClockClause(clause, nowMs = Date.now()) {
+  const clockMatch = clause.match(/\b(?:at|around|round|by|before|after)?\s*(?:(\d{3,4})|(\d{1,2})(?::(\d{2})|\s+([0-5]\d))?)\s*(am|pm|a|p)?\b/i);
   if (!clockMatch) return null;
-  let hour = Math.max(0, Math.min(23, Number(clockMatch[1])));
-  const minute = Math.max(0, Math.min(59, Number(clockMatch[2] ?? 0)));
-  const suffix = clockMatch[3]?.toLowerCase();
+  const compactTime = clockMatch[1];
+  let hour = compactTime
+    ? Number(compactTime.slice(0, -2))
+    : Number(clockMatch[2]);
+  const minute = Math.max(0, Math.min(59, Number(compactTime ? compactTime.slice(-2) : (clockMatch[3] ?? clockMatch[4] ?? 0))));
+  const suffix = clockMatch[5]?.toLowerCase();
+  hour = Math.max(0, Math.min(23, hour));
   if (suffix === 'pm' || suffix === 'p') {
     if (hour < 12) hour += 12;
   } else if (suffix === 'am' || suffix === 'a') {
     if (hour === 12) hour = 0;
+  } else if (/\b(wake\s+(?:me\s+)?up|wake|alarm|breakfast|morning)\b/i.test(clause)) {
+    if (hour === 12) hour = 0;
+  } else if (/\bmorning\b/i.test(clause) && hour === 12) {
+    hour = 0;
+  } else if (/\b(afternoon|evening|tonight)\b/i.test(clause) && hour >= 1 && hour <= 11) {
+    hour += 12;
   } else if (hour >= 1 && hour <= 7) {
     hour += 12;
+  } else if (hour >= 8 && hour <= 11) {
+    const amCandidate = new Date(nowMs);
+    amCandidate.setHours(hour, minute, 0, 0);
+    const pmCandidate = new Date(nowMs);
+    pmCandidate.setHours(hour + 12, minute, 0, 0);
+    if (amCandidate.getTime() >= nowMs - 60000) {
+      // Keep AM when it is still the nearest sensible occurrence.
+    } else if (pmCandidate.getTime() >= nowMs - 60000) {
+      hour += 12;
+    }
   }
-  const date = new Date();
+  const date = new Date(nowMs);
   if (/\btomorrow\b/i.test(clause)) date.setDate(date.getDate() + 1);
   date.setHours(hour, minute, 0, 0);
-  if (date.getTime() < Date.now() - 60000 && !/\btomorrow\b/i.test(clause)) {
+  if (date.getTime() < nowMs - 60000 && !/\btomorrow\b/i.test(clause)) {
     date.setDate(date.getDate() + 1);
   }
   return date;
 }
 
-function buildReminderFallbackFromRaw(raw, taskText = '') {
+function buildReminderFallbackFromRaw(raw, taskText = '', nowMs = Date.now()) {
   const clause = aiReminderLocalClauseForTask(raw, taskText);
   if (!aiTextHasReminderCue(clause)) return null;
-  const now = Date.now();
+  const now = nowMs;
   const relativeMatch = clause.match(/\bin\s+(\d+)\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)\b/i);
   if (relativeMatch) {
     const amount = Math.max(1, Number(relativeMatch[1]));
     const unit = relativeMatch[2].toLowerCase();
+    if (/^days?$/i.test(unit)) {
+      const clockDate = reminderDateFromClockClause(clause, nowMs);
+      if (clockDate) {
+        const date = new Date(nowMs);
+        date.setDate(date.getDate() + amount);
+        date.setHours(clockDate.getHours(), clockDate.getMinutes(), 0, 0);
+        return { remindAt: date.getTime(), repeatHourly: false, repeatDaily: false };
+      }
+    }
     const ms = /^m/.test(unit) ? amount * 60000 : /^h/.test(unit) ? amount * 3600000 : amount * 86400000;
     return { remindAt: now + ms, repeatHourly: false, repeatDaily: false };
   }
@@ -777,21 +886,38 @@ function buildReminderFallbackFromRaw(raw, taskText = '') {
   if (everyMatch) {
     const amount = Math.max(1, Number(everyMatch[1] ?? 1));
     const unit = everyMatch[2].toLowerCase();
-    const clockDate = reminderDateFromClockClause(clause);
+    const clockDate = reminderDateFromClockClause(clause, nowMs);
     if (/^m/.test(unit) || /^h/.test(unit)) {
       const fallbackDelay = /^m/.test(unit) ? amount * 60000 : amount * 3600000;
       return { remindAt: clockDate?.getTime() ?? (now + fallbackDelay), repeatHourly: true, repeatDaily: false };
     }
     const first = clockDate ?? (() => {
-      const date = new Date();
+      const date = new Date(nowMs);
       date.setDate(date.getDate() + 1);
       date.setHours(9, 0, 0, 0);
       return date;
     })();
     return { remindAt: first.getTime(), repeatHourly: false, repeatDaily: true };
   }
-  const clockDate = reminderDateFromClockClause(clause);
+  const clockDate = reminderDateFromClockClause(clause, nowMs);
   return clockDate ? { remindAt: clockDate.getTime(), repeatHourly: false, repeatDaily: false } : null;
+}
+
+function buildLocalReminderFromTaskText(text, nowMs = Date.now()) {
+  const raw = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!raw || (!hasDirectTaskActionIntent(raw) && !hasScheduledEventStatement(raw))) return null;
+  if (!aiInputAllowsReminder(raw, raw)) return null;
+  return buildReminderFallbackFromRaw(raw, raw, nowMs);
+}
+
+function taskDraftWithLocalReminder(text, tier = 'medium', reminder = null, nowMs = Date.now()) {
+  const raw = String(text || '').replace(/\s+/g, ' ').trim();
+  const resolvedReminder = reminder || buildLocalReminderFromTaskText(raw, nowMs);
+  return {
+    text: resolvedReminder ? cleanReminderTimingFromTaskText(raw) : raw,
+    tier,
+    reminder: resolvedReminder,
+  };
 }
 
 function shouldAllowAiReminderForTask(raw, taskText = '') {
@@ -1073,6 +1199,7 @@ function concreteGeneratedTaskRows(items, input) {
     .filter(item => !taskLooksLikeGenerationPlaceholder(String(item?.text ?? ''), input));
   const fallback = fallbackGeneratedTaskRowsFromRaw(input);
   if (concrete.length === 0) return fallback;
+  if (taskRowsUnderfillGeneratedTopic(concrete, input) && fallback.length > 0) return fallback;
   if (taskRowsNeedGenerationDetailRetry(concrete, input) && fallback.length > 0) return fallback;
   if (taskRowsMissRequestedWorkoutFocus(concrete, input) && fallback.length > 0) return fallback;
   return concrete;
@@ -1122,7 +1249,7 @@ function trimGeneratedTaskRowsPreservingDirect(items, input) {
 
 const AI_DIRECT_TASK_RECOVERY_TOKENS = new Set([
   'call', 'text', 'email', 'schedule', 'book', 'pay', 'order', 'fix', 'repair', 'clean',
-  'do', 'finish', 'submit', 'send', 'test', 'walk', 'walking', 'rub',
+  'do', 'finish', 'submit', 'send', 'test', 'wake', 'walk', 'walking', 'rub',
 ]);
 
 const AI_DIRECT_TASK_SEGMENT_SPLIT_TOKENS = new Set([
@@ -1388,11 +1515,13 @@ function resolveAiTaskListId({ text, raw, aiListIdValue, lists, destinationHint 
 
 function cleanReminderTimingFromTaskText(text) {
   const cleaned = text
-    .replace(/\b(?:at|around|round|by|before|after)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a|p)?\b/gi, ' ')
+    .replace(/\b(?:at|around|round|by|before|after)\s+(?:\d{1,2}(?::\d{2}|\s+[0-5]\d)?|\d{3,4})\s*(?:am|pm|a|p)?\b/gi, ' ')
     .replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a|p)\b/gi, ' ')
     .replace(/\bin\s+\d+\s*(?:m|min|mins|minutes|h|hr|hrs|hours|days?)\b/gi, ' ')
     .replace(/\bevery\s+\d*\s*(?:m|min|mins|minutes|h|hr|hrs|hours|days?|weeks?)\b/gi, ' ')
     .replace(/\b(today|tomorrow|tonight|this morning|this afternoon|this evening|morning|afternoon|evening|noon|midnight)\b/gi, ' ')
+    .replace(/^(?:please\s+)?(?:remind me to|remember to|notify me to|set(?: a)? reminder to|i need to|need to|gotta|have to)\s+/i, '')
+    .replace(/^(?:i have|i've got|ive got|got|have)\s+(?:an?\s+)?/i, '')
     .replace(/\s+/g, ' ')
     .replace(/\s+([,.;:!?])/g, '$1')
     .replace(/^[,.;:\s-]+|[,.;:\s-]+$/g, '')
@@ -1730,7 +1859,7 @@ Rows:
 - include compact practical details when needed, such as sets/reps/minutes for workout rows.
 - recipe/shopping/grocery/supplies/materials/equipment/accessories/gear/tools/packing/buy lists -> 5-8 grocery rows, not placeholder items; ${groceryQuantityInstruction(inferGroceryQuantities)}
 - Split mixed clauses; do not duplicate a clause as both task and grocery. Ambiguous actionable input -> task. Non-empty actionable input must return a row.
-- Reminders only for explicit reminder/alarm/notify/repeat or clock time. Date-only today/tomorrow/later is not a reminder. No-AM/PM clock defaults PM.
+- Reminders only for explicit reminder/alarm/notify/repeat, scheduled-event wording with a time, or a clear clock time. Date-only today/tomorrow/later is not a reminder. Infer the next sensible occurrence from NOW.
 - listId per task from WORKSPACE; otherwise default. Keep user wording/register; do not sanitize names/relationships.
 Output only schema fields. Empty side arrays allowed.`
     };
@@ -1746,6 +1875,7 @@ Use Personal Context for people, priorities, list aliases, accessibility, diet/a
 ${workspaceContext.prompt}
 Rows:
 - Short app rows, not prose. One task = one useful action; one grocery/material row = one buyable item.
+- Use intent frames over memorized phrases: action verb + object = task; event/appointment noun + date/time = task with reminder; ingredients/supplies/materials + topic = grocery/material rows; plan/routine/checklist/tips + topic = concrete task rows.
 - Plans/routines/checklists/tips/advice become concrete task rows, not meta rows like choose/create/schedule/plan the plan.
 - Ingredients/recipes/shopping/groceries/supplies/materials/equipment/accessories/gear/tools/packing/buy lists become grocery/material rows.
 - Casual words like stuff, junk, crap, or things also mean grocery/material rows when attached to a recipe, meal, smoothie, project, repair, packing, or buying clause.
@@ -1758,8 +1888,8 @@ Rows:
 - ${AI_GROCERY_CATEGORY_HINTS}
 - ${groceryQuantityInstruction(inferGroceryQuantities)}
 - Tasks set listId from WORKSPACE when named/implied; otherwise use default, not active.
-- Reminders only for explicit reminder/alarm/notify/repeat wording or clear clock time like "at 4"; date-only today/tomorrow/later is not a reminder. repeat* only if explicit.
-- Time: "at/around/round 6" no AM/PM = 6 PM unless morning context; tonight=20; evening=19; tomorrow morning=day+1 hour 9; relative hours calculate from NOW.
+- Reminders only for explicit reminder/alarm/notify/repeat wording, scheduled-event wording with a time ("appointment tomorrow at 330"), or a clear clock time ("at 4", "at 12:30", "at 1230"). Date-only today/tomorrow/later is not a reminder. repeat* only if explicit.
+- Time: infer the next sensible occurrence from NOW. "at/around/round 6" usually means next 6 PM unless morning/wake/alarm context; "at 9" at 8 PM means 9 PM, while "at 9" at 11 PM means tomorrow 9 AM. Compact "1230" means 12:30. "wake up at 8 in 3 days" means 8 AM three days from NOW.
 - Output concise text; remove timing words only when a reminder is created; keep user wording/register and do not sanitize names/relationships.
 
 Return only schema fields. Either array can be empty, but actionable input must not return both empty.`
@@ -1802,10 +1932,14 @@ Tasks: set listId per task. Different tasks in one prompt may use different list
 Tasks get tier high/medium/low. Use high only for urgent/important, low for optional/light, otherwise medium.
 Set widgetLabel to 1-5 words. Keep meaning/action/final object; if text is already short, use full text.
 
-Reminders: include daysFromNow/hour/minute/repeatHourly/repeatDaily only for explicit reminder/alarm/notify/repeat wording or a clear clock time like "at 4". Date-only words like today/tomorrow/later are not reminders by themselves. repeat* true only if explicit.
+Reminders: include daysFromNow/hour/minute/repeatHourly/repeatDaily only for explicit reminder/alarm/notify/repeat wording, scheduled-event wording with a time, or a clear clock time like "at 4", "at 12:30", or "at 1230". Date-only words like today/tomorrow/later are not reminders by themselves. repeat* true only if explicit.
 
 TIME INTERPRETATION:
-- "around 6", "at 6" with no AM/PM = 6 PM (hour: 18) unless context says morning
+- infer the next sensible occurrence from NOW
+- compact "1230" means 12:30
+- "around 6", "at 6" with no AM/PM = next 6 PM unless context says morning/wake/alarm
+- "at 9" at 8 PM means 9 PM; "at 9" at 11 PM means tomorrow 9 AM
+- "wake up at 8 in 3 days" means 8 AM three days from NOW
 - "tonight" = hour 20, "this evening" = hour 19, "tomorrow morning" = daysFromNow:1 hour:9
 - "in an hour" / "in 2 hours" - calculate from NOW
 
@@ -1847,7 +1981,7 @@ async function requestOpenAi({ apiKey, system, user, schema = aiRouteSchema(), s
       ? data.output.flatMap(item => item.content || []).map(part => part.text || '').join('\n')
       : '');
   if (!text.trim()) throw new Error(`Provider returned no text: ${JSON.stringify(data).slice(0, 500)}`);
-  return JSON.parse(text);
+  return parseJsonText(text);
 }
 
 function delay(ms) {
@@ -1889,62 +2023,158 @@ function geminiBackoffMs(attempt, data, headers) {
 
 async function requestGemini({ apiKey, system, user, schema = aiRouteSchema() }) {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(PROVIDERS.gemini.model)}:generateContent`;
-  const requestBody = {
-    systemInstruction: { parts: [{ text: `${system}\n\nReturn ONLY JSON matching this schema:\n${JSON.stringify(schema)}` }] },
+  const schemaText = JSON.stringify(schema);
+  const base = {
+    systemInstruction: { parts: [{ text: `${system}\n\nReturn ONLY a complete valid JSON object matching this schema. No markdown, no explanation:\n${schemaText}` }] },
     contents: [{ role: 'user', parts: [{ text: user }] }],
-    generationConfig: {
-      temperature: 0,
-      maxOutputTokens: 4096,
-      responseMimeType: 'application/json',
+  };
+  const requests = [
+    {
+      ...base,
+      generationConfig: { temperature: 0, maxOutputTokens: 8192, responseMimeType: 'application/json' },
     },
-  };
-  const requestBodyText = JSON.stringify(requestBody);
-  let resp = null;
-  let data = null;
-  let httpAttempts = 0;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    httpAttempts = attempt + 1;
-    resp = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      body: requestBodyText,
-    });
-    try {
-      data = await resp.json();
-    } catch {
-      data = { error: { code: resp.status, message: resp.statusText || 'Gemini request failed.' } };
+    {
+      ...base,
+      contents: [{
+        role: 'user',
+        parts: [{ text: `${user}\n\nReturn only a complete valid JSON object. Close every array/object. Schema:\n${schemaText}` }],
+      }],
+      generationConfig: { temperature: 0, maxOutputTokens: 8192, responseMimeType: 'application/json' },
+    },
+    {
+      ...base,
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: 8192,
+        responseMimeType: 'application/json',
+        responseJsonSchema: schema,
+      },
+    },
+  ];
+  let totalHttpAttempts = 0;
+  let totalRequestChars = 0;
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let lastError = null;
+
+  for (const requestBody of requests) {
+    const requestBodyText = JSON.stringify(requestBody);
+    totalRequestChars += requestBodyText.length;
+    let resp = null;
+    let data = null;
+    let httpAttempts = 0;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      httpAttempts = attempt + 1;
+      totalHttpAttempts += 1;
+      resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: requestBodyText,
+      });
+      try {
+        data = await resp.json();
+      } catch {
+        data = { error: { code: resp.status, message: resp.statusText || 'Gemini request failed.' } };
+      }
+      if (resp.ok || !isRetriableGeminiError(resp.status, data)) break;
+      const delayMs = geminiBackoffMs(attempt, data, resp.headers);
+      if (attempt >= 3 || delayMs == null) break;
+      await delay(delayMs);
     }
-    if (resp.ok || !isRetriableGeminiError(resp.status, data)) break;
-    const delayMs = geminiBackoffMs(attempt, data, resp.headers);
-    if (attempt >= 3 || delayMs == null) break;
-    await delay(delayMs);
+
+    totalRequestChars += requestBodyText.length * Math.max(0, httpAttempts - 1);
+    totalInputTokens += data?.usageMetadata?.promptTokenCount ?? 0;
+    totalOutputTokens += data?.usageMetadata?.candidatesTokenCount ?? 0;
+    lastProviderUsage = {
+      schemaName: 'gemini-json',
+      inputTokens: totalInputTokens || null,
+      outputTokens: totalOutputTokens || null,
+      requestChars: totalRequestChars,
+      httpAttempts: totalHttpAttempts,
+      systemChars: system.length,
+      userChars: user.length,
+      schemaChars: schemaText.length,
+    };
+
+    if (!resp.ok) {
+      lastError = new Error(JSON.stringify(data));
+      if (isRetriableGeminiError(resp.status, data)) break;
+      continue;
+    }
+    const text = data?.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('\n') || '';
+    if (!text.trim()) {
+      lastError = new Error(`Provider returned no text: ${JSON.stringify(data).slice(0, 500)}`);
+      continue;
+    }
+    try {
+      return parseJsonText(text);
+    } catch (error) {
+      lastError = error;
+    }
   }
-  lastProviderUsage = {
-    schemaName: 'gemini-json',
-    inputTokens: data?.usageMetadata?.promptTokenCount ?? null,
-    outputTokens: data?.usageMetadata?.candidatesTokenCount ?? null,
-    requestChars: requestBodyText.length * httpAttempts,
-    httpAttempts,
-    systemChars: system.length,
-    userChars: user.length,
-    schemaChars: JSON.stringify(schema).length,
-  };
-  if (!resp.ok) throw new Error(JSON.stringify(data));
-  const text = data?.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('\n') || '';
-  if (!text.trim()) throw new Error(`Provider returned no text: ${JSON.stringify(data).slice(0, 500)}`);
-  return JSON.parse(text);
+
+  throw lastError || new Error('Gemini request failed.');
+}
+
+function extractBalancedJsonCandidates(value) {
+  const candidates = [];
+  let start = -1;
+  let stack = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < value.length; i += 1) {
+    const ch = value[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+
+    if (ch === '"') {
+      if (start >= 0) inString = true;
+      continue;
+    }
+
+    if (ch === '{' || ch === '[') {
+      if (start < 0) {
+        start = i;
+        stack = [];
+      }
+      stack.push(ch === '{' ? '}' : ']');
+      continue;
+    }
+
+    if ((ch === '}' || ch === ']') && start >= 0) {
+      const expected = stack.pop();
+      if (expected !== ch) {
+        start = -1;
+        stack = [];
+        inString = false;
+        escaped = false;
+        continue;
+      }
+      if (stack.length === 0) {
+        candidates.push(value.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+
+  return candidates;
 }
 
 function parseJsonText(text) {
-  const raw = String(text || '').trim();
+  const raw = String(text || '').replace(/```json\s*/gi, '').replace(/```/g, '').trim();
   if (!raw) throw new Error('Provider returned no text.');
   try {
     return JSON.parse(raw);
   } catch {
-    const firstObject = raw.indexOf('{');
-    const lastObject = raw.lastIndexOf('}');
-    if (firstObject >= 0 && lastObject > firstObject) {
-      return JSON.parse(raw.slice(firstObject, lastObject + 1));
+    for (const candidate of extractBalancedJsonCandidates(raw)) {
+      try {
+        return JSON.parse(candidate);
+      } catch {}
     }
     throw new Error(`Provider returned text instead of JSON: ${raw.slice(0, 200)}`);
   }
@@ -2085,7 +2315,7 @@ ${AI_ROW_STYLE_RULES}
 - For any plan/routine, output the plan's actual useful rows, not meta tasks to choose, create, schedule, or research the plan.
 - Use concise row text, keep the user's register, and keep rows actionable.
 - Tasks get tier high/medium/low. Use high only for urgent/important, low for optional/light, otherwise medium.
-- Reminders only for explicit reminder/alarm/notify/repeat wording or a clear clock time like "at 4"; date-only words like today/tomorrow/later are not reminders by themselves.
+- Reminders only for explicit reminder/alarm/notify/repeat wording, scheduled-event wording with a time, or a clear clock time like "at 4", "at 12:30", or "at 1230"; date-only words like today/tomorrow/later are not reminders by themselves.
 - Set listId using WORKSPACE. If no destination is named or implied, use the default list.
 
 Return only JSON: {"tasks":[{"text":"bench press 3x8","tier":"medium","listId":"workout"}]}.`
@@ -2264,6 +2494,12 @@ async function runCase(provider, apiKey, caseName, promptOverride, promptVariant
       : mergeGeneratedTaskExpansionRows(parsedTasks, concreteGeneratedTasks, input);
   }
   parsed.tasks = dropCoveredCompoundTaskRows(dedupeAiTaskRows([...recoveredDirectTaskRowsFromRaw(input, Array.isArray(parsed.tasks) ? parsed.tasks : []), ...(Array.isArray(parsed.tasks) ? parsed.tasks : [])]));
+  if (taskRowsUnderfillGeneratedTopic(parsed.tasks, input)) {
+    parsed.tasks = mergeGeneratedTaskExpansionRows(parsed.tasks, fallbackGeneratedTaskRowsFromRaw(input), input);
+  }
+  if (parsed.tasks.length === 0 && (hasDirectTaskActionIntent(input) || hasScheduledEventStatement(input))) {
+    parsed.tasks = [taskDraftWithLocalReminder(input, 'medium')];
+  }
   let parsedGrocery = Array.isArray(parsed.grocery)
     ? parsed.grocery
       .map(item => normalizeGroceryItem(item, input, shouldInferGroceryQuantities(input)))
@@ -2340,6 +2576,159 @@ function printMeasure(result) {
   console.log(`${result.caseName} (${result.promptVariant}): approxInput=${result.approxInputTokens} systemChars=${result.systemChars} schemaChars=${result.schemaChars} requestChars=${result.requestChars}`);
 }
 
+const LOCAL_REMINDER_CASES = [
+  {
+    name: 'noon-colon-today',
+    now: '2026-05-12T09:00:00-04:00',
+    input: 'call physical therapy for Uber at 12:30',
+    expectText: 'call physical therapy for Uber',
+    expectReminder: true,
+    hour: 12,
+    minute: 30,
+    dayOffset: 0,
+  },
+  {
+    name: 'late-night-compact-next-noon',
+    now: '2026-05-12T23:00:00-04:00',
+    input: 'call an Uber for PT at 1230',
+    expectText: 'call an Uber for PT',
+    expectReminder: true,
+    hour: 12,
+    minute: 30,
+    dayOffset: 1,
+  },
+  {
+    name: 'evening-9-means-tonight',
+    now: '2026-05-12T20:00:00-04:00',
+    input: 'call grandma at 9',
+    expectText: 'call grandma',
+    expectReminder: true,
+    hour: 21,
+    minute: 0,
+    dayOffset: 0,
+  },
+  {
+    name: 'late-9-means-next-morning',
+    now: '2026-05-12T23:00:00-04:00',
+    input: 'call grandma at 9',
+    expectText: 'call grandma',
+    expectReminder: true,
+    hour: 9,
+    minute: 0,
+    dayOffset: 1,
+  },
+  {
+    name: 'explicit-am',
+    now: '2026-05-12T23:00:00-04:00',
+    input: 'call grandma at 9am',
+    expectText: 'call grandma',
+    expectReminder: true,
+    hour: 9,
+    minute: 0,
+    dayOffset: 1,
+  },
+  {
+    name: 'appointment-tomorrow-compact',
+    now: '2026-05-12T09:00:00-04:00',
+    input: 'i have an appointment tomorrow at 330',
+    expectText: 'appointment',
+    expectReminder: true,
+    hour: 15,
+    minute: 30,
+    dayOffset: 1,
+  },
+  {
+    name: 'wake-relative-days',
+    now: '2026-05-12T21:00:00-04:00',
+    input: 'remind me to wake up at 8 in 3 days',
+    expectText: 'wake up',
+    expectReminder: true,
+    hour: 8,
+    minute: 0,
+    dayOffset: 3,
+  },
+  {
+    name: 'meeting-today-compact',
+    now: '2026-05-12T09:00:00-04:00',
+    input: 'got a meeting at 1045',
+    expectText: 'meeting',
+    expectReminder: true,
+    hour: 10,
+    minute: 45,
+    dayOffset: 0,
+  },
+  {
+    name: 'date-only-is-not-reminder',
+    now: '2026-05-12T09:00:00-04:00',
+    input: 'call grandma tomorrow',
+    expectReminder: false,
+  },
+  {
+    name: 'plain-number-is-not-time',
+    now: '2026-05-12T09:00:00-04:00',
+    input: 'order 12 quick crimps for sv4',
+    expectReminder: false,
+  },
+  {
+    name: 'listing-task-no-time',
+    now: '2026-05-12T09:00:00-04:00',
+    input: 'Make a listing for custom orders on Etsy',
+    expectReminder: false,
+  },
+  {
+    name: 'tools-list-no-time',
+    now: '2026-05-12T09:00:00-04:00',
+    input: 'Make list of in-house tools vs shed tools',
+    expectReminder: false,
+  },
+  {
+    name: 'ring-doorbell-no-time',
+    now: '2026-05-12T09:00:00-04:00',
+    input: 'Set up Ring doorbell Wi-Fi again',
+    expectReminder: false,
+  },
+];
+
+function localCalendarDayOffset(nowMs, remindAt) {
+  const nowDate = new Date(nowMs);
+  const reminderDate = new Date(remindAt);
+  const nowStart = new Date(nowDate);
+  nowStart.setHours(0, 0, 0, 0);
+  const reminderStart = new Date(reminderDate);
+  reminderStart.setHours(0, 0, 0, 0);
+  return Math.round((reminderStart.getTime() - nowStart.getTime()) / 86400000);
+}
+
+function runLocalReminderCases() {
+  let failed = 0;
+  LOCAL_REMINDER_CASES.forEach((test) => {
+    const nowMs = new Date(test.now).getTime();
+    const draft = taskDraftWithLocalReminder(test.input, 'medium', null, nowMs);
+    const failures = [];
+    if (test.expectReminder && !draft.reminder) {
+      failures.push('expected reminder');
+    }
+    if (!test.expectReminder && draft.reminder) {
+      failures.push('expected no reminder');
+    }
+    if (test.expectText && draft.text !== test.expectText) {
+      failures.push(`expected text "${test.expectText}", got "${draft.text}"`);
+    }
+    if (draft.reminder && test.hour != null) {
+      const reminderDate = new Date(draft.reminder.remindAt);
+      if (reminderDate.getHours() !== test.hour) failures.push(`expected hour ${test.hour}, got ${reminderDate.getHours()}`);
+      if (reminderDate.getMinutes() !== test.minute) failures.push(`expected minute ${test.minute}, got ${reminderDate.getMinutes()}`);
+      const dayOffset = localCalendarDayOffset(nowMs, draft.reminder.remindAt);
+      if (dayOffset !== test.dayOffset) failures.push(`expected day offset ${test.dayOffset}, got ${dayOffset}`);
+    }
+    const status = failures.length ? 'FAIL' : 'PASS';
+    console.log(`[${status}] ${test.name}: ${test.input}${draft.reminder ? ` -> ${draft.text} @ ${new Date(draft.reminder.remindAt).toLocaleString()}` : ' -> no reminder'}`);
+    failures.forEach(failure => console.log(`  - ${failure}`));
+    if (failures.length) failed += 1;
+  });
+  return failed;
+}
+
 const args = parseArgs(process.argv);
 if (!PROMPT_VARIANTS.has(args.promptVariant)) {
   throw new Error(`Unknown prompt variant "${args.promptVariant}". Use ${Array.from(PROMPT_VARIANTS).join(', ')}.`);
@@ -2348,6 +2737,9 @@ if (args.modelOverride) {
   if (!PROVIDERS[args.provider]) throw new Error(`Unknown provider "${args.provider}". Use ${Object.keys(PROVIDERS).join(', ')}.`);
   PROVIDERS[args.provider].model = args.modelOverride;
 }
+if (args.localReminderOnly) {
+  process.exitCode = runLocalReminderCases() ? 1 : 0;
+} else {
 const apiKey = args.measureOnly ? '' : readSecret(args.provider);
 const caseNames = args.prompt
   ? ['custom']
@@ -2372,3 +2764,4 @@ for (const caseName of caseNames) {
 }
 
 process.exitCode = failed ? 1 : 0;
+}

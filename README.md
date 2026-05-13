@@ -9,15 +9,15 @@ The app is distributed as a signed Android APK through GitHub Releases. It is no
 The current public beta APK is published on GitHub Releases:
 
 - Latest release: https://github.com/3Dendeavors/Triority/releases/latest
-- Current beta: `v1.4.9`
+- Current beta: `v1.4.10`
 - Android package id: `com.triority`
-- Current APK: `Triority-v1.4.9.apk`
-- SHA-256: `4B9E642750CB3D68F3B537DAD998E1F00752D2F367EEAAF473023AD7F2C08105`
+- Current APK: `Triority-v1.4.10.apk`
+- SHA-256: `100674A4A4E78FBDE6F2B0584544DC18A45D89C1F7DCBB1B8167A9583FB4B38D`
 
 To install:
 
 1. Open the latest release page on your Android device.
-2. Under **Assets**, download `Triority-v1.4.9.apk`.
+2. Under **Assets**, download `Triority-v1.4.10.apk`.
 3. If Android asks, allow your browser or file manager to install unknown apps.
 4. Open the downloaded APK and tap **Install**.
 5. Launch Triority from your app drawer.
@@ -70,6 +70,6 @@ Experimental local AI smoke tests live in `scripts/ai-smoke-test.mjs`. They use 
 
 ## Current Status
 
-The current public beta is `v1.4.9` / `versionCode 25`, an AI reliability and task-handling release. It simplifies public AI provider choices to Gemini 2.5 Flash-Lite or Claude Sonnet, strengthens mixed task/grocery routing, improves generated grocery quantities and recipe fractions, makes new AI-created rows easier to find, and clarifies drag/drop between priority tiers.
+The current public beta is `v1.4.10` / `versionCode 26`, a task drag/drop accuracy release on top of the v1.4.9 AI reliability work. It keeps the Gemini 2.5 Flash-Lite and Claude Sonnet AI provider choices, strengthens timed-task reminder handling, and fixes long-list drag behavior so grabbed task rows stay under the finger during edge-scroll and bottom-of-list drops.
 
 Release pages must include the installable APK asset. The source-code archives attached to GitHub tags are not Android installers.
