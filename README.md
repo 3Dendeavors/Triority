@@ -1,44 +1,44 @@
 # Triority
 
-Triority is a private-first Android task, grocery, reminder, and AI triage app. It is built around quick capture, three practical priority tiers, optional Google sync, shared household-style lists, and bring-your-own AI provider access.
+Triority is a private-first Android task, grocery, reminder, and AI triage app. It is built around quick capture, three practical priority tiers, optional Google sync, shared household-style lists, Android voice widgets, and bring-your-own AI provider access.
 
-The app is distributed as a signed Android APK through GitHub Releases. It is not currently distributed through the Play Store, so installation is a normal Android sideload.
+Triority is distributed as a signed Android APK through GitHub Releases. It is not currently distributed through the Play Store, so installation is a normal Android sideload.
 
 ## Install
 
 The current public beta APK is published on GitHub Releases:
 
 - Latest release: https://github.com/3Dendeavors/Triority/releases/latest
-- Current beta: `v1.4.11`
+- Current beta: `v1.4.12`
 - Android package id: `com.triority`
-- Current APK: `Triority-v1.4.11.apk`
-- SHA-256: `4492CFEC6A2C26F4EF5D53D0452FEB244C8CC813B910E516B8EC17CEEBC992D6`
+- Current APK: `Triority-v1.4.12.apk`
+- SHA-256: `717953D2BAE21BE779E09ECE40B23F9789E53D43947AB0F0E6893AFB7516140D`
 
 To install:
 
 1. Open the latest release page on your Android device.
-2. Under **Assets**, download `Triority-v1.4.11.apk`.
+2. Under **Assets**, download `Triority-v1.4.12.apk`.
 3. If Android asks, allow your browser or file manager to install unknown apps.
 4. Open the downloaded APK and tap **Install**.
 5. Launch Triority from your app drawer.
 
 Use the APK asset for installs. The source-code `.zip` and `.tar.gz` files attached to GitHub tags are for developers and will not install the Android app.
 
-Future installed builds check this repo's `latest.json` and prompt when a newer APK is available. Installing a newer signed APK over the old one should preserve local app data as long as the package id and signing key match.
+Installed builds check this repo's `latest.json` and prompt when a newer APK is available. Installing a newer signed APK over the old one should preserve local app data as long as the package id and signing key match.
 
 ## What It Does
 
-Triority is meant for practical daily planning rather than project-management ceremony:
-
 - Tasks organized into High, Medium, and Low tiers.
-- Multiple task lists with drag reorder inside and between priority tiers, archive/restore support, and a short shine on newly added rows.
-- Built-in grocery list with category sorting, a Got It section, recipe/project quantities, and material-shopping categories.
+- Multiple task lists with drag reorder, archive/restore, reminders, and new-row focus shine.
+- Grocery/material list with category sorting, Got It, recipe/project quantities, and duplicate protection.
 - Shared task lists and one shared grocery page through optional sign-in and invite codes.
 - Local and shared task reminders, with each device alerting only when that user allows notifications.
 - Optional read-only Google Calendar conflict checks for reminder tasks.
-- Optional AI triage using your own Gemini or Claude Sonnet API key, Personal Context, and the current task/grocery workspace.
-- Themes, accent colors, and personal context for AI prompting.
-- Optional support through Buy Me a Coffee: https://buymeacoffee.com/3DEndeavors
+- Optional AI triage using your own Gemini or Claude Sonnet API key, Personal Context, and current task/grocery workspace.
+- Android launcher widgets for voice capture and Next Up previews.
+- Themes, accent colors, widget appearance controls, and optional support through Buy Me a Coffee.
+
+Support link: https://buymeacoffee.com/3DEndeavors
 
 ## Privacy
 
@@ -50,10 +50,10 @@ Network calls are limited to:
 - Supabase for current shared-list collaboration.
 - Google Calendar free/busy checks only when you enable calendar conflict checks.
 - The selected AI provider only when you provide an API key and use AI features.
+- GitHub for update checks.
+- Buy Me a Coffee only when you tap the support link.
 
 Google handles sign-in. Triority does not receive your Google password. Your AI provider key is stored locally with encrypted storage, is remembered per Google account on the same phone, and is not intentionally synced to the cloud.
-
-Signed-in users can use Settings > Delete Account Data to remove their synced Triority backup, sign out, clear local Triority data on that phone, remove the saved AI key, and cancel local reminders.
 
 Full policy: [PRIVACY.md](PRIVACY.md)
 
@@ -68,12 +68,14 @@ cd android
 .\gradlew.bat :app:createBundleReleaseJsAndAssets --rerun-tasks :app:assembleRelease --no-daemon
 ```
 
-Release signing files and Firebase config are intentionally not committed. See `scripts/prepare-github-release-secrets.ps1` for preparing GitHub Actions release secrets from local private files; after GitHub CLI authentication is valid, run it with `-Upload` to set the release workflow secrets.
+Release signing files and Firebase config are intentionally not committed. See `scripts/prepare-github-release-secrets.ps1` for preparing GitHub Actions release secrets from local private files.
 
-Experimental local AI smoke tests live in `scripts/ai-smoke-test.mjs`. They use ignored files under `_local_secrets/`, print only parsed row summaries and token usage when available, and are meant as a reversible helper for checking provider routing before manual phone testing.
+## Documentation Map
 
-## Current Status
+Public/user-facing docs:
 
-The current public beta is `v1.4.11` / `versionCode 27`, an account-restore and public-polish release on top of v1.4.10. It keeps the drag/drop accuracy and AI reminder fixes, adds better account restore feedback, syncs widget/calendar settings, remembers AI keys locally per Google account on the same phone, tightens grocery duplicate handling, and updates the public privacy policy.
+- [README.md](README.md): public overview, install path, setup notes, and doc map.
+- [PRIVACY.md](PRIVACY.md): public privacy policy.
+- [CHANGELOG.md](CHANGELOG.md): release notes.
 
-Release pages must include the installable APK asset. The source-code archives attached to GitHub tags are not Android installers.
+Maintainer notes and operational docs are kept in the local workspace and are not part of the public install surface.

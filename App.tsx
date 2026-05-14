@@ -2663,10 +2663,11 @@ function triorityLocalDataKeys(uid?: string): string[] {
     REMINDER_NAV_KEY,
     SYNC_LAST_REMOTE_KEY,
     SYNC_LAST_LOCAL_KEY,
+    SYNC_LOCAL_DIRTY_KEY,
     SYNC_CURRENT_UID_KEY,
   ];
   if (uid) {
-    keys.push(syncLastLocalKey(uid), syncLastRemoteKey(uid), syncAccountCacheKey(uid), accountAiProviderKey(uid));
+    keys.push(syncLastLocalKey(uid), syncLastRemoteKey(uid), syncLocalDirtyKey(uid), syncAccountCacheKey(uid), accountAiProviderKey(uid));
   }
   return keys;
 }
@@ -3736,6 +3737,7 @@ const SYNC_SCHEMA_VERSION = 1;
 const SYNC_DEBOUNCE_MS = 800;          // batch rapid edits into one write
 const SYNC_LAST_REMOTE_KEY = 'tri_sync_last_remote_at';   // mirrors remote updatedAt last seen
 const SYNC_LAST_LOCAL_KEY  = 'tri_sync_last_local_at';    // mirrors local updatedAt last written
+const SYNC_LOCAL_DIRTY_KEY = 'tri_sync_local_dirty_at';   // mirrors most recent local edit, even before cloud write
 const SYNC_CURRENT_UID_KEY = 'tri_sync_current_uid_v1';
 const SYNC_ACCOUNT_CACHE_PREFIX = 'tri_sync_account_cache_v1:';
 
@@ -3807,8 +3809,17 @@ function syncLastRemoteKey(uid: string) {
   return syncAccountKey(`${SYNC_LAST_REMOTE_KEY}:`, uid);
 }
 
+function syncLocalDirtyKey(uid: string) {
+  return syncAccountKey(`${SYNC_LOCAL_DIRTY_KEY}:`, uid);
+}
+
 function syncAccountCacheKey(uid: string) {
   return syncAccountKey(SYNC_ACCOUNT_CACHE_PREFIX, uid);
+}
+
+function parseSyncTimestamp(value: string | null | undefined) {
+  const parsed = value ? parseInt(value, 10) : 0;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
 // ─── Shared list helpers (Phase 2) ────────────────────────────────────────────
@@ -5907,8 +5918,8 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 27;
-const CURRENT_APP_VERSION_NAME = '1.4.11';
+const CURRENT_APP_VERSION_CODE = 28;
+const CURRENT_APP_VERSION_NAME = '1.4.12';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {
@@ -6045,7 +6056,6 @@ function parseCollapsedGroups(raw: string | null): CollapsedGroups {
 async function loadAll() {
   const version = await AsyncStorage.getItem('tri_version');
   if (version !== APP_VERSION) {
-    await AsyncStorage.multiRemove(['tri_tasks', 'tri_archive', 'tri_lists', 'tri_active_list_id']);
     await AsyncStorage.setItem('tri_version', APP_VERSION);
   }
   const [listsRaw, legacyTasks, archive, activeIdRaw, legacyAccent, accentLightRaw, accentDarkRaw, themeRaw, darkMode, defaultTier, autoClear, context, onboarded, widgetOnboardingSeenRaw, listOrderRaw, customThemeRaw, customThemesRaw, groceryRaw, collapsedGroupsRaw, widgetThemeRaw, widgetClearRaw, widgetShorthandRaw, widgetCustomColorsRaw, widgetMicSideRaw, aiProviderRaw] = await Promise.all([
@@ -14075,16 +14085,36 @@ function TriorityApp() {
   const openedReminderTargetsRef = useRef<{ target: ReminderNavTarget; openedAt: number }[]>([]);
   const apiKeyRef = useRef(apiKey);
   const aiProviderRef = useRef(aiProvider);
+  // Track which uid the sync cycle is bound to, so local edits can be marked
+  // account-scoped even before their debounced Firestore write lands.
+  const activeUidRef = useRef<string | null>(null);
+  const localDirtyAtRef = useRef(0);
   useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
   useEffect(() => { aiProviderRef.current = aiProvider; }, [aiProvider]);
 
+  const markLocalDirty = useCallback((timestamp = Date.now()) => {
+    const dirtyAt = Math.max(localDirtyAtRef.current + 1, timestamp);
+    localDirtyAtRef.current = dirtyAt;
+    AsyncStorage.setItem(SYNC_LOCAL_DIRTY_KEY, String(dirtyAt)).catch(() => {});
+    const uid = activeUidRef.current;
+    if (uid) AsyncStorage.setItem(syncLocalDirtyKey(uid), String(dirtyAt)).catch(() => {});
+  }, []);
+
+  const clearLocalDirty = useCallback((uid: string, dirtyAtThrough: number) => {
+    if (localDirtyAtRef.current > dirtyAtThrough) return;
+    localDirtyAtRef.current = 0;
+    AsyncStorage.multiRemove([SYNC_LOCAL_DIRTY_KEY, syncLocalDirtyKey(uid)]).catch(() => {});
+  }, []);
+
   const persistGrocery = (items: GroceryItem[]) => {
+    markLocalDirty();
     AsyncStorage.setItem('tri_grocery', JSON.stringify(items)).catch(() => {});
   };
   const setViewingSharedGrocery = useCallback((viewShared: boolean) => {
+    markLocalDirty();
     setViewingSharedGroceryState(viewShared);
     AsyncStorage.setItem(SHARED_GROCERY_TOGGLE_KEY, viewShared ? '1' : '0').catch(() => {});
-  }, []);
+  }, [markLocalDirty]);
   const setCollapsedGroup = useCallback((key: string, collapsed: boolean) => {
     setCollapsedGroupsState(prev => {
       const next = { ...prev, [key]: collapsed };
@@ -14093,10 +14123,11 @@ function TriorityApp() {
     });
   }, []);
   const setCalendarConflictsEnabled = useCallback((enabled: boolean) => {
+    markLocalDirty();
     setCalendarConflictsEnabledState(enabled);
     if (!enabled) setCalendarConflictKeys(new Set());
     AsyncStorage.setItem(CALENDAR_CONFLICTS_ENABLED_KEY, enabled ? '1' : '0').catch(() => {});
-  }, []);
+  }, [markLocalDirty]);
   const requestCalendarConflictAccess = useCallback(async () => {
     try {
       const token = await getCalendarFreeBusyAccessToken();
@@ -14496,8 +14527,6 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
   const lastSyncedAtRef = useRef<number>(0);
   // Debounce timer ID — restart on every change.
   const writeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Track which uid this effect cycle is bound to, so a sign-out cleanly halts.
-  const activeUidRef = useRef<string | null>(null);
   const saveAccountCache = useCallback(async (uid: string, data: SyncedState) => {
     const cache: AccountCache = { savedAt: Date.now(), data: stripUndefined(data) };
     await AsyncStorage.setItem(syncAccountCacheKey(uid), JSON.stringify(cache));
@@ -14600,9 +14629,14 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
         const snap = await getDoc(ref);
         if (cancelled || activeUidRef.current !== uid) return;
 
-        const legacyLocalLastWrittenRaw = !previousUid ? await AsyncStorage.getItem(SYNC_LAST_LOCAL_KEY) : null;
+        const legacyLocalLastWrittenRaw = !isAccountSwitch ? await AsyncStorage.getItem(SYNC_LAST_LOCAL_KEY) : null;
         const localLastWrittenRaw = await AsyncStorage.getItem(syncLastLocalKey(uid)) || legacyLocalLastWrittenRaw;
-        const localLastWritten = localLastWrittenRaw ? parseInt(localLastWrittenRaw, 10) : 0;
+        const localLastWritten = parseSyncTimestamp(localLastWrittenRaw);
+        const localDirtyRaw = await AsyncStorage.getItem(syncLocalDirtyKey(uid));
+        const legacyLocalDirtyRaw = !isAccountSwitch ? await AsyncStorage.getItem(SYNC_LOCAL_DIRTY_KEY) : null;
+        const localDirtyAt = Math.max(parseSyncTimestamp(localDirtyRaw), parseSyncTimestamp(legacyLocalDirtyRaw));
+        const localFreshAt = Math.max(localLastWritten, localDirtyAt);
+        localDirtyAtRef.current = Math.max(localDirtyAtRef.current, localDirtyAt);
         const cachedAccount = await loadAccountCache(uid).catch(() => null);
 
         const finishRestore = async (baselineAt: number) => {
@@ -14622,8 +14656,9 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
           const remoteAt = typeof remote?.updatedAt === 'number' ? remote.updatedAt : 0;
           const remoteData = remote?.data;
           const sameSchema = remote?.schemaVersion === SYNC_SCHEMA_VERSION;
-          if (remoteData && sameSchema && (isAccountSwitch || remoteAt > localLastWritten)) {
-            // Remote is newer than what we last wrote — restore.
+          if (remoteData && sameSchema && (isAccountSwitch || remoteAt > localFreshAt)) {
+            // Remote is newer than local device state — restore. localFreshAt
+            // includes dirty edits that have not reached Firestore yet.
             justRestoredRef.current = true;
             setAccountRestoreStatus('Restoring account data...');
             const restoredData = fillLocalOnlySyncSettings(remoteData, cachedAccount?.data);
@@ -14633,6 +14668,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
             await AsyncStorage.setItem(SYNC_LAST_REMOTE_KEY, String(remoteAt));
             await AsyncStorage.setItem(SYNC_LAST_LOCAL_KEY, String(remoteAt));
             await saveAccountCache(uid, restoredData).catch(() => {});
+            clearLocalDirty(uid, Number.MAX_SAFE_INTEGER);
             // Drop the suppression flag a tick later — long enough for the
             // state-applied effects to settle and trigger one watcher pass.
             await finishRestore(remoteAt);
@@ -14650,7 +14686,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
           await finishRestore(fallbackAt);
           return;
         }
-        lastSyncedAtRef.current = localLastWritten;
+        lastSyncedAtRef.current = localFreshAt;
         await AsyncStorage.setItem(SYNC_CURRENT_UID_KEY, uid).catch(() => {});
         setSyncWriteReady(true);
         setAccountRestoreStatus(null);
@@ -14667,7 +14703,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
       if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
       writeTimerRef.current = null;
     };
-  }, [fillLocalOnlySyncSettings, loadAccountCache, ready, restoreAccountApiSettings, saveAccountApiSettings, saveAccountCache, syncUser?.uid]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [clearLocalDirty, fillLocalOnlySyncSettings, loadAccountCache, ready, restoreAccountApiSettings, saveAccountApiSettings, saveAccountCache, syncUser?.uid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Watcher: debounce-write the slice on change.
   useEffect(() => {
@@ -14681,7 +14717,9 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
       const uid = activeUidRef.current;
       if (!uid) return;
       const updatedAt = Date.now();
-      const blob = buildSyncBlob(sliceRef.current, updatedAt);
+      const dirtyAtForWrite = localDirtyAtRef.current;
+      const sliceSnapshot = sliceRef.current;
+      const blob = buildSyncBlob(sliceSnapshot, updatedAt);
       try {
         const db = getFirestore(getApp());
         await setDoc(doc(db, 'users', uid), blob);
@@ -14691,7 +14729,8 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
         await AsyncStorage.setItem(SYNC_LAST_LOCAL_KEY, String(updatedAt));
         await AsyncStorage.setItem(SYNC_LAST_REMOTE_KEY, String(updatedAt));
         await AsyncStorage.setItem(SYNC_CURRENT_UID_KEY, uid);
-        await saveAccountCache(uid, sliceRef.current).catch(() => {});
+        await saveAccountCache(uid, sliceSnapshot).catch(() => {});
+        clearLocalDirty(uid, dirtyAtForWrite);
       } catch {
         // Permission denied, network failure, etc. Local data is fine; we'll
         // retry on the next state change. Persistence is not gated on Firestore.
@@ -14701,7 +14740,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     return () => {
       if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
     };
-  }, [ready, saveAccountCache, syncUser?.uid, syncWriteReady, syncedSlice]);
+  }, [clearLocalDirty, ready, saveAccountCache, syncUser?.uid, syncWriteReady, syncedSlice]);
 
   // Apply a restored remote slice back into local state + AsyncStorage. Mirrors
   // the writes that loadAll() does so the local cache stays consistent.
@@ -14796,7 +14835,10 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     setShowOnboarding(true);
   };
 
-  const persistLists = (next: TaskList[]) => { AsyncStorage.setItem('tri_lists', JSON.stringify(next)).catch(() => {}); };
+  const persistLists = (next: TaskList[]) => {
+    markLocalDirty();
+    AsyncStorage.setItem('tri_lists', JSON.stringify(next)).catch(() => {});
+  };
 
   // Refs let reorderLists read the current shared-id set without forming
   // a forward-reference dependency on sharedTaskIdSet (which is declared
@@ -14934,9 +14976,10 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
   }, [setListTasks]);
 
   const setActiveListId = useCallback((id: string) => {
+    markLocalDirty();
     setActiveListIdState(id);
     AsyncStorage.setItem('tri_active_list_id', JSON.stringify(id)).catch(() => {});
-  }, []);
+  }, [markLocalDirty]);
 
   const addList = useCallback((name: string, color?: string) => {
     const id = `list_${Date.now()}`;
@@ -14977,43 +15020,52 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
   }, [activeListId, setActiveListId]);
 
   const setArchive = useCallback((fn: (prev: ArchivedTask[]) => ArchivedTask[]) => {
+    markLocalDirty();
     setArchiveState(prev => { const next = fn(prev); AsyncStorage.setItem('tri_archive', JSON.stringify(next)); return next; });
-  }, []);
+  }, [markLocalDirty]);
 
   const setAccentLight = (v: string | null) => {
+    markLocalDirty();
     setAccentLightState(v);
     if (v == null) AsyncStorage.removeItem('tri_accent_light').catch(() => {});
     else AsyncStorage.setItem('tri_accent_light', JSON.stringify(v)).catch(() => {});
   };
   const setAccentDark = (v: string | null) => {
+    markLocalDirty();
     setAccentDarkState(v);
     if (v == null) AsyncStorage.removeItem('tri_accent_dark').catch(() => {});
     else AsyncStorage.setItem('tri_accent_dark', JSON.stringify(v)).catch(() => {});
   };
-  const setThemeId = (v: string) => { setThemeIdState(v); AsyncStorage.setItem('tri_theme', JSON.stringify(v)).catch(() => {}); };
+  const setThemeId = (v: string) => { markLocalDirty(); setThemeIdState(v); AsyncStorage.setItem('tri_theme', JSON.stringify(v)).catch(() => {}); };
   const setWidgetThemeId = (v: WidgetThemeId) => {
+    markLocalDirty();
     const next = v === WIDGET_THEME_MATCH_APP || v === WIDGET_THEME_CUSTOM ? v : resolveThemeId(v);
     setWidgetThemeIdState(next);
     AsyncStorage.setItem(WIDGET_THEME_KEY, JSON.stringify(next)).catch(() => {});
   };
   const setWidgetClear = (v: boolean) => {
+    markLocalDirty();
     setWidgetClearState(v);
     AsyncStorage.setItem(WIDGET_CLEAR_KEY, v ? '1' : '0').catch(() => {});
   };
   const setWidgetShorthand = (v: boolean) => {
+    markLocalDirty();
     setWidgetShorthandState(v);
     AsyncStorage.setItem(WIDGET_SHORTHAND_KEY, v ? '1' : '0').catch(() => {});
   };
   const setWidgetCustomColors = (v: WidgetCustomColors) => {
+    markLocalDirty();
     setWidgetCustomColorsState(v);
     AsyncStorage.setItem(WIDGET_CUSTOM_COLORS_KEY, JSON.stringify(v)).catch(() => {});
   };
   const setWidgetMicSide = (v: WidgetMicSide) => {
+    markLocalDirty();
     const next = v === 'right' ? 'right' : 'left';
     setWidgetMicSideState(next);
     AsyncStorage.setItem(WIDGET_MIC_SIDE_KEY, JSON.stringify(next)).catch(() => {});
   };
   const setCustomThemeDrafts = (drafts: (CustomThemeDraft | null)[]) => {
+    markLocalDirty();
     setCustomThemeDraftsState(drafts);
     AsyncStorage.setItem('tri_custom_themes', JSON.stringify(drafts)).catch(() => {});
   };
@@ -15031,9 +15083,9 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     EncryptedStorage.setItem(API_KEY_STORAGE_KEY, trimmed).catch(() => {});
     if (syncUser?.uid) saveAccountApiSettings(syncUser.uid, trimmed, aiProvider).catch(() => {});
   };
-  const setPersonalContext = (v: string) => { setPersonalContextState(v); AsyncStorage.setItem('triority-context', JSON.stringify(v)).catch(() => {}); };
-  const setAutoClear = (v: AutoClear) => { setAutoClearState(v); AsyncStorage.setItem('tri_autoClear', JSON.stringify(v)).catch(() => {}); };
-  const setDarkMode = (v: boolean) => { setDarkModeState(v); AsyncStorage.setItem('tri_darkMode', JSON.stringify(v)).catch(() => {}); };
+  const setPersonalContext = (v: string) => { markLocalDirty(); setPersonalContextState(v); AsyncStorage.setItem('triority-context', JSON.stringify(v)).catch(() => {}); };
+  const setAutoClear = (v: AutoClear) => { markLocalDirty(); setAutoClearState(v); AsyncStorage.setItem('tri_autoClear', JSON.stringify(v)).catch(() => {}); };
+  const setDarkMode = (v: boolean) => { markLocalDirty(); setDarkModeState(v); AsyncStorage.setItem('tri_darkMode', JSON.stringify(v)).catch(() => {}); };
 
   const customSlotIndex = /^custom_([012])$/.exec(themeId)?.[1];
   const activeCustomDraft = customSlotIndex != null

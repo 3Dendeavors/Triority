@@ -1,8 +1,8 @@
 {
-  "versionName": "1.4.11",
-  "versionCode": 27,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.11/Triority-v1.4.11.apk",
-  "releaseNotes": "Account restore polish: sign-in/account switching now shows restore feedback only while account data is actually being restored, widget and calendar conflict settings sync with the account, AI keys are remembered locally per Google account on the same phone, grocery duplicate checks are stricter, and the public privacy policy is updated.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.11",
+  "versionName": "1.4.12",
+  "versionCode": 28,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.12/Triority-v1.4.12.apk",
+  "releaseNotes": "Sync hotfix: recent task/list edits now stay protected while their cloud backup write is pending, and normal app-version marker changes no longer clear local task/list/archive data.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.12",
   "required": false
 }
