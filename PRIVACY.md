@@ -51,7 +51,9 @@ Depending on the features you use, Triority may connect to:
 
 ## Data Deletion
 
-Local data can be removed by clearing app data or uninstalling Triority. Signed-in sync and shared-list data may also exist in Firebase or Supabase. A dedicated in-app account/data deletion flow is planned; until then, users can request help through the project owner or repository contact path.
+Settings includes a Delete Account Data action for signed-in users. It deletes the synced Triority backup for the current Google account, signs out, clears Triority data on that phone, removes the saved AI key, and cancels local reminders.
+
+Shared collaboration records are separate from the private sync backup. Shared lists that other people can access are not silently deleted by the account-data button; owners should delete or make those lists private from the shared-list controls when they want to remove shared data for everyone.
 
 ## Changes
 
