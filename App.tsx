@@ -220,6 +220,41 @@ function cleanOptionalGroceryPart(value: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function groceryDuplicatePart(value: unknown): string {
+  return cleanOptionalGroceryPart(value)
+    ?.toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim() ?? '';
+}
+
+function groceryDuplicateName(value: unknown): string {
+  const name = typeof value === 'string' ? splitPackageHintFromName(value).name : value;
+  return groceryDuplicatePart(name).replace(/^(?:1|one)\s+/, '');
+}
+
+function groceryDuplicateKey(item: { name?: string; quantity?: string; unit?: string; packageSize?: string }): string {
+  return groceryDuplicateName(item.name);
+}
+
+function filterUncheckedGroceryDuplicates<T extends Pick<GroceryDraft, 'name' | 'quantity' | 'unit' | 'packageSize'>>(
+  incoming: T[],
+  existing: Array<{ name?: string; quantity?: string; unit?: string; packageSize?: string; checked?: boolean }>,
+): T[] {
+  const seen = new Set(existing
+    .filter((item) => !item.checked)
+    .map(groceryDuplicateKey)
+    .filter(Boolean));
+  const out: T[] = [];
+  for (const item of incoming) {
+    const key = groceryDuplicateKey(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
 const COMMON_GROCERY_FRACTIONS: Array<[number, string]> = [
   [1 / 8, '1/8'],
   [1 / 6, '1/6'],
@@ -2554,6 +2589,87 @@ const GOOGLE_CALENDAR_LIST_SCOPE = 'https://www.googleapis.com/auth/calendar.cal
 const CALENDAR_CONFLICT_WINDOW_MS = 30 * 60 * 1000;
 const REMINDER_NAV_KEY = 'tri_pending_reminder_nav_v1';
 const SHARED_STALE_RESTORE_CUTOFF_MS = new Date('2026-05-07T00:00:00-04:00').getTime();
+const API_KEY_STORAGE_KEY = 'triority-api-key';
+const API_KEY_ACCOUNT_STORAGE_PREFIX = 'triority-api-key-v1:';
+const AI_PROVIDER_ACCOUNT_KEY_PREFIX = `${AI_PROVIDER_KEY}:account:`;
+
+function normalizeWidgetThemeId(value: unknown): WidgetThemeId {
+  if (typeof value !== 'string') return WIDGET_THEME_MATCH_APP;
+  if (value === WIDGET_THEME_LEGACY_CLEAR || value === WIDGET_THEME_MATCH_APP) return WIDGET_THEME_MATCH_APP;
+  if (value === WIDGET_THEME_CUSTOM) return WIDGET_THEME_CUSTOM;
+  return resolveThemeId(value);
+}
+
+function normalizeWidgetCustomColors(value: unknown): WidgetCustomColors {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return DEFAULT_WIDGET_CUSTOM_COLORS;
+  const parsed = value as Partial<WidgetCustomColors>;
+  const text = typeof parsed.text === 'string' && /^#[0-9a-fA-F]{6}$/.test(parsed.text)
+    ? parsed.text
+    : DEFAULT_WIDGET_CUSTOM_COLORS.text;
+  const accent = typeof parsed.accent === 'string' && /^#[0-9a-fA-F]{6}$/.test(parsed.accent)
+    ? parsed.accent
+    : DEFAULT_WIDGET_CUSTOM_COLORS.accent;
+  return { text, accent };
+}
+
+function normalizeWidgetMicSide(value: unknown): WidgetMicSide {
+  return value === 'right' ? 'right' : 'left';
+}
+
+function accountApiKeyKey(uid: string) {
+  return syncAccountKey(API_KEY_ACCOUNT_STORAGE_PREFIX, uid);
+}
+
+function accountAiProviderKey(uid: string) {
+  return syncAccountKey(AI_PROVIDER_ACCOUNT_KEY_PREFIX, uid);
+}
+
+function triorityLocalDataKeys(uid?: string): string[] {
+  const keys = [
+    'tri_version',
+    'tri_lists',
+    'tri_tasks',
+    'tri_archive',
+    'tri_active_list_id',
+    'tri_accent',
+    'tri_accent_light',
+    'tri_accent_dark',
+    'tri_theme',
+    'tri_darkMode',
+    'tri_defaultTier',
+    'tri_autoClear',
+    'triority-context',
+    'tri_onboarded',
+    'tri_is_paid',
+    'tri_list_order',
+    'tri_custom_theme',
+    'tri_custom_themes',
+    'tri_grocery',
+    SHARED_JOINED_LISTS_KEY,
+    SHARED_TASK_ORDER_KEY,
+    LIST_ROW_ORDER_KEY,
+    SHARED_GROCERY_TOGGLE_KEY,
+    SUPABASE_SHARED_GROCERY_ID_KEY,
+    SHARED_CACHE_KEY,
+    COLLAPSED_GROUPS_KEY,
+    CALENDAR_CONFLICTS_ENABLED_KEY,
+    WIDGET_THEME_KEY,
+    WIDGET_CLEAR_KEY,
+    WIDGET_SHORTHAND_KEY,
+    WIDGET_CUSTOM_COLORS_KEY,
+    WIDGET_MIC_SIDE_KEY,
+    WIDGET_ONBOARDING_RELEASE_KEY,
+    AI_PROVIDER_KEY,
+    REMINDER_NAV_KEY,
+    SYNC_LAST_REMOTE_KEY,
+    SYNC_LAST_LOCAL_KEY,
+    SYNC_CURRENT_UID_KEY,
+  ];
+  if (uid) {
+    keys.push(syncLastLocalKey(uid), syncLastRemoteKey(uid), syncAccountCacheKey(uid), accountAiProviderKey(uid));
+  }
+  return keys;
+}
 
 function anthropicTextFromResponse(data: any) {
   const blocks = Array.isArray(data?.content) ? data.content : [];
@@ -3440,6 +3556,7 @@ function withTimeout<T>(promise: PromiseLike<T>, ms: number, message: string): P
 // these URLs. The button hides itself if BOTH URLs are empty.
 const TRIORITY_PATREON_URL = '';
 const TRIORITY_BMAC_URL = 'https://buymeacoffee.com/3DEndeavors';
+const TRIORITY_PRIVACY_URL = 'https://github.com/3Dendeavors/Triority/blob/main/PRIVACY.md';
 
 // Legacy constants retained so existing references compile. The stub provider
 // below ignores RC_API_KEY_ANDROID; deleting it would just be churn for the
@@ -3629,11 +3746,17 @@ interface SyncedState {
   accentLight: string | null;
   accentDark: string | null;
   themeId: string;
+  widgetThemeId?: WidgetThemeId;
+  widgetClear?: boolean;
+  widgetShorthand?: boolean;
+  widgetCustomColors?: WidgetCustomColors;
+  widgetMicSide?: WidgetMicSide;
   customThemeDrafts: (CustomThemeDraft | null)[];
   personalContext: string;
   defaultTier: Tier;
   autoClear: AutoClear;
   darkMode: boolean;
+  calendarConflictsEnabled?: boolean;
   groceryItems: GroceryItem[];
   // Phase 2 additions — round-trip across reinstall so a fresh device knows
   // which shared lists this user is in and which grocery slice they were
@@ -4796,10 +4919,11 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
 
   const addSharedGroceryItems = useCallback(async (listId: string, items: GroceryDraft[]) => {
     if (!user) throw new Error('Not signed in');
-    if (items.length === 0) return [];
+    const filteredItems = filterUncheckedGroceryDuplicates(items, sharedItems[listId] || []);
+    if (filteredItems.length === 0) return [];
     if (isSupabaseSharedListId(listId)) {
       const now = Date.now();
-      const rows = items
+      const rows = filteredItems
         .map((it) => ({
           id: randomUuid(),
           list_id: listId,
@@ -4831,7 +4955,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     const now = Date.now();
     const batch = writeBatch(db);
     const ids: string[] = [];
-    for (const it of items) {
+    for (const it of filteredItems) {
       const name = it.name.trim();
       if (!name) continue;
       const ref = doc(collection(db, 'sharedLists', listId, 'items'));
@@ -4852,7 +4976,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     }
     await batch.commit();
     return ids;
-  }, [user]);
+  }, [sharedItems, user]);
 
   const updateSharedGroceryItem = useCallback(async (listId: string, itemId: string, patch: { name?: string; category?: string; checked?: boolean }) => {
     if (!user) throw new Error('Not signed in');
@@ -4948,7 +5072,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       }
       throw error;
     }
-  }, [user]);
+  }, [sharedItems, user]);
 
   const deleteSharedGroceryItem = useCallback(async (listId: string, itemId: string) => {
     if (!user) throw new Error('Not signed in');
@@ -4990,7 +5114,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       }
       throw error;
     }
-  }, [user]);
+  }, [sharedItems, user]);
 
   const deleteSharedGroceryItems = useCallback(async (listId: string, itemIds: string[]) => {
     if (!user) throw new Error('Not signed in');
@@ -5783,8 +5907,8 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 26;
-const CURRENT_APP_VERSION_NAME = '1.4.10';
+const CURRENT_APP_VERSION_CODE = 27;
+const CURRENT_APP_VERSION_NAME = '1.4.11';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {
@@ -5885,11 +6009,17 @@ function emptySyncedState(): SyncedState {
     accentLight: null,
     accentDark: null,
     themeId: 'slate',
+    widgetThemeId: WIDGET_THEME_MATCH_APP,
+    widgetClear: false,
+    widgetShorthand: true,
+    widgetCustomColors: DEFAULT_WIDGET_CUSTOM_COLORS,
+    widgetMicSide: 'left',
     customThemeDrafts: [null, null, null],
     personalContext: '',
     defaultTier: 'medium',
     autoClear: 'Never',
     darkMode: true,
+    calendarConflictsEnabled: false,
     groceryItems: [],
     joinedSharedLists: [],
     syncEnabledForGrocery: false,
@@ -5948,7 +6078,7 @@ async function loadAll() {
   // API key is stored encrypted for security
   let apiKey = '';
   try {
-    apiKey = await EncryptedStorage.getItem('triority-api-key') || '';
+    apiKey = await EncryptedStorage.getItem(API_KEY_STORAGE_KEY) || '';
   } catch {}
   let aiProvider = normalizeAiProvider(null, apiKey);
   if (aiProviderRaw) {
@@ -6077,24 +6207,13 @@ async function loadAll() {
   const groceryItems: GroceryItem[] = groceryRaw ? (JSON.parse(groceryRaw) as GroceryItem[]) : [];
   const widgetThemeParsed = widgetThemeRaw ? JSON.parse(widgetThemeRaw) as string : WIDGET_THEME_MATCH_APP;
   const widgetLegacyClear = widgetThemeParsed === WIDGET_THEME_LEGACY_CLEAR;
-  const widgetThemeId = widgetThemeParsed === WIDGET_THEME_MATCH_APP || widgetLegacyClear
-    ? WIDGET_THEME_MATCH_APP
-    : widgetThemeParsed === WIDGET_THEME_CUSTOM
-      ? WIDGET_THEME_CUSTOM
-      : resolveThemeId(widgetThemeParsed);
+  const widgetThemeId = normalizeWidgetThemeId(widgetThemeParsed);
   const widgetClear = widgetLegacyClear || widgetClearRaw === '1' || widgetClearRaw === 'true';
   const widgetShorthand = widgetShorthandRaw == null ? true : (widgetShorthandRaw === '1' || widgetShorthandRaw === 'true');
   let widgetCustomColors = DEFAULT_WIDGET_CUSTOM_COLORS;
   if (widgetCustomColorsRaw) {
     try {
-      const parsed = JSON.parse(widgetCustomColorsRaw) as Partial<WidgetCustomColors>;
-      const text = typeof parsed.text === 'string' && /^#[0-9a-fA-F]{6}$/.test(parsed.text)
-        ? parsed.text
-        : DEFAULT_WIDGET_CUSTOM_COLORS.text;
-      const customAccent = typeof parsed.accent === 'string' && /^#[0-9a-fA-F]{6}$/.test(parsed.accent)
-        ? parsed.accent
-        : DEFAULT_WIDGET_CUSTOM_COLORS.accent;
-      widgetCustomColors = { text, accent: customAccent };
+      widgetCustomColors = normalizeWidgetCustomColors(JSON.parse(widgetCustomColorsRaw));
     } catch {}
   }
   if (widgetLegacyClear) {
@@ -6102,7 +6221,7 @@ async function loadAll() {
     AsyncStorage.setItem(WIDGET_CLEAR_KEY, '1').catch(() => {});
   }
   const widgetMicSideParsed = widgetMicSideRaw ? JSON.parse(widgetMicSideRaw) as string : 'left';
-  const widgetMicSide: WidgetMicSide = widgetMicSideParsed === 'right' ? 'right' : 'left';
+  const widgetMicSide = normalizeWidgetMicSide(widgetMicSideParsed);
 
   return {
     lists,
@@ -6774,6 +6893,7 @@ const ICON_MAP: Record<string, { family: 'feather' | 'ionicons'; glyph: string }
   user:     { family: 'feather',  glyph: 'user' },
   users:    { family: 'feather',  glyph: 'users' },
   link:     { family: 'feather',  glyph: 'link' },
+  external: { family: 'feather',  glyph: 'external-link' },
   logIn:    { family: 'feather',  glyph: 'log-in' },
   'refresh-cw': { family: 'feather', glyph: 'refresh-cw' },
   heart:    { family: 'feather',  glyph: 'heart' },
@@ -8582,7 +8702,12 @@ function InputBar({ onAddMany, onAddManyToList, onTaskListRouted, onAddGroceryIt
   const [listening, setListening] = useState(false);
   const [widgetTier, setWidgetTier] = useState<Tier | null>(null);
   const addGroceryItemsSafely = useCallback((items: GroceryDraft[]) => {
-    return Promise.resolve(onAddGroceryItems(items)).catch((e) => {
+    return Promise.resolve(onAddGroceryItems(items)).then((ids) => {
+      if (Array.isArray(ids) && ids.length === 0 && items.length > 0) {
+        showToast('Already on grocery list');
+      }
+      return ids;
+    }).catch((e) => {
       showToast('Could not add groceries', e?.message || 'Check connection');
       return undefined;
     });
@@ -8717,7 +8842,7 @@ function InputBar({ onAddMany, onAddManyToList, onTaskListRouted, onAddGroceryIt
     if (aiMode && hasApiKey) {
       let storedKey = '';
       try {
-        storedKey = await EncryptedStorage.getItem('triority-api-key') || '';
+        storedKey = await EncryptedStorage.getItem(API_KEY_STORAGE_KEY) || '';
       } catch {}
       const storedCtx = await AsyncStorage.getItem('triority-context')
         .then(v => {
@@ -8990,7 +9115,8 @@ The tool input must include at least 6 items. Never return an empty items array.
             if (Array.isArray(groceryIds) && groceryIds[0]) {
               onGroceryOnlyAdded?.(groceryIds, totalTasks === 0);
             }
-            if (totalTasks === 0) showToast(`${grocItems.length} grocery item${grocItems.length !== 1 ? 's' : ''} added`);
+            const addedGroceryCount = Array.isArray(groceryIds) ? groceryIds.length : grocItems.length;
+            if (totalTasks === 0 && addedGroceryCount > 0) showToast(`${addedGroceryCount} grocery item${addedGroceryCount !== 1 ? 's' : ''} added`);
           }
           if (totalTasks === 0 && grocItems.length === 0) {
             showToast('Nothing parsed — try again');
@@ -11682,6 +11808,7 @@ interface SettingsProps {
   calendarConflictsEnabled: boolean;
   setCalendarConflictsEnabled: (enabled: boolean) => void;
   onRequestCalendarConflictAccess: () => Promise<boolean>;
+  onDeleteAccountData: () => Promise<void>;
 }
 
 function Toggle({ value, onChange, accent }: { value: boolean; onChange: (v: boolean) => void; accent: string }) {
@@ -12605,7 +12732,7 @@ function WidgetColorSheet({ initialColors, clear, onSave, onClose }: { initialCo
   );
 }
 
-function Settings({ accent, aiProvider, setAiProvider, apiKey, setApiKey, hasApiKey, setHasApiKey, personalContext, setPersonalContext, autoClear, setAutoClear, darkMode, setDarkMode, accentLight, accentDark, setAccentLight, setAccentDark, themeId, setThemeId, widgetThemeId, setWidgetThemeId, widgetClear, setWidgetClear, widgetShorthand, setWidgetShorthand, widgetCustomColors, setWidgetCustomColors, widgetMicSide, setWidgetMicSide, customThemeDrafts, setCustomThemeDrafts, onClearArchive, onReplayOnboarding, calendarConflictsEnabled, setCalendarConflictsEnabled, onRequestCalendarConflictAccess }: SettingsProps) {
+function Settings({ accent, aiProvider, setAiProvider, apiKey, setApiKey, hasApiKey, setHasApiKey, personalContext, setPersonalContext, autoClear, setAutoClear, darkMode, setDarkMode, accentLight, accentDark, setAccentLight, setAccentDark, themeId, setThemeId, widgetThemeId, setWidgetThemeId, widgetClear, setWidgetClear, widgetShorthand, setWidgetShorthand, widgetCustomColors, setWidgetCustomColors, widgetMicSide, setWidgetMicSide, customThemeDrafts, setCustomThemeDrafts, onClearArchive, onReplayOnboarding, calendarConflictsEnabled, setCalendarConflictsEnabled, onRequestCalendarConflictAccess, onDeleteAccountData }: SettingsProps) {
   const T = useT();
   const insets = useSafeAreaInsets();
   const isPaid = useIsPaid();
@@ -12679,6 +12806,24 @@ function Settings({ accent, aiProvider, setAiProvider, apiKey, setApiKey, hasApi
   const chooseAiProvider = (provider: AiProvider) => {
     setAiProvider(provider);
   };
+  const deleteAccountData = () => {
+    if (!syncUser) {
+      showSettingsToast('Sign in with Google first');
+      return;
+    }
+    confirm({
+      title: 'Delete Account Data',
+      message: 'This deletes your synced Triority backup for this Google account, signs out, clears Triority data on this phone, removes the saved AI key, and cancels local reminders. Shared lists other people can access are not deleted here.',
+      confirmLabel: 'Delete Data',
+      destructive: true,
+      onConfirm: () => {
+        showSettingsToast('Deleting account data...');
+        onDeleteAccountData()
+          .then(() => showSettingsToast('Account data deleted'))
+          .catch((e) => showSettingsToast(String(e?.message || 'Could not delete data').slice(0, 90)));
+      },
+    });
+  };
   const cardStyle = [styles.settingsCard, { backgroundColor: T.s1, borderColor: T.border }];
   const toggleCalendarConflicts = async (enabled: boolean) => {
     if (!enabled) {
@@ -12750,6 +12895,12 @@ function Settings({ accent, aiProvider, setAiProvider, apiKey, setApiKey, hasApi
               style={{ marginTop: 12, height: 38, borderRadius: 10, borderWidth: 1, borderColor: T.border, backgroundColor: T.s2, alignItems: 'center', justifyContent: 'center' }}
               activeOpacity={0.7}>
               <Text style={[styles.settingRowLabel, { color: T.textSub, fontFamily: jks('500'), fontSize: 13 }]}>Sign Out</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={deleteAccountData}
+              style={{ marginTop: 8, height: 38, borderRadius: 10, borderWidth: 1, borderColor: '#FF504066', backgroundColor: '#FF504012', alignItems: 'center', justifyContent: 'center' }}
+              activeOpacity={0.7}>
+              <Text style={[styles.settingRowLabel, { color: '#FF5040', fontFamily: jks('700'), fontSize: 13 }]}>Delete Account Data</Text>
             </TouchableOpacity>
           </View>
         ) : (
@@ -13086,9 +13237,13 @@ function Settings({ accent, aiProvider, setAiProvider, apiKey, setApiKey, hasApi
 
       <SettingsSection title="Help" />
       <View style={[cardStyle, { marginBottom: 16 }]}>
-        <SettingRow label="Show walkthrough again" subtitle="Replay the intro tour" noBorder
+        <SettingRow label="Show walkthrough again" subtitle="Replay the intro tour"
           onPress={onReplayOnboarding}
           right={<Text style={[styles.clearLabel, { color: accent, fontFamily: jks('400') }]}>Show</Text>} />
+        <SettingRow label="Privacy Policy" subtitle="How Triority handles app data"
+          onPress={() => Linking.openURL(TRIORITY_PRIVACY_URL)}
+          noBorder
+          right={<Icon name="external" size={14} color={accent} />} />
       </View>
 
       {hasSupportLink && (
@@ -13617,12 +13772,16 @@ function StandaloneGrocery({
   }, [clearLocalPendingGroceryGlow, onPendingGroceryGlowSeen]);
   const handleAddGroceryItems = useCallback((items: GroceryDraft[]) => {
     return Promise.resolve(onAddGroceryItems(items)).then((ids) => {
-      if (ids?.[0]) {
-        setFocusedGroceryId(ids[0]);
+      const cleanIds = (ids || []).filter(Boolean);
+      if (items.length > 0 && cleanIds.length === 0) {
+        showToast('Already on grocery list');
+      }
+      if (cleanIds[0]) {
+        setFocusedGroceryId(cleanIds[0]);
         setFocusedGroceryNonce(n => n + 1);
       }
-      armLocalPendingGroceryGlow((ids || []).slice(1));
-      return ids;
+      armLocalPendingGroceryGlow(cleanIds.slice(1));
+      return cleanIds;
     }).catch((e) => {
       showToast('Could not add groceries', e?.message || 'Check connection');
     });
@@ -13867,7 +14026,7 @@ function StandaloneGrocery({
 
 function TriorityApp() {
   const isPaid = useIsPaid();
-  const { user: syncUser } = useSync();
+  const { user: syncUser, signOut: syncSignOut } = useSync();
   const [showGroceryUpsell, setShowGroceryUpsell] = useState(false);
   const [ready, setReady] = useState(false);
   const [screen, setScreen] = useState<Screen>('list');
@@ -13905,6 +14064,7 @@ function TriorityApp() {
   const [focusedGroceryNonce, setFocusedGroceryNonce] = useState(0);
   const [pendingGroceryGlowIds, setPendingGroceryGlowIds] = useState<Record<string, number>>({});
   const [widgetImportToast, setWidgetImportToast] = useState<ToastData | null>(null);
+  const [accountRestoreStatus, setAccountRestoreStatus] = useState<string | null>(null);
   const widgetCaptureRunningRef = useRef(false);
   const widgetImportToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [calendarConflictsEnabled, setCalendarConflictsEnabledState] = useState(false);
@@ -13913,6 +14073,10 @@ function TriorityApp() {
   const [onboardingInitialStep, setOnboardingInitialStep] = useState(0);
   const activeReminderFiredRef = useRef<Set<string>>(new Set());
   const openedReminderTargetsRef = useRef<{ target: ReminderNavTarget; openedAt: number }[]>([]);
+  const apiKeyRef = useRef(apiKey);
+  const aiProviderRef = useRef(aiProvider);
+  useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
+  useEffect(() => { aiProviderRef.current = aiProvider; }, [aiProvider]);
 
   const persistGrocery = (items: GroceryItem[]) => {
     AsyncStorage.setItem('tri_grocery', JSON.stringify(items)).catch(() => {});
@@ -14001,7 +14165,8 @@ function TriorityApp() {
   }, []);
   const addGroceryItems = useCallback((items: GroceryDraft[]) => {
     const now = Date.now();
-    const newItems: GroceryItem[] = items.map((item, i) => ({
+    const filteredItems = filterUncheckedGroceryDuplicates(items, groceryItems);
+    const newItems: GroceryItem[] = filteredItems.map((item, i) => ({
       id: `groc_${now}_${i}`,
       name: item.name.trim(),
       category: item.category || GROCERY_UNCATEGORIZED,
@@ -14017,7 +14182,7 @@ function TriorityApp() {
       return next;
     });
     return newItems.map((item) => item.id);
-  }, []);
+  }, [groceryItems]);
 
   const checkGrocery = useCallback((id: string) => {
     setGroceryItemsState(prev => {
@@ -14051,7 +14216,7 @@ function TriorityApp() {
 
   const aiSortGrocery = useCallback(async (onDone?: () => void) => {
     let storedKey = '';
-    try { storedKey = await EncryptedStorage.getItem('triority-api-key') || ''; } catch {}
+    try { storedKey = await EncryptedStorage.getItem(API_KEY_STORAGE_KEY) || ''; } catch {}
     if (!storedKey || !isValidKey(storedKey, aiProvider)) { onDone?.(); return; }
     // Snapshot current items at call time — avoids stale closure inside setState
     const snapshot = groceryItems;
@@ -14298,19 +14463,26 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     accentLight,
     accentDark,
     themeId,
+    widgetThemeId,
+    widgetClear,
+    widgetShorthand,
+    widgetCustomColors,
+    widgetMicSide,
     customThemeDrafts,
     personalContext,
     defaultTier,
     autoClear,
     darkMode,
+    calendarConflictsEnabled,
     groceryItems,
     joinedSharedLists: syncedJoinedIds,
     syncEnabledForGrocery: viewingSharedGrocery,
     sharedTaskOrder,
     listRowOrder,
   }), [lists, activeListId, archive, accentLight, accentDark, themeId,
+       widgetThemeId, widgetClear, widgetShorthand, widgetCustomColors, widgetMicSide,
        customThemeDrafts, personalContext, defaultTier, autoClear, darkMode,
-       groceryItems, syncedJoinedIds, viewingSharedGrocery, sharedTaskOrder, listRowOrder]);
+       calendarConflictsEnabled, groceryItems, syncedJoinedIds, viewingSharedGrocery, sharedTaskOrder, listRowOrder]);
 
   const sliceRef = useRef(syncedSlice);
   useEffect(() => { sliceRef.current = syncedSlice; }, [syncedSlice]);
@@ -14336,6 +14508,59 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     const parsed = JSON.parse(raw) as AccountCache;
     return parsed?.data ? parsed : null;
   }, []);
+  const saveAccountApiSettings = useCallback(async (uid: string, key = apiKeyRef.current, provider = aiProviderRef.current) => {
+    const trimmed = key.trim();
+    if (trimmed) await EncryptedStorage.setItem(accountApiKeyKey(uid), trimmed);
+    else await EncryptedStorage.removeItem(accountApiKeyKey(uid));
+    await AsyncStorage.setItem(accountAiProviderKey(uid), JSON.stringify(normalizeAiProvider(provider, trimmed)));
+  }, []);
+  const restoreAccountApiSettings = useCallback(async (uid: string, allowGlobalFallback: boolean) => {
+    let restoredKey = '';
+    try {
+      restoredKey = await EncryptedStorage.getItem(accountApiKeyKey(uid)) || '';
+    } catch {}
+    if (!restoredKey && allowGlobalFallback) {
+      try {
+        restoredKey = await EncryptedStorage.getItem(API_KEY_STORAGE_KEY) || '';
+      } catch {}
+    }
+
+    let restoredProvider = normalizeAiProvider(null, restoredKey);
+    const providerRaw = await AsyncStorage.getItem(accountAiProviderKey(uid))
+      || (allowGlobalFallback ? await AsyncStorage.getItem(AI_PROVIDER_KEY) : null);
+    if (providerRaw) {
+      try {
+        restoredProvider = normalizeAiProvider(JSON.parse(providerRaw), restoredKey);
+      } catch {
+        restoredProvider = normalizeAiProvider(providerRaw, restoredKey);
+      }
+    }
+
+    setApiKeyState(restoredKey);
+    setAiProviderState(restoredProvider);
+    setHasApiKey(isValidKey(restoredKey, restoredProvider));
+    if (restoredKey) await EncryptedStorage.setItem(API_KEY_STORAGE_KEY, restoredKey).catch(() => {});
+    else await EncryptedStorage.removeItem(API_KEY_STORAGE_KEY).catch(() => {});
+    await AsyncStorage.setItem(AI_PROVIDER_KEY, JSON.stringify(restoredProvider)).catch(() => {});
+    if (restoredKey || providerRaw) await saveAccountApiSettings(uid, restoredKey, restoredProvider).catch(() => {});
+  }, [saveAccountApiSettings]);
+  const fillLocalOnlySyncSettings = useCallback((remoteData: SyncedState, fallbackData?: SyncedState | null): SyncedState => {
+    if (!fallbackData) return remoteData;
+    return {
+      ...remoteData,
+      widgetThemeId: remoteData.widgetThemeId ?? fallbackData.widgetThemeId,
+      widgetClear: remoteData.widgetClear ?? fallbackData.widgetClear,
+      widgetShorthand: remoteData.widgetShorthand ?? fallbackData.widgetShorthand,
+      widgetCustomColors: remoteData.widgetCustomColors ?? fallbackData.widgetCustomColors,
+      widgetMicSide: remoteData.widgetMicSide ?? fallbackData.widgetMicSide,
+      calendarConflictsEnabled: remoteData.calendarConflictsEnabled ?? fallbackData.calendarConflictsEnabled,
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!ready || !syncUser?.uid) return;
+    saveAccountApiSettings(syncUser.uid, apiKey, aiProvider).catch(() => {});
+  }, [aiProvider, apiKey, ready, saveAccountApiSettings, syncUser?.uid]);
 
   useEffect(() => {
     // Wait for AsyncStorage hydration before any sync activity.
@@ -14350,8 +14575,10 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
       if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
       writeTimerRef.current = null;
       lastSyncedAtRef.current = 0;
+      setAccountRestoreStatus(null);
       if (priorActiveUid) {
         saveAccountCache(priorActiveUid, sliceRef.current).catch(() => {});
+        saveAccountApiSettings(priorActiveUid).catch(() => {});
       }
       return;
     }
@@ -14364,9 +14591,12 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
         const ref = doc(db, 'users', uid);
         const previousUid = await AsyncStorage.getItem(SYNC_CURRENT_UID_KEY);
         const isAccountSwitch = !!previousUid && previousUid !== uid;
+        if (isAccountSwitch) setAccountRestoreStatus('Restoring account data...');
         if (priorActiveUid && priorActiveUid !== uid) {
           await saveAccountCache(priorActiveUid, sliceRef.current).catch(() => {});
+          await saveAccountApiSettings(priorActiveUid).catch(() => {});
         }
+        await restoreAccountApiSettings(uid, !isAccountSwitch).catch(() => {});
         const snap = await getDoc(ref);
         if (cancelled || activeUidRef.current !== uid) return;
 
@@ -14382,6 +14612,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
             if (!cancelled && activeUidRef.current === uid) {
               justRestoredRef.current = false;
               setSyncWriteReady(true);
+              setAccountRestoreStatus(null);
             }
           }, 1500);
         };
@@ -14394,12 +14625,14 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
           if (remoteData && sameSchema && (isAccountSwitch || remoteAt > localLastWritten)) {
             // Remote is newer than what we last wrote — restore.
             justRestoredRef.current = true;
-            applyRestoredState(remoteData);
+            setAccountRestoreStatus('Restoring account data...');
+            const restoredData = fillLocalOnlySyncSettings(remoteData, cachedAccount?.data);
+            applyRestoredState(restoredData);
             await AsyncStorage.setItem(syncLastRemoteKey(uid), String(remoteAt));
             await AsyncStorage.setItem(syncLastLocalKey(uid), String(remoteAt));
             await AsyncStorage.setItem(SYNC_LAST_REMOTE_KEY, String(remoteAt));
             await AsyncStorage.setItem(SYNC_LAST_LOCAL_KEY, String(remoteAt));
-            await saveAccountCache(uid, remoteData).catch(() => {});
+            await saveAccountCache(uid, restoredData).catch(() => {});
             // Drop the suppression flag a tick later — long enough for the
             // state-applied effects to settle and trigger one watcher pass.
             await finishRestore(remoteAt);
@@ -14420,10 +14653,12 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
         lastSyncedAtRef.current = localLastWritten;
         await AsyncStorage.setItem(SYNC_CURRENT_UID_KEY, uid).catch(() => {});
         setSyncWriteReady(true);
+        setAccountRestoreStatus(null);
       } catch {
         // Network or rules error — don't block local use. The next state change
         // will retry via the watcher; the cold-start restore is best-effort.
         setSyncWriteReady(!cancelled && activeUidRef.current === uid);
+        setAccountRestoreStatus(null);
       }
     })();
 
@@ -14432,7 +14667,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
       if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
       writeTimerRef.current = null;
     };
-  }, [loadAccountCache, ready, saveAccountCache, syncUser?.uid]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [fillLocalOnlySyncSettings, loadAccountCache, ready, restoreAccountApiSettings, saveAccountApiSettings, saveAccountCache, syncUser?.uid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Watcher: debounce-write the slice on change.
   useEffect(() => {
@@ -14475,17 +14710,32 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     const restoredActiveListId = restoredLists.some(l => l.id === s.activeListId)
       ? s.activeListId
       : DEFAULT_LIST_ID;
+    const restoredWidgetThemeId = normalizeWidgetThemeId(s.widgetThemeId);
+    const restoredWidgetClear = typeof s.widgetClear === 'boolean' ? s.widgetClear : false;
+    const restoredWidgetShorthand = typeof s.widgetShorthand === 'boolean' ? s.widgetShorthand : true;
+    const restoredWidgetCustomColors = normalizeWidgetCustomColors(s.widgetCustomColors);
+    const restoredWidgetMicSide = normalizeWidgetMicSide(s.widgetMicSide);
+    const restoredCalendarConflictsEnabled = typeof s.calendarConflictsEnabled === 'boolean'
+      ? s.calendarConflictsEnabled
+      : false;
     setListsState(restoredLists);
     setActiveListIdState(restoredActiveListId);
     setArchiveState(s.archive);
     setAccentLightState(s.accentLight);
     setAccentDarkState(s.accentDark);
     setThemeIdState(s.themeId);
+    setWidgetThemeIdState(restoredWidgetThemeId);
+    setWidgetClearState(restoredWidgetClear);
+    setWidgetShorthandState(restoredWidgetShorthand);
+    setWidgetCustomColorsState(restoredWidgetCustomColors);
+    setWidgetMicSideState(restoredWidgetMicSide);
     setCustomThemeDraftsState(s.customThemeDrafts);
     setPersonalContextState(s.personalContext);
     setDefaultTierState(s.defaultTier);
     setAutoClearState(s.autoClear);
     setDarkModeState(s.darkMode);
+    setCalendarConflictsEnabledState(restoredCalendarConflictsEnabled);
+    if (!restoredCalendarConflictsEnabled) setCalendarConflictKeys(new Set());
     setGroceryItemsState(s.groceryItems);
     if (Array.isArray(s.joinedSharedLists)) {
       restoreJoinedIds(s.joinedSharedLists.filter((id) => typeof id === 'string')).catch(() => {});
@@ -14511,11 +14761,17 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
       ['tri_active_list_id', JSON.stringify(restoredActiveListId)],
       ['tri_archive', JSON.stringify(s.archive)],
       ['tri_theme', JSON.stringify(s.themeId)],
+      [WIDGET_THEME_KEY, JSON.stringify(restoredWidgetThemeId)],
+      [WIDGET_CLEAR_KEY, restoredWidgetClear ? '1' : '0'],
+      [WIDGET_SHORTHAND_KEY, restoredWidgetShorthand ? '1' : '0'],
+      [WIDGET_CUSTOM_COLORS_KEY, JSON.stringify(restoredWidgetCustomColors)],
+      [WIDGET_MIC_SIDE_KEY, JSON.stringify(restoredWidgetMicSide)],
       ['tri_custom_themes', JSON.stringify(s.customThemeDrafts)],
       ['triority-context', JSON.stringify(s.personalContext)],
       ['tri_defaultTier', JSON.stringify(s.defaultTier)],
       ['tri_autoClear', JSON.stringify(s.autoClear)],
       ['tri_darkMode', JSON.stringify(s.darkMode)],
+      [CALENDAR_CONFLICTS_ENABLED_KEY, restoredCalendarConflictsEnabled ? '1' : '0'],
       ['tri_grocery', JSON.stringify(s.groceryItems)],
       ['tri_list_order', JSON.stringify(s.lists.map(l => l.id))],
       [SHARED_TASK_ORDER_KEY, JSON.stringify(restoredSharedTaskOrder)],
@@ -14766,12 +15022,14 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     setAiProviderState(next);
     setHasApiKey(isValidKey(apiKey, next));
     AsyncStorage.setItem(AI_PROVIDER_KEY, JSON.stringify(next)).catch(() => {});
+    if (syncUser?.uid) saveAccountApiSettings(syncUser.uid, apiKey, next).catch(() => {});
   };
   const setApiKey = (v: string) => {
     const trimmed = v.trim();
     setApiKeyState(trimmed);
     setHasApiKey(isValidKey(trimmed, aiProvider));
-    EncryptedStorage.setItem('triority-api-key', trimmed).catch(() => {});
+    EncryptedStorage.setItem(API_KEY_STORAGE_KEY, trimmed).catch(() => {});
+    if (syncUser?.uid) saveAccountApiSettings(syncUser.uid, trimmed, aiProvider).catch(() => {});
   };
   const setPersonalContext = (v: string) => { setPersonalContextState(v); AsyncStorage.setItem('triority-context', JSON.stringify(v)).catch(() => {}); };
   const setAutoClear = (v: AutoClear) => { setAutoClearState(v); AsyncStorage.setItem('tri_autoClear', JSON.stringify(v)).catch(() => {}); };
@@ -15496,7 +15754,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
       return;
     }
     let storedKey = '';
-    try { storedKey = await EncryptedStorage.getItem('triority-api-key') || ''; } catch {}
+    try { storedKey = await EncryptedStorage.getItem(API_KEY_STORAGE_KEY) || ''; } catch {}
     if (!storedKey || !isValidKey(storedKey, aiProvider) || sharedGroceryItems.length === 0) { onDone?.(); return; }
     const validCats = new Set([...GROCERY_CATEGORIES, GROCERY_UNCATEGORIZED]);
     const systemPrompt = `Assign one category per item. Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
@@ -15520,6 +15778,65 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     }).catch(() => { onDone?.(); });
   }, [aiProvider, aiSortGrocery, sharedGroceryDoc, sharedGroceryItems, updateSharedGroceryCategories, usingSharedGrocery]);
 
+  const deleteAccountData = useCallback(async () => {
+    const uid = syncUser?.uid;
+    if (!uid) throw new Error('Sign in with Google first.');
+    if (writeTimerRef.current) {
+      clearTimeout(writeTimerRef.current);
+      writeTimerRef.current = null;
+    }
+    setSyncWriteReady(false);
+
+    const db = getFirestore(getApp());
+    await deleteDoc(doc(db, 'users', uid));
+    await syncSignOut();
+    await TriorityWidget?.consumePendingCaptures?.().catch(() => {});
+    await EncryptedStorage.removeItem(API_KEY_STORAGE_KEY).catch(() => {});
+    await EncryptedStorage.removeItem(accountApiKeyKey(uid)).catch(() => {});
+    await AsyncStorage.multiRemove(triorityLocalDataKeys(uid)).catch(() => {});
+    await AsyncStorage.setItem('tri_version', APP_VERSION).catch(() => {});
+    await syncAllReminders([]).catch(() => {});
+
+    const fresh = emptySyncedState();
+    activeUidRef.current = null;
+    lastSyncedAtRef.current = 0;
+    justRestoredRef.current = false;
+    setAccountRestoreStatus(null);
+    setScreen('list');
+    setListsState(fresh.lists);
+    setActiveListIdState(fresh.activeListId);
+    setArchiveState([]);
+    setAccentLightState(null);
+    setAccentDarkState(null);
+    setThemeIdState('slate');
+    setWidgetThemeIdState(WIDGET_THEME_MATCH_APP);
+    setWidgetClearState(false);
+    setWidgetShorthandState(true);
+    setWidgetCustomColorsState(DEFAULT_WIDGET_CUSTOM_COLORS);
+    setWidgetMicSideState('left');
+    setCustomThemeDraftsState([null, null, null]);
+    setAiProviderState(DEFAULT_AI_PROVIDER);
+    setApiKeyState('');
+    setHasApiKey(false);
+    setPersonalContextState('');
+    setDefaultTierState('medium');
+    setAutoClearState('Never');
+    setDarkModeState(true);
+    setGroceryItemsState([]);
+    setViewingSharedGroceryState(false);
+    setSharedTaskOrderState([]);
+    setListRowOrderState([DEFAULT_LIST_ID]);
+    setCollapsedGroupsState({});
+    setCalendarConflictsEnabledState(false);
+    setFocusedTaskId(null);
+    setFocusedGroceryId(null);
+    setPendingGroceryGlowIds({});
+    setExternalPendingTaskGlowIds({});
+    setPendingReminderNav(null);
+    setOnboardingInitialStep(0);
+    setShowOnboarding(true);
+  }, [syncSignOut, syncUser?.uid]);
+
   if (!ready) {
     return (
       <View style={[styles.loadingScreen, { backgroundColor: T.bg }]}>
@@ -15527,6 +15844,9 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
       </View>
     );
   }
+
+  const rootToast = widgetImportToast
+    || (accountRestoreStatus ? { message: accountRestoreStatus, sub: 'Lists and settings may take a moment' } : null);
 
   return (
     <ThemeCtx.Provider value={T}>
@@ -15612,12 +15932,13 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
                 onClearArchive={() => setArchive(() => [])} onReplayOnboarding={replayOnboarding}
                 calendarConflictsEnabled={calendarConflictsEnabled}
                 setCalendarConflictsEnabled={setCalendarConflictsEnabled}
-                onRequestCalendarConflictAccess={requestCalendarConflictAccess} />
+                onRequestCalendarConflictAccess={requestCalendarConflictAccess}
+                onDeleteAccountData={deleteAccountData} />
             )}
           </View>
           <TabBar screen={screen} setScreen={setScreen} accentColor={accentColor} isPaid={isPaid} onLockedGrocery={() => setShowGroceryUpsell(true)} />
         </PortalHost>
-        {widgetImportToast && <View style={styles.toastContainer} pointerEvents="none"><Toast message={widgetImportToast.message} sub={widgetImportToast.sub} /></View>}
+        {rootToast && <View style={styles.toastContainer} pointerEvents="none"><Toast message={rootToast.message} sub={rootToast.sub} /></View>}
         {showGroceryUpsell && <ProUpsellSheet accentColor={accentColor} onClose={() => setShowGroceryUpsell(false)} showToast={() => {}} />}
         {showOnboarding && <Onboarding onDone={finishOnboarding} accentColor={accentColor} initialStep={onboardingInitialStep} />}
       </View>
