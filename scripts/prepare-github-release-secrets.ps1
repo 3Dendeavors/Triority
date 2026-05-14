@@ -1,5 +1,7 @@
 param(
-  [string]$RepoRoot = (Resolve-Path "$PSScriptRoot\..").Path
+  [string]$RepoRoot = (Resolve-Path "$PSScriptRoot\..").Path,
+  [string]$Repo = '3Dendeavors/Triority',
+  [switch]$Upload
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,9 +55,32 @@ $props['TRIORITY_RELEASE_KEY_PASSWORD'] |
 
 Write-Host "Secret payload files written to $outDir"
 Write-Host ''
-Write-Host 'If GitHub CLI is installed and authenticated, run:'
-Write-Host "gh secret set GOOGLE_SERVICES_JSON_BASE64 --repo 3Dendeavors/Triority < `"$outDir\GOOGLE_SERVICES_JSON_BASE64.txt`""
-Write-Host "gh secret set TRIORITY_RELEASE_KEYSTORE_BASE64 --repo 3Dendeavors/Triority < `"$outDir\TRIORITY_RELEASE_KEYSTORE_BASE64.txt`""
-Write-Host "gh secret set TRIORITY_RELEASE_STORE_PASSWORD --repo 3Dendeavors/Triority < `"$outDir\TRIORITY_RELEASE_STORE_PASSWORD.txt`""
-Write-Host "gh secret set TRIORITY_RELEASE_KEY_ALIAS --repo 3Dendeavors/Triority < `"$outDir\TRIORITY_RELEASE_KEY_ALIAS.txt`""
-Write-Host "gh secret set TRIORITY_RELEASE_KEY_PASSWORD --repo 3Dendeavors/Triority < `"$outDir\TRIORITY_RELEASE_KEY_PASSWORD.txt`""
+
+$secretFiles = [ordered]@{
+  GOOGLE_SERVICES_JSON_BASE64 = Join-Path $outDir 'GOOGLE_SERVICES_JSON_BASE64.txt'
+  TRIORITY_RELEASE_KEYSTORE_BASE64 = Join-Path $outDir 'TRIORITY_RELEASE_KEYSTORE_BASE64.txt'
+  TRIORITY_RELEASE_STORE_PASSWORD = Join-Path $outDir 'TRIORITY_RELEASE_STORE_PASSWORD.txt'
+  TRIORITY_RELEASE_KEY_ALIAS = Join-Path $outDir 'TRIORITY_RELEASE_KEY_ALIAS.txt'
+  TRIORITY_RELEASE_KEY_PASSWORD = Join-Path $outDir 'TRIORITY_RELEASE_KEY_PASSWORD.txt'
+}
+
+if ($Upload) {
+  $gh = Get-Command gh -ErrorAction SilentlyContinue
+  if (-not $gh) {
+    throw 'GitHub CLI is not installed or not on PATH.'
+  }
+  gh auth status | Out-Null
+  foreach ($entry in $secretFiles.GetEnumerator()) {
+    gh secret set $entry.Key --repo $Repo --body-file $entry.Value
+  }
+  Write-Host "GitHub Actions release secrets uploaded to $Repo"
+  exit 0
+}
+
+Write-Host 'To upload these with GitHub CLI after authentication, run:'
+Write-Host ".\scripts\prepare-github-release-secrets.ps1 -Upload"
+Write-Host ''
+Write-Host 'Manual fallback commands:'
+foreach ($entry in $secretFiles.GetEnumerator()) {
+  Write-Host "gh secret set $($entry.Key) --repo $Repo --body-file `"$($entry.Value)`""
+}

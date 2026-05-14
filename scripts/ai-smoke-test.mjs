@@ -416,6 +416,56 @@ const CASES = {
     input: 'order quick crimps for sv4',
     expect: { minTasks: 1, maxGrocery: 0, taskList: 'biomed', noReminders: true },
   },
+  'date-only-and-number-control': {
+    screen: 'tasks',
+    input: 'call grandma tomorrow and order 12 quick crimps for sv4',
+    expect: {
+      minTasks: 2,
+      maxGrocery: 0,
+      hasLists: ['personal', 'biomed'],
+      noReminders: true,
+      taskTextList: [
+        { text: 'grandma', listId: 'personal' },
+        { text: 'crimps', listId: 'biomed' },
+      ],
+    },
+  },
+  'messy-household-capture': {
+    screen: 'tasks',
+    input: 'tomorrow clean fridge call alex at 445 get batteries and give me a quick garage cleanup checklist',
+    expect: {
+      minTasks: 5,
+      minGrocery: 1,
+      maxGrocery: 4,
+      taskList: 'personal',
+      hasReminder: true,
+      maxReminders: 1,
+      reminderTaskText: ['alex'],
+      noReminderTaskText: ['fridge', 'garage'],
+      groceryText: ['batter'],
+    },
+  },
+  'recipe-no-extra-control': {
+    screen: 'grocery',
+    input: 'ingredients for pancakes but no extras only basic ingredients',
+    expect: {
+      minGrocery: 3,
+      maxGrocery: 8,
+      maxTasks: 0,
+      noReminders: true,
+      forbiddenGroceryText: ['cinnamon', 'vanilla', 'nutmeg', 'berries', 'syrup'],
+    },
+  },
+  'recipe-seasoning-needed': {
+    screen: 'grocery',
+    input: 'ingredients for chicken fajitas',
+    expect: {
+      minGrocery: 5,
+      maxTasks: 0,
+      noReminders: true,
+      groceryText: ['pepper'],
+    },
+  },
 };
 
 const PROMPT_VARIANTS = new Set(['full', 'compact', 'lean']);

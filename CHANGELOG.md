@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+## v1.4.11 - 2026-05-14
+
+- Added a public privacy policy and linked it from Settings.
+- Added a signed-in Delete Account Data flow that deletes the synced backup, signs out, clears local Triority data on that phone, removes the saved AI key, and cancels local reminders.
+- Added visible account-restore feedback after sign-in/account switching so synced lists and settings can reload without looking stuck.
+- Limited that restore feedback to actual account restores/switches so normal same-account backup checks do not sit on screen.
+- Synced widget theme settings and the calendar conflict toggle with the signed-in account, and kept AI provider keys local but remembered per Google account on the same phone.
+- Hardened grocery adds against unchecked duplicates on personal and shared grocery lists, including case changes and manual-vs-AI grocery rows, while still allowing fresh adds after an item is checked.
+- Updated the GitHub release secret helper so `scripts/prepare-github-release-secrets.ps1 -Upload` can upload release workflow secrets after GitHub CLI authentication is valid.
+- Added more AI smoke-test oddball cases for date-only/no-time controls, casual household captures, recipe no-extra constraints, and seasoning-needed recipe prompts.
+
 ## v1.4.10 - 2026-05-13
 
 - Fixed task drag/drop accuracy on long task lists. Dragged rows now stay anchored to the finger while the list edge-scrolls, including at the bottom of the list.

@@ -9,15 +9,15 @@ The app is distributed as a signed Android APK through GitHub Releases. It is no
 The current public beta APK is published on GitHub Releases:
 
 - Latest release: https://github.com/3Dendeavors/Triority/releases/latest
-- Current beta: `v1.4.10`
+- Current beta: `v1.4.11`
 - Android package id: `com.triority`
-- Current APK: `Triority-v1.4.10.apk`
-- SHA-256: `100674A4A4E78FBDE6F2B0584544DC18A45D89C1F7DCBB1B8167A9583FB4B38D`
+- Current APK: `Triority-v1.4.11.apk`
+- SHA-256: `4492CFEC6A2C26F4EF5D53D0452FEB244C8CC813B910E516B8EC17CEEBC992D6`
 
 To install:
 
 1. Open the latest release page on your Android device.
-2. Under **Assets**, download `Triority-v1.4.10.apk`.
+2. Under **Assets**, download `Triority-v1.4.11.apk`.
 3. If Android asks, allow your browser or file manager to install unknown apps.
 4. Open the downloaded APK and tap **Install**.
 5. Launch Triority from your app drawer.
@@ -51,7 +51,11 @@ Network calls are limited to:
 - Google Calendar free/busy checks only when you enable calendar conflict checks.
 - The selected AI provider only when you provide an API key and use AI features.
 
-Google handles sign-in. Triority does not receive your Google password. Your AI provider key is stored locally with encrypted storage and is not intentionally synced.
+Google handles sign-in. Triority does not receive your Google password. Your AI provider key is stored locally with encrypted storage, is remembered per Google account on the same phone, and is not intentionally synced to the cloud.
+
+Signed-in users can use Settings > Delete Account Data to remove their synced Triority backup, sign out, clear local Triority data on that phone, remove the saved AI key, and cancel local reminders.
+
+Full policy: [PRIVACY.md](PRIVACY.md)
 
 ## Building
 
@@ -64,12 +68,12 @@ cd android
 .\gradlew.bat :app:createBundleReleaseJsAndAssets --rerun-tasks :app:assembleRelease --no-daemon
 ```
 
-Release signing files and Firebase config are intentionally not committed. See `scripts/prepare-github-release-secrets.ps1` for preparing GitHub Actions release secrets from local private files.
+Release signing files and Firebase config are intentionally not committed. See `scripts/prepare-github-release-secrets.ps1` for preparing GitHub Actions release secrets from local private files; after GitHub CLI authentication is valid, run it with `-Upload` to set the release workflow secrets.
 
 Experimental local AI smoke tests live in `scripts/ai-smoke-test.mjs`. They use ignored files under `_local_secrets/`, print only parsed row summaries and token usage when available, and are meant as a reversible helper for checking provider routing before manual phone testing.
 
 ## Current Status
 
-The current public beta is `v1.4.10` / `versionCode 26`, a task drag/drop accuracy release on top of the v1.4.9 AI reliability work. It keeps the Gemini 2.5 Flash-Lite and Claude Sonnet AI provider choices, strengthens timed-task reminder handling, and fixes long-list drag behavior so grabbed task rows stay under the finger during edge-scroll and bottom-of-list drops.
+The current public beta is `v1.4.11` / `versionCode 27`, an account-restore and public-polish release on top of v1.4.10. It keeps the drag/drop accuracy and AI reminder fixes, adds better account restore feedback, syncs widget/calendar settings, remembers AI keys locally per Google account on the same phone, tightens grocery duplicate handling, and updates the public privacy policy.
 
 Release pages must include the installable APK asset. The source-code archives attached to GitHub tags are not Android installers.
