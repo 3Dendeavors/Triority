@@ -4,6 +4,10 @@ Effective date: May 14, 2026
 
 Triority is a private-first Android task, grocery, reminder, and AI triage app. It is built to keep your planning data under your control and to avoid analytics, telemetry, and hosted AI services.
 
+## Scope
+
+This policy describes public-facing data handling. Technical implementation details live in the project documentation and source code.
+
 ## No Analytics Or Telemetry
 
 Triority is intended to have no analytics, telemetry, tracking SDKs, or sale of user data.

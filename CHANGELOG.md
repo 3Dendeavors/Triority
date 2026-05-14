@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v1.4.12 - 2026-05-14
+
+- Protected recent local task/list edits from being overwritten by an older Firestore restore while the debounced sync write is still pending.
+- Stopped the local app-version marker check from clearing task/list/archive storage during normal upgrades.
+
 ## v1.4.11 - 2026-05-14
 
 - Added a public privacy policy and linked it from Settings.
