@@ -2,7 +2,11 @@
 
 Effective date: May 14, 2026
 
-Triority is a private-first Android task, grocery, reminder, and AI triage app. It is built to keep your planning data under your control and to avoid analytics, advertising, telemetry, and hosted AI services.
+Triority is a private-first Android task, grocery, reminder, and AI triage app. It is built to keep your planning data under your control and to avoid analytics, telemetry, and hosted AI services.
+
+## No Analytics Or Telemetry
+
+Triority is intended to have no analytics, telemetry, tracking SDKs, or sale of user data.
 
 ## Data Triority Stores
 
@@ -33,10 +37,6 @@ If you enable calendar conflict checks, Triority asks Google for read-only calen
 AI features are bring-your-own-key. If you add a Gemini or Claude API key and use AI triage, Triority sends the relevant prompt and limited app context directly to the provider you selected. This can include the text you typed, selected app context such as list names or visible rows, and your Personal Context when needed for routing.
 
 Triority does not provide a hosted AI service and does not intentionally send AI requests unless you use an AI feature.
-
-## No Analytics Or Ads
-
-Triority is intended to have no analytics, telemetry, tracking SDKs, advertising, or sale of user data.
 
 ## Network Services
 
