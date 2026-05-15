@@ -4,10 +4,15 @@
   "private": true,
   "scripts": {
     "android": "react-native run-android",
+    "android:install-release": "powershell -ExecutionPolicy Bypass -File scripts/build-install-android-release.ps1 -Install",
+    "android:release": "powershell -ExecutionPolicy Bypass -File scripts/build-install-android-release.ps1",
+    "check:release-version": "node scripts/check-release-version.js",
+    "check:ts": "tsc --noEmit",
     "ios": "react-native run-ios",
     "lint": "eslint .",
     "start": "react-native start",
     "test": "jest",
+    "verify": "npm run check:release-version && npm run check:ts && npm test -- --runInBand",
     "postinstall": "patch-package"
   },
   "dependencies": {

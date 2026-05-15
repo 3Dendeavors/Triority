@@ -9,15 +9,15 @@ Triority is distributed as a signed Android APK through GitHub Releases. It is n
 The current public beta APK is published on GitHub Releases:
 
 - Latest release: https://github.com/3Dendeavors/Triority/releases/latest
-- Current beta: `v1.4.12`
+- Current beta: `v1.4.13`
 - Android package id: `com.triority`
-- Current APK: `Triority-v1.4.12.apk`
-- SHA-256: `717953D2BAE21BE779E09ECE40B23F9789E53D43947AB0F0E6893AFB7516140D`
+- Current APK: `Triority-v1.4.13.apk`
+- SHA-256: `E82CA33856C27D116FECED8F28756BAD7491A2EDBEE2887D164232055EECE7C8`
 
 To install:
 
 1. Open the latest release page on your Android device.
-2. Under **Assets**, download `Triority-v1.4.12.apk`.
+2. Under **Assets**, download `Triority-v1.4.13.apk`.
 3. If Android asks, allow your browser or file manager to install unknown apps.
 4. Open the downloaded APK and tap **Install**.
 5. Launch Triority from your app drawer.
@@ -61,11 +61,16 @@ Full policy: [PRIVACY.md](PRIVACY.md)
 
 This is a React Native Android app. Most app logic intentionally lives in `App.tsx`.
 
-For release builds after JavaScript changes, force the bundle task to rerun:
+For local release builds after JavaScript changes:
 
 ```powershell
-cd android
-.\gradlew.bat :app:createBundleReleaseJsAndAssets --rerun-tasks :app:assembleRelease --no-daemon
+npm run android:release
+```
+
+To install that signed build over an attached Android device without wiping app data:
+
+```powershell
+npm run android:install-release
 ```
 
 Release signing files and Firebase config are intentionally not committed. See `scripts/prepare-github-release-secrets.ps1` for preparing GitHub Actions release secrets from local private files.
