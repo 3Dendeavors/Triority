@@ -1388,10 +1388,6 @@ function dropGroceryClauseTaskLeaks<T>(items: T[], input: string): T[] {
   return items.filter(item => !taskRepeatsGroceryGenerationClause(item, input));
 }
 
-function shouldDropIncidentalAiGroceryRows(input: string) {
-  return (hasTaskGenerationIntent(input) || hasDirectTaskActionIntent(input)) && !hasGroceryGenerationIntent(input);
-}
-
 function normalizeAiListText(value: string) {
   return value
     .toLowerCase()
@@ -1429,11 +1425,60 @@ function normalizeAiNameToken(token: string) {
   return out;
 }
 
+const AI_GROCERY_DIRECT_ACTION_TOKENS = new Set([
+  'add', 'adding', 'buy', 'buying', 'get', 'getting', 'got', 'grab', 'grabbing',
+  'need', 'needing', 'needs', 'pick', 'picking', 'pickup', 'place', 'placing',
+  'purchase', 'purchasing', 'put', 'putting', 'remember', 'remembering', 'write',
+  'writing',
+]);
+
+const AI_GROCERY_MENTION_STOP_TOKENS = new Set([
+  'a', 'an', 'and', 'for', 'grocery', 'groceries', 'item', 'items', 'list',
+  'my', 'of', 'on', 'our', 'shopping', 'the', 'to',
+]);
+
 function normalizedAiTokens(value: string) {
   return normalizeAiListText(value)
     .split(' ')
     .map(normalizeAiNameToken)
     .filter(Boolean);
+}
+
+function inputHasDirectGroceryAction(input: string) {
+  const tokens = normalizedAiTokens(input);
+  return tokens.some((token, index) => (
+    AI_GROCERY_DIRECT_ACTION_TOKENS.has(token)
+    || (token === 'pick' && tokens[index + 1] === 'up')
+  ));
+}
+
+function inputHasExplicitGroceryListTarget(input: string) {
+  const normalized = normalizeAiListText(input);
+  return /\b(grocery|groceries|shopping|cart)\b/i.test(normalized)
+    || /\b(?:to|on|in|into)\s+(?:my|the|our)?\s*(?:grocery|shopping)\s+(?:list|cart)\b/i.test(normalized)
+    || /\b(?:grocery|shopping)\s+(?:list|cart)\b/i.test(normalized);
+}
+
+function inputMentionsGroceryDraft(input: string, item: Pick<GroceryDraft, 'name'>) {
+  const itemTokens = normalizedAiTokens(item.name || '')
+    .filter(token => token.length >= 2 && !AI_GROCERY_MENTION_STOP_TOKENS.has(token));
+  if (itemTokens.length === 0) return false;
+  const inputTokens = normalizedAiTokens(input);
+  return itemTokens.every(token => inputTokens.some(candidate => (
+    candidate === token || aiTokensCloseEnough(candidate, token)
+  )));
+}
+
+function inputExplicitlyRequestsParsedGroceryRows(input: string, items: Array<Pick<GroceryDraft, 'name'>>) {
+  if (items.length === 0 || !inputHasDirectGroceryAction(input)) return false;
+  if (inputHasExplicitGroceryListTarget(input)) return true;
+  return items.some(item => inputMentionsGroceryDraft(input, item));
+}
+
+function shouldDropIncidentalAiGroceryRows(input: string, items: Array<Pick<GroceryDraft, 'name'>> = []) {
+  if (hasGroceryGenerationIntent(input)) return false;
+  if (inputExplicitlyRequestsParsedGroceryRows(input, items)) return false;
+  return hasTaskGenerationIntent(input) || hasDirectTaskActionIntent(input);
 }
 
 function aiTextHasToken(value: string, token: string) {
@@ -2122,7 +2167,7 @@ async function parseWidgetAiCapture({
     if (parsedTasks.length === 0 && (hasDirectTaskActionIntent(raw) || hasScheduledEventStatement(raw))) {
       parsedTasks = [taskDraftWithLocalReminder(raw, defaultTier)];
     }
-    if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw) && parsedGroceryItems.length > 0) {
+    if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw, parsedGroceryItems) && parsedGroceryItems.length > 0) {
       parsedTasks = [taskDraftWithLocalReminder(raw, defaultTier)];
     }
     const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0;
@@ -2167,7 +2212,7 @@ async function parseWidgetAiCapture({
           .filter((item: GroceryDraft) => groceryDraftAllowedByPersonalContext(item, personalContext))
       : [];
     grocery = mergeRecoveredGroceryDrafts(grocery, raw);
-    if (shouldDropIncidentalAiGroceryRows(raw)) {
+    if (shouldDropIncidentalAiGroceryRows(raw, grocery)) {
       grocery = [];
     }
     if (groceryEnabled && groceryDraftsNeedGenerationRetry(grocery, raw)) {
@@ -3471,6 +3516,44 @@ function sharedItemMutationKey(listId: string, itemId: string) {
   return `${listId}::${itemId}`;
 }
 
+function compareSharedItemsByCreatedAt(a: SharedListItem, b: SharedListItem) {
+  const createdDiff = (a.createdAt || 0) - (b.createdAt || 0);
+  if (createdDiff !== 0) return createdDiff;
+  return String(a.id).localeCompare(String(b.id));
+}
+
+function orderSharedItemsByCreatedAt(items: SharedListItem[]) {
+  return [...items].sort(compareSharedItemsByCreatedAt);
+}
+
+function mergeSharedItemsPreservingLocalOrder(
+  localItems: SharedListItem[],
+  serverItems: SharedListItem[],
+  pendingIds: Set<string>,
+) {
+  const orderedServerItems = orderSharedItemsByCreatedAt(serverItems);
+  const serverById = new Map(orderedServerItems.map((item) => [item.id, item]));
+  const merged: SharedListItem[] = [];
+
+  for (const localItem of localItems) {
+    const serverItem = serverById.get(localItem.id);
+    if (serverItem) {
+      merged.push(serverItem);
+      serverById.delete(localItem.id);
+      continue;
+    }
+    if (pendingIds.has(localItem.id)) merged.push(localItem);
+  }
+
+  for (const serverItem of orderedServerItems) {
+    if (!serverById.has(serverItem.id)) continue;
+    merged.push(serverItem);
+    serverById.delete(serverItem.id);
+  }
+
+  return merged;
+}
+
 function mapSupabaseArchive(row: any): SharedArchiveItem {
   return stripUndefined({
     id: String(row.id),
@@ -4061,7 +4144,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         if (locallyRemovedSharedIdsRef.current.has(id)) continue;
         if (isSupabaseSharedListId(id) && cachedLists[id]?.kind === 'grocery' && !isSupabaseGroceryMarkedActive(id)) continue;
         if (cachedLists[id]) filteredLists[id] = cachedLists[id];
-        if (Array.isArray(cachedItems[id])) filteredItems[id] = cachedItems[id];
+        if (Array.isArray(cachedItems[id])) filteredItems[id] = orderSharedItemsByCreatedAt(cachedItems[id]);
         if (Array.isArray(cachedArchives[id])) filteredArchives[id] = cachedArchives[id];
       }
       if (Object.keys(filteredLists).length > 0) {
@@ -4194,7 +4277,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     const [listRes, membersRes, itemsRes, archivesRes] = await Promise.all([
       supabase.from('tri_shared_lists').select('*').eq('id', listId).maybeSingle(),
       supabase.from('tri_shared_members').select('*').eq('list_id', listId),
-      supabase.from('tri_shared_items').select('*').eq('list_id', listId),
+      supabase.from('tri_shared_items').select('*').eq('list_id', listId).order('created_at', { ascending: true }).order('id', { ascending: true }),
       supabase.from('tri_shared_archives').select('*').eq('list_id', listId),
     ]);
     if (listRes.error) throw new Error(supabaseErrorMessage(listRes.error, 'Could not load shared list.'));
@@ -4233,15 +4316,10 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     for (const id of serverItemIds) pendingSharedItemIdsRef.current.delete(id);
     setSharedItems((prev) => {
       const localItems = prev[listId] || [];
-      // Preserve any local rows that:
-      // (a) are still pending confirmation (we just inserted them and the
-      //     server SELECT didn't see them yet), or
-      // (b) have an ID not present in the server response AND not yet seen.
-      // Keeping (a) avoids the flash where a freshly-added row briefly
-      // disappears when realtime triggers a refresh before the INSERT has
-      // committed visibly.
-      const survivingLocal = localItems.filter((it) => !serverItemIds.has(it.id) && pendingSharedItemIdsRef.current.has(it.id));
-      return { ...prev, [listId]: [...serverItems, ...survivingLocal] };
+      return {
+        ...prev,
+        [listId]: mergeSharedItemsPreservingLocalOrder(localItems, serverItems, pendingSharedItemIdsRef.current),
+      };
     });
     setSharedArchives((prev) => ({ ...prev, [listId]: (archivesRes.data || []).map(mapSupabaseArchive) }));
   }, [forgetSharedListLocally, reconcileIncomingSharedItems, removeJoinedId]);
@@ -4457,7 +4535,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
           snap.forEach((d) => {
             items.push({ id: d.id, ...(d.data() as Omit<SharedListItem, 'id'>) });
           });
-          setSharedItems((prev) => ({ ...prev, [listId]: reconcileIncomingSharedItems(listId, items) }));
+          setSharedItems((prev) => ({ ...prev, [listId]: orderSharedItemsByCreatedAt(reconcileIncomingSharedItems(listId, items)) }));
         },
         (error) => {
           if (isMissingOrPermissionError(error)) {
@@ -4598,18 +4676,21 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     if (isSupabaseSharedListId(listId)) {
       const now = Date.now();
       const rows = items
-        .map((it) => ({
-          id: randomUuid(),
-          list_id: listId,
-          text: it.text,
-          tier: it.tier,
-          reminder: it.reminder ? stripUndefined(it.reminder) : undefined,
-          checked: false,
-          created_by: user.uid,
-          created_at: new Date(now).toISOString(),
-          last_edited_by: user.uid,
-          last_edited_at: new Date(now).toISOString(),
-        }))
+        .map((it, index) => {
+          const createdAt = new Date(now + index).toISOString();
+          return {
+            id: randomUuid(),
+            list_id: listId,
+            text: it.text,
+            tier: it.tier,
+            reminder: it.reminder ? stripUndefined(it.reminder) : undefined,
+            checked: false,
+            created_by: user.uid,
+            created_at: createdAt,
+            last_edited_by: user.uid,
+            last_edited_at: createdAt,
+          };
+        })
         .filter((it) => it.text.trim());
       if (rows.length === 0) return [];
       const optimistic = rows.map(mapSupabaseItem);
@@ -4935,17 +5016,20 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     if (isSupabaseSharedListId(listId)) {
       const now = Date.now();
       const rows = filteredItems
-        .map((it) => ({
-          id: randomUuid(),
-          list_id: listId,
-          name: groceryStorageName(it),
-          category: it.category || GROCERY_UNCATEGORIZED,
-          checked: false,
-          created_by: user.uid,
-          created_at: new Date(now).toISOString(),
-          last_edited_by: user.uid,
-          last_edited_at: new Date(now).toISOString(),
-        }))
+        .map((it, index) => {
+          const createdAt = new Date(now + index).toISOString();
+          return {
+            id: randomUuid(),
+            list_id: listId,
+            name: groceryStorageName(it),
+            category: it.category || GROCERY_UNCATEGORIZED,
+            checked: false,
+            created_by: user.uid,
+            created_at: createdAt,
+            last_edited_by: user.uid,
+            last_edited_at: createdAt,
+          };
+        })
         .filter((it) => it.name);
       if (rows.length === 0) return [];
       const optimistic = rows.map(mapSupabaseItem);
@@ -5414,12 +5498,12 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     if (!user) throw new Error('Not signed in');
     if (USE_SUPABASE_SHARED_LISTS) {
       const now = Date.now();
-      const items = list.tasks.map((t) => ({
+      const items = list.tasks.map((t, index) => ({
         text: t.text,
         tier: t.tier,
         reminder: t.reminder,
         checked: false,
-        createdAt: t.createdAt || now,
+        createdAt: t.createdAt || now + index,
       }));
       const result = await withTimeout(
         supabase.rpc('tri_create_shared_list', { p_kind: 'tasks', p_name: list.name, p_items: items }),
@@ -5442,7 +5526,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         createdAt: Number(listRow.createdAt || now),
         updatedAt: Number(listRow.updatedAt || now),
       };
-      const sharedRows = Array.isArray(result.data?.items) ? result.data.items.map(mapSupabaseItem) : [];
+      const sharedRows = Array.isArray(result.data?.items) ? orderSharedItemsByCreatedAt(result.data.items.map(mapSupabaseItem)) : [];
       setSharedLists((prev) => ({ ...prev, [listId]: sharedList }));
       setSharedItems((prev) => ({ ...prev, [listId]: sharedRows }));
       await addJoinedId(listId);
@@ -5533,11 +5617,11 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       const now = Date.now();
       const groceryItems = items
         .filter((it) => it.name.trim())
-        .map((it) => ({
+        .map((it, index) => ({
           name: groceryStorageName(it),
           category: it.category || GROCERY_UNCATEGORIZED,
           checked: !!it.checked,
-          createdAt: it.createdAt || now,
+          createdAt: it.createdAt || now + index,
         }));
       const result = await withTimeout(
         supabase.rpc('tri_create_shared_list', { p_kind: 'grocery', p_name: 'Groceries', p_items: groceryItems }),
@@ -5567,7 +5651,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
         createdAt: Number(listRow.createdAt || now),
         updatedAt: Number(listRow.updatedAt || now),
       };
-      const sharedRows = Array.isArray(result.data?.items) ? result.data.items.map(mapSupabaseItem) : [];
+      const sharedRows = Array.isArray(result.data?.items) ? orderSharedItemsByCreatedAt(result.data.items.map(mapSupabaseItem)) : [];
       // Mark active BEFORE setSharedLists / addJoinedId. The in-memory ref
       // inside markSupabaseSharedGroceryActive is updated synchronously, so
       // any listener-attach refresh that fires when joinedIds changes will
@@ -5918,8 +6002,8 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 28;
-const CURRENT_APP_VERSION_NAME = '1.4.12';
+const CURRENT_APP_VERSION_CODE = 29;
+const CURRENT_APP_VERSION_NAME = '1.4.13';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {
@@ -6545,14 +6629,15 @@ function widgetTaskTargetFromUrl(url?: string | null): ReminderNavTarget | null 
   return { listId, taskId, scheduledTaskId: taskId };
 }
 
-function reminderNotificationData(task: Task) {
+function reminderNotificationData(task: Task): Record<string, string> {
   const displayTaskId = task.reminderTaskId ?? task.id;
-  return stripUndefined({
+  const data: Record<string, string> = {
     route: 'taskReminder',
     taskId: String(displayTaskId),
     scheduledTaskId: String(task.id),
-    listId: task.reminderListId,
-  });
+  };
+  if (task.reminderListId) data.listId = task.reminderListId;
+  return data;
 }
 
 function activeReminderOccurrence(task: Task, now = Date.now()): number | null {
@@ -6586,6 +6671,14 @@ function calendarConflictKey(listId: string | undefined, taskId: TaskId | undefi
 function taskGlowKey(listId: string | undefined, taskId: TaskId | string | undefined) {
   if (!listId || taskId == null) return '';
   return `${listId}:${String(taskId)}`;
+}
+
+function taskGroupCollapseKey(listId: string, tier: Tier) {
+  return `tasks:${listId}:${tier}`;
+}
+
+function groceryGroupCollapseKey(scope: string, group: string) {
+  return `grocery:${scope}:${group}`;
 }
 
 function calendarConflictKeyForTask(task: Task, fallbackListId?: string) {
@@ -6652,7 +6745,7 @@ function calendarCheckErrorMessage(error: any) {
   return raw ? `Calendar check failed: ${raw.slice(0, 80)}` : 'Calendar conflicts could not be checked';
 }
 
-async function fetchCalendarIds(accessToken: string) {
+async function fetchCalendarIds(accessToken: string): Promise<string[]> {
   const resp = await fetch('https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=reader', {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
@@ -6914,9 +7007,9 @@ function Icon({ name, size = 20, color = '#000' }: IconProps) {
   const entry = ICON_MAP[name];
   if (!entry) return null;
   if (entry.family === 'ionicons') {
-    return <Ionicons name={entry.glyph} size={size} color={color} />;
+    return <Ionicons name={entry.glyph as any} size={size} color={color} />;
   }
-  return <Feather name={entry.glyph} size={size} color={color} />;
+  return <Feather name={entry.glyph as any} size={size} color={color} />;
 }
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
@@ -8427,11 +8520,15 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
   const rowLayoutsRef = useRef<Record<string, { y: number; height: number; parentKey?: string | null }>>({});
   const groupLayoutsRef = useRef<Record<string, { y: number; height: number }>>({});
   const lastVisibleRevisionAtRef = useRef(0);
+  const latestFocusedScrollTargetRef = useRef<number | null>(null);
+  const lastFocusedScrollTargetRef = useRef<number | null>(null);
+  const lastFocusedScrollAtRef = useRef(0);
+  const pendingFocusedScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const activeItems = items.filter(i => !i.checked);
   const gotItItems = items.filter(i => i.checked);
   const gotItCount = gotItItems.length;
-  const groceryGroupKey = useCallback((group: string) => `grocery:${groupCollapseScope}:${group}`, [groupCollapseScope]);
+  const groceryGroupKey = useCallback((group: string) => groceryGroupCollapseKey(groupCollapseScope, group), [groupCollapseScope]);
 
   const focusedItemRequestKey = focusedItemId ? `${focusedItemId}:${focusedItemNonce ?? 0}` : null;
 
@@ -8457,31 +8554,71 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
     return visiblePx >= Math.min(layout.height * 0.6, 72);
   }, [visibleRevision]);
 
+  const clearPendingFocusedScroll = useCallback(() => {
+    if (!pendingFocusedScrollTimerRef.current) return;
+    clearTimeout(pendingFocusedScrollTimerRef.current);
+    pendingFocusedScrollTimerRef.current = null;
+  }, []);
+
+  const scheduleFocusedScroll = useCallback((targetY: number) => {
+    latestFocusedScrollTargetRef.current = targetY;
+    const lastTarget = lastFocusedScrollTargetRef.current;
+    const alreadyNearTarget = Math.abs(scrollOffsetRef.current - targetY) < 16;
+    const targetMoved = lastTarget == null || Math.abs(lastTarget - targetY) > 24;
+    if (!targetMoved || alreadyNearTarget) return;
+
+    clearPendingFocusedScroll();
+    const elapsed = Date.now() - lastFocusedScrollAtRef.current;
+    const delay = elapsed > 280 ? 40 : 280 - elapsed;
+    pendingFocusedScrollTimerRef.current = setTimeout(() => {
+      pendingFocusedScrollTimerRef.current = null;
+      const latestTarget = latestFocusedScrollTargetRef.current;
+      if (latestTarget == null) return;
+      lastFocusedScrollTargetRef.current = latestTarget;
+      lastFocusedScrollAtRef.current = Date.now();
+      scrollRef.current?.scrollTo({ y: latestTarget, animated: true });
+    }, delay);
+  }, [clearPendingFocusedScroll]);
+
   const scrollToFocusedItem = useCallback((y: number) => {
     const requestKey = focusedItemRequestKey;
     const targetY = Math.max(0, y - 96);
-    [80, 320, 700].forEach((delay) => {
-      setTimeout(() => {
-        scrollRef.current?.scrollTo({ y: targetY, animated: true });
-      }, delay);
-    });
+    scheduleFocusedScroll(targetY);
     if (!requestKey || firedFocusKeyRef.current === requestKey) return;
     firedFocusKeyRef.current = requestKey;
     setTimeout(() => {
       setFocusedGlowKey(requestKey);
       onFocusedItemSeen?.();
     }, 520);
-  }, [focusedItemRequestKey, onFocusedItemSeen]);
+  }, [focusedItemRequestKey, onFocusedItemSeen, scheduleFocusedScroll]);
 
   useEffect(() => {
+    clearPendingFocusedScroll();
+    latestFocusedScrollTargetRef.current = null;
+    lastFocusedScrollTargetRef.current = null;
+    lastFocusedScrollAtRef.current = 0;
     firedFocusKeyRef.current = null;
     setFocusedGlowKey(null);
-  }, [focusedItemRequestKey]);
+  }, [clearPendingFocusedScroll, focusedItemRequestKey]);
+
+  useEffect(() => {
+    return () => clearPendingFocusedScroll();
+  }, [clearPendingFocusedScroll]);
 
   const focusedItem = useMemo(() => {
     if (!focusedItemId) return null;
     return items.find(item => item.id === focusedItemId) || null;
   }, [focusedItemId, items]);
+
+  const scrollFocusedItemIfMeasured = useCallback(() => {
+    if (!focusedItemId) return false;
+    const layout = rowLayoutsRef.current[focusedItemId];
+    if (!layout) return false;
+    const groupY = layout.parentKey ? groupLayoutsRef.current[layout.parentKey]?.y : 0;
+    if (layout.parentKey && groupY == null) return false;
+    scrollToFocusedItem((groupY || 0) + layout.y);
+    return true;
+  }, [focusedItemId, scrollToFocusedItem]);
 
   useEffect(() => {
     if (!focusedItem) return;
@@ -8492,6 +8629,18 @@ function GroceryScreen({ items, onCheck, onDelete, onClearChecked, onClearAll, o
         : null;
     if (key && collapsedGroups[key]) setCollapsedGroup(key, false);
   }, [collapsedGroups, focusedItem, groceryGroupKey, setCollapsedGroup, sortMode]);
+
+  useEffect(() => {
+    if (!focusedItemRequestKey || !focusedItem) return;
+    const attempt = () => {
+      scrollFocusedItemIfMeasured();
+    };
+    attempt();
+    const timers = [80, 220, 520, 900, 1300].map(delay => setTimeout(attempt, delay));
+    return () => {
+      timers.forEach(clearTimeout);
+    };
+  }, [focusedItem, focusedItemRequestKey, scrollFocusedItemIfMeasured]);
 
   const sortedActive = useMemo(() => {
     if (sortMode === 'alpha') {
@@ -8699,7 +8848,7 @@ interface InputBarProps {
   lists: TaskList[];
   activeListId: string;
   widgetShorthand: boolean;
-  onGroceryOnlyAdded?: (ids: string[], navigate?: boolean) => void;
+  onGroceryOnlyAdded?: (ids: string[], navigate?: boolean, items?: GroceryDraft[]) => void;
 }
 
 function InputBar({ onAddMany, onAddManyToList, onTaskListRouted, onAddGroceryItems, aiProvider, hasApiKey, accentColor, defaultTier, showToast, dismissToast, groceryMode, lists, activeListId, widgetShorthand, onGroceryOnlyAdded }: InputBarProps) {
@@ -8799,7 +8948,7 @@ function InputBar({ onAddMany, onAddManyToList, onTaskListRouted, onAddGroceryIt
       typedPrefixRef.current = existing && !existing.endsWith(' ') ? existing + ' ' : existing;
       // Signal stop to native; actual teardown + 150ms delay happens inside startListening.
       try { await srStop(); } catch {}
-      await new Promise(r => setTimeout(r, 50));
+      await new Promise<void>(resolve => setTimeout(resolve, 50));
       // Confirm the recognizer is actually available before starting; if not,
       // surface the error now instead of waiting for the watchdog.
       try {
@@ -8949,10 +9098,17 @@ The tool input must include at least 6 items. Never return an empty items array.
           }
           grocItems = trimGeneratedGroceryRowsForScope(grocItems, raw);
           if (grocItems.length > 0) {
-            addGroceryItemsSafely(grocItems);
+            const groceryIds = await addGroceryItemsSafely(grocItems);
+            if (Array.isArray(groceryIds) && groceryIds[0]) {
+              onGroceryOnlyAdded?.(groceryIds, false, grocItems);
+            }
             showToast(`${grocItems.length} item${grocItems.length !== 1 ? 's' : ''} added`);
           } else {
-            addGroceryItemsSafely([{ name: raw, category: GROCERY_UNCATEGORIZED }]);
+            const fallbackItems = [{ name: raw, category: GROCERY_UNCATEGORIZED }];
+            const groceryIds = await addGroceryItemsSafely(fallbackItems);
+            if (Array.isArray(groceryIds) && groceryIds[0]) {
+              onGroceryOnlyAdded?.(groceryIds, false, fallbackItems);
+            }
             showToast('AI could not split it', 'Raw grocery added');
           }
         } else {
@@ -9027,7 +9183,7 @@ The tool input must include at least 6 items. Never return an empty items array.
           if (parsedTasks.length === 0 && (hasDirectTaskActionIntent(raw) || hasScheduledEventStatement(raw))) {
             parsedTasks = [taskDraftWithLocalReminder(raw, 'medium')];
           }
-          if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw) && parsedGroceryItems.length > 0) {
+          if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw, parsedGroceryItems) && parsedGroceryItems.length > 0) {
             parsedTasks = [taskDraftWithLocalReminder(raw, 'medium')];
           }
           const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0;
@@ -9066,7 +9222,7 @@ The tool input must include at least 6 items. Never return an empty items array.
                 .filter((item: GroceryDraft) => groceryDraftAllowedByPersonalContext(item, storedCtx))
             : [];
           grocItems = mergeRecoveredGroceryDrafts(grocItems, raw);
-          if (shouldDropIncidentalAiGroceryRows(raw)) {
+          if (shouldDropIncidentalAiGroceryRows(raw, grocItems)) {
             grocItems = [];
           }
           if (groceryEnabled && groceryDraftsNeedGenerationRetry(grocItems, raw)) {
@@ -9123,7 +9279,7 @@ The tool input must include at least 6 items. Never return an empty items array.
           if (grocItems.length > 0) {
             const groceryIds = await addGroceryItemsSafely(grocItems);
             if (Array.isArray(groceryIds) && groceryIds[0]) {
-              onGroceryOnlyAdded?.(groceryIds, totalTasks === 0);
+              onGroceryOnlyAdded?.(groceryIds, totalTasks === 0, grocItems);
             }
             const addedGroceryCount = Array.isArray(groceryIds) ? groceryIds.length : grocItems.length;
             if (totalTasks === 0 && addedGroceryCount > 0) showToast(`${addedGroceryCount} grocery item${addedGroceryCount !== 1 ? 's' : ''} added`);
@@ -9135,7 +9291,11 @@ The tool input must include at least 6 items. Never return an empty items array.
       } catch (e: any) {
         showToast('AI failed', aiErrorDetail(aiProvider, e));
         if (groceryMode) {
-          addGroceryItemsSafely([{ name: raw, category: GROCERY_UNCATEGORIZED }]);
+          const fallbackItems = [{ name: raw, category: GROCERY_UNCATEGORIZED }];
+          const groceryIds = await addGroceryItemsSafely(fallbackItems);
+          if (Array.isArray(groceryIds) && groceryIds[0]) {
+            onGroceryOnlyAdded?.(groceryIds, false, fallbackItems);
+          }
         } else {
           onAddMany([taskDraftWithLocalReminder(raw, defaultTier)]);
         }
@@ -10342,7 +10502,7 @@ interface ActiveListProps {
   reorderLists: (newLists: TaskList[]) => void;
   onAddGroceryItems: (items: GroceryDraft[]) => AddGroceryDraftResult;
   setScreen: (s: Screen) => void;
-  onGroceryOnlyAdded?: (ids: string[], navigate?: boolean) => void;
+  onGroceryOnlyAdded?: (ids: string[], navigate?: boolean, items?: GroceryDraft[]) => void;
   // Step 11b.2: when present, the active list is a shared one. Mutations
   // route through shared-list writes instead of local setTasks. Within-tier
   // reordering is a no-op on shared lists in v1 (ordering field deferred to v2).
@@ -10433,6 +10593,11 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
     if (toastTimer.current) { clearTimeout(toastTimer.current); toastTimer.current = null; }
     setToast(null);
   }, []);
+
+  const openTaskGroupsForDrafts = useCallback((listId: string, items: TaskDraft[]) => {
+    const tiers = Array.from(new Set(items.map(item => item.tier)));
+    tiers.forEach(tier => setCollapsedGroup(taskGroupCollapseKey(listId, tier), false));
+  }, [setCollapsedGroup]);
 
   const armLocalTaskFocus = useCallback((id: TaskId | string) => {
     setLocalFocusedTaskId(String(id));
@@ -10615,6 +10780,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
   }, [handleComplete]);
 
   const handleAddMany = useCallback((items: TaskDraft[]) => {
+    openTaskGroupsForDrafts(activeListId, items);
     if (sharedActions) {
       // Shared reminders are stored on the row; each device schedules locally
       // only when that user has granted reminder permissions.
@@ -10644,10 +10810,11 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
     armPendingTaskGlow(newTasks.slice(1).map(task => task.id));
     scheduleRemindersBatch(newTasks, showToast, activeListId);
     return newTasks.map((task) => task.id);
-  }, [activeListId, setTasks, showToast, sharedActions, armPendingTaskGlow]);
+  }, [activeListId, setTasks, showToast, sharedActions, armPendingTaskGlow, openTaskGroupsForDrafts]);
 
   const handleAddManyToList = useCallback((listId: string, items: TaskDraft[], options?: AddTaskOptions) => {
     const shouldFocus = options?.focus !== false;
+    openTaskGroupsForDrafts(listId, items);
     if (sharedIdSet?.has(listId)) {
       if (items.some(it => it.reminder)) {
         requestReminderSchedulingPermissions(showToast).catch(() => {});
@@ -10681,7 +10848,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
     armPendingTaskGlowForList(listId, (shouldFocus ? newTasks.slice(1) : newTasks).map(task => task.id));
     scheduleRemindersBatch(newTasks, showToast, listId);
     return newTasks.map((task) => task.id);
-  }, [activeListId, addSharedTaskItems, armLocalTaskFocus, armPendingTaskGlowForList, setActiveListId, setListTasks, sharedIdSet, showToast]);
+  }, [activeListId, addSharedTaskItems, armLocalTaskFocus, armPendingTaskGlowForList, openTaskGroupsForDrafts, setActiveListId, setListTasks, sharedIdSet, showToast]);
 
   const handleSave = useCallback((updated: Task) => {
     if (sharedActions) {
@@ -10722,6 +10889,10 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
   const tierRowLayoutsRef = useRef<Partial<Record<Tier, { bodyY: number; rows: TaskRowLayoutInfo[] }>>>({});
   const edgeScrollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const edgeScrollDirectionRef = useRef<'up' | 'down' | null>(null);
+  const latestFocusedScrollTargetRef = useRef<number | null>(null);
+  const lastFocusedScrollTargetRef = useRef<number | null>(null);
+  const lastFocusedScrollAtRef = useRef(0);
+  const pendingFocusedScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const effectiveFocusedTaskId = focusedTaskId ?? localFocusedTaskId;
   const effectiveFocusRequestKey = effectiveFocusedTaskId
     ? `${activeListId}:${effectiveFocusedTaskId}:${focusedTaskId ? `external:${focusedTaskNonce}` : `local:${localFocusedTaskNonce}`}`
@@ -10730,34 +10901,9 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
 
   useEffect(() => {
     if (!effectiveFocusedTaskId || !focusedTaskTier) return;
-    const collapseKey = `tasks:${activeListId}:${focusedTaskTier}`;
+    const collapseKey = taskGroupCollapseKey(activeListId, focusedTaskTier);
     if (collapsedGroups[collapseKey]) setCollapsedGroup(collapseKey, false);
   }, [activeListId, collapsedGroups, effectiveFocusedTaskId, focusedTaskTier, setCollapsedGroup]);
-
-  const scrollToFocusedTask = useCallback((y: number) => {
-    const requestKey = effectiveFocusRequestKey;
-    const targetY = Math.max(0, y - 96);
-    [80, 320, 700].forEach((delay) => {
-      setTimeout(() => {
-        scrollRef.current?.scrollTo({ y: targetY, animated: true });
-      }, delay);
-    });
-    if (!requestKey || firedFocusKeyRef.current === requestKey) return;
-    firedFocusKeyRef.current = requestKey;
-    setTimeout(() => {
-      setFocusedGlowKey(requestKey);
-      if (focusedTaskId) {
-        onFocusedTaskSeen?.();
-      } else {
-        markLocalTaskFocusSeen();
-      }
-    }, 520);
-  }, [effectiveFocusRequestKey, focusedTaskId, markLocalTaskFocusSeen, onFocusedTaskSeen]);
-
-  useEffect(() => {
-    firedFocusKeyRef.current = null;
-    setFocusedGlowKey(null);
-  }, [effectiveFocusRequestKey]);
 
   const stopEdgeScroll = useCallback(() => {
     edgeScrollDirectionRef.current = null;
@@ -10781,6 +10927,61 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
   const clampScrollOffset = useCallback((offset: number) => (
     Math.max(0, Math.min(offset, maxScrollOffset()))
   ), [maxScrollOffset]);
+
+  const clearPendingFocusedScroll = useCallback(() => {
+    if (!pendingFocusedScrollTimerRef.current) return;
+    clearTimeout(pendingFocusedScrollTimerRef.current);
+    pendingFocusedScrollTimerRef.current = null;
+  }, []);
+
+  const scheduleFocusedScroll = useCallback((targetY: number) => {
+    latestFocusedScrollTargetRef.current = targetY;
+    const lastTarget = lastFocusedScrollTargetRef.current;
+    const alreadyNearTarget = Math.abs(scrollOffsetRef.current - targetY) < 16;
+    const targetMoved = lastTarget == null || Math.abs(lastTarget - targetY) > 24;
+    if (!targetMoved || alreadyNearTarget) return;
+
+    clearPendingFocusedScroll();
+    const elapsed = Date.now() - lastFocusedScrollAtRef.current;
+    const delay = elapsed > 280 ? 40 : 280 - elapsed;
+    pendingFocusedScrollTimerRef.current = setTimeout(() => {
+      pendingFocusedScrollTimerRef.current = null;
+      const latestTarget = latestFocusedScrollTargetRef.current;
+      if (latestTarget == null) return;
+      lastFocusedScrollTargetRef.current = latestTarget;
+      lastFocusedScrollAtRef.current = Date.now();
+      scrollRef.current?.scrollTo({ y: latestTarget, animated: true });
+    }, delay);
+  }, [clearPendingFocusedScroll]);
+
+  const scrollToFocusedTask = useCallback((y: number) => {
+    const requestKey = effectiveFocusRequestKey;
+    const targetY = Math.max(0, y - 96);
+    scheduleFocusedScroll(targetY);
+    if (!requestKey || firedFocusKeyRef.current === requestKey) return;
+    firedFocusKeyRef.current = requestKey;
+    setTimeout(() => {
+      setFocusedGlowKey(requestKey);
+      if (focusedTaskId) {
+        onFocusedTaskSeen?.();
+      } else {
+        markLocalTaskFocusSeen();
+      }
+    }, 520);
+  }, [effectiveFocusRequestKey, focusedTaskId, markLocalTaskFocusSeen, onFocusedTaskSeen, scheduleFocusedScroll]);
+
+  useEffect(() => {
+    clearPendingFocusedScroll();
+    latestFocusedScrollTargetRef.current = null;
+    lastFocusedScrollTargetRef.current = null;
+    lastFocusedScrollAtRef.current = 0;
+    firedFocusKeyRef.current = null;
+    setFocusedGlowKey(null);
+  }, [clearPendingFocusedScroll, effectiveFocusRequestKey]);
+
+  useEffect(() => {
+    return () => clearPendingFocusedScroll();
+  }, [clearPendingFocusedScroll]);
 
   const pageYToContentY = useCallback((pageY: number) => (
     Math.max(0, Math.min(
@@ -11003,7 +11204,7 @@ function ActiveList({ tasks, setTasks, setListTasks, accentColor, aiProvider, ha
           </View>
         ) : (
           TIERS.map(tier => {
-            const collapseKey = `tasks:${activeListId}:${tier.id}`;
+            const collapseKey = taskGroupCollapseKey(activeListId, tier.id);
             return (
               <TierGroup key={tier.id} tier={tier} tasks={tasks.filter(t => t.tier === tier.id)}
                 onComplete={handleComplete} onDelete={handleDelete} requestComplete={requestComplete} onEdit={setEditingTask} accentColor={accentColor}
@@ -13780,6 +13981,10 @@ function StandaloneGrocery({
     clearLocalPendingGroceryGlow(id);
     onPendingGroceryGlowSeen?.(id);
   }, [clearLocalPendingGroceryGlow, onPendingGroceryGlowSeen]);
+  const openGroceryGroupsForDrafts = useCallback((items: GroceryDraft[]) => {
+    const categories = Array.from(new Set(items.map(item => item.category || GROCERY_UNCATEGORIZED)));
+    categories.forEach(category => setCollapsedGroup(groceryGroupCollapseKey(groupCollapseScope, `category:${category}`), false));
+  }, [groupCollapseScope, setCollapsedGroup]);
   const handleAddGroceryItems = useCallback((items: GroceryDraft[]) => {
     return Promise.resolve(onAddGroceryItems(items)).then((ids) => {
       const cleanIds = (ids || []).filter(Boolean);
@@ -13787,6 +13992,7 @@ function StandaloneGrocery({
         showToast('Already on grocery list');
       }
       if (cleanIds[0]) {
+        openGroceryGroupsForDrafts(items);
         setFocusedGroceryId(cleanIds[0]);
         setFocusedGroceryNonce(n => n + 1);
       }
@@ -13795,7 +14001,7 @@ function StandaloneGrocery({
     }).catch((e) => {
       showToast('Could not add groceries', e?.message || 'Check connection');
     });
-  }, [armLocalPendingGroceryGlow, onAddGroceryItems, showToast]);
+  }, [armLocalPendingGroceryGlow, onAddGroceryItems, openGroceryGroupsForDrafts, showToast]);
 
   const markFocusedGrocerySeen = useCallback(() => {
     if (!focusedGroceryId) return;
@@ -14064,6 +14270,9 @@ function TriorityApp() {
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [groceryItems, setGroceryItemsState] = useState<GroceryItem[]>([]);
   const [viewingSharedGrocery, setViewingSharedGroceryState] = useState(false);
+  const [storedSupabaseGroceryId, setStoredSupabaseGroceryId] = useState<string | null>(null);
+  const [sharedGroceryStartupHoldExpired, setSharedGroceryStartupHoldExpired] = useState(false);
+  const [sharedListsStartupHoldExpired, setSharedListsStartupHoldExpired] = useState(false);
   const [collapsedGroups, setCollapsedGroupsState] = useState<CollapsedGroups>({});
   const [pendingReminderNav, setPendingReminderNav] = useState<ReminderNavTarget | null>(null);
   const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
@@ -14122,6 +14331,10 @@ function TriorityApp() {
       return next;
     });
   }, []);
+  const openTaskGroupsForDrafts = useCallback((listId: string, items: TaskDraft[]) => {
+    const tiers = Array.from(new Set(items.map(item => item.tier)));
+    tiers.forEach(tier => setCollapsedGroup(taskGroupCollapseKey(listId, tier), false));
+  }, [setCollapsedGroup]);
   const setCalendarConflictsEnabled = useCallback((enabled: boolean) => {
     markLocalDirty();
     setCalendarConflictsEnabledState(enabled);
@@ -14316,6 +14529,8 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
         }
         const rawSharedGroceryView = await AsyncStorage.getItem(SHARED_GROCERY_TOGGLE_KEY);
         setViewingSharedGroceryState(rawSharedGroceryView === '1');
+        const rawSupabaseGroceryId = await AsyncStorage.getItem(SUPABASE_SHARED_GROCERY_ID_KEY);
+        setStoredSupabaseGroceryId(rawSupabaseGroceryId || null);
         const rawCalendarConflicts = await AsyncStorage.getItem(CALENDAR_CONFLICTS_ENABLED_KEY);
         setCalendarConflictsEnabledState(rawCalendarConflicts === '1');
       } catch {}
@@ -14485,6 +14700,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
   const {
     joinedIds: syncedJoinedIds,
     setJoinedIds: restoreJoinedIds,
+    hydrating: sharedListsHydrating,
   } = useSharedLists();
 
   const syncedSlice: SyncedState = useMemo(() => ({
@@ -14887,6 +15103,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
   }, [applyListTasks]);
 
   const addManyToActiveList = useCallback((items: TaskDraft[]) => {
+    openTaskGroupsForDrafts(activeListId, items);
     const now = Date.now();
     const newTasks: Task[] = items.map((item, i) => ({
       id: now + i, text: item.text, widgetLabel: item.widgetLabel, tier: item.tier, createdAt: now + i, reminder: item.reminder,
@@ -14902,10 +15119,11 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     // No toast renderer at TriorityApp scope; missing-perm path still redirects to system settings.
     scheduleRemindersBatch(newTasks, () => {}, activeListId);
     return newTasks.map((task) => task.id);
-  }, [activeListId, armExternalPendingTaskGlow, armFocusedTask, setTasks]);
+  }, [activeListId, armExternalPendingTaskGlow, armFocusedTask, openTaskGroupsForDrafts, setTasks]);
 
   const addManyToList = useCallback((listId: string, items: TaskDraft[], options?: AddTaskOptions) => {
     const shouldFocus = options?.focus !== false;
+    openTaskGroupsForDrafts(listId, items);
     const now = Date.now();
     const newTasks: Task[] = items.map((item, i) => ({
       id: now + i, text: item.text, widgetLabel: item.widgetLabel, tier: item.tier, createdAt: now + i, reminder: item.reminder,
@@ -14920,9 +15138,10 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     armExternalPendingTaskGlow((shouldFocus ? newTasks.slice(1) : newTasks).map(task => taskGlowKey(listId, task.id)));
     scheduleRemindersBatch(newTasks, () => {}, listId);
     return newTasks.map((task) => task.id);
-  }, [armExternalPendingTaskGlow, armFocusedTask, setListTasks]);
+  }, [armExternalPendingTaskGlow, armFocusedTask, openTaskGroupsForDrafts, setListTasks]);
 
   const addManyToListFromWidget = useCallback((listId: string, items: TaskDraft[]) => {
+    openTaskGroupsForDrafts(listId, items);
     const now = Date.now();
     const newTasks: Task[] = items.map((item, i) => ({
       id: now + i,
@@ -14973,7 +15192,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     });
     scheduleRemindersBatch(newTasks, () => {}, listId);
     return newTasks.map((task) => task.id);
-  }, [setListTasks]);
+  }, [openTaskGroupsForDrafts, setListTasks]);
 
   const setActiveListId = useCallback((id: string) => {
     markLocalDirty();
@@ -15168,6 +15387,26 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
   }, [sharedListsMap, sharedItems]);
 
   const sharedTaskIdSet = useMemo(() => new Set(sharedTaskLists.map(l => l.id)), [sharedTaskLists]);
+  const missingJoinedSharedIds = useMemo(
+    () => syncedJoinedIds.filter(id => !sharedListsMap[id]),
+    [sharedListsMap, syncedJoinedIds],
+  );
+  const missingJoinedSharedKey = missingJoinedSharedIds.join('|');
+  const sharedListsStartupHold = ready
+    && !sharedListsHydrating
+    && missingJoinedSharedIds.length > 0
+    && !sharedListsStartupHoldExpired;
+
+  useEffect(() => {
+    if (!ready || sharedListsHydrating || missingJoinedSharedIds.length === 0) {
+      setSharedListsStartupHoldExpired(false);
+      return;
+    }
+    setSharedListsStartupHoldExpired(false);
+    const timer = setTimeout(() => setSharedListsStartupHoldExpired(true), 5000);
+    return () => clearTimeout(timer);
+  }, [missingJoinedSharedIds.length, missingJoinedSharedKey, ready, sharedListsHydrating]);
+
   const reminderTasksForScheduling = useMemo(() => {
     const privateTasks = lists.flatMap(l =>
       l.tasks.map(t => ({ ...t, reminderListId: l.id, reminderTaskId: t.id })),
@@ -15282,6 +15521,27 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
   const sharedGroceryDoc = useMemo(() => {
     return Object.values(sharedListsMap).find((l) => l.kind === 'grocery') ?? null;
   }, [sharedListsMap]);
+  const sharedGroceryStartupExpected = viewingSharedGrocery || !!storedSupabaseGroceryId;
+  const sharedGroceryStartupHold = ready
+    && sharedGroceryStartupExpected
+    && !sharedGroceryDoc
+    && !sharedGroceryStartupHoldExpired;
+
+  useEffect(() => {
+    if (!ready || !sharedGroceryStartupExpected || sharedGroceryDoc) {
+      setSharedGroceryStartupHoldExpired(false);
+      return;
+    }
+    setSharedGroceryStartupHoldExpired(false);
+    const timer = setTimeout(() => setSharedGroceryStartupHoldExpired(true), 5000);
+    return () => clearTimeout(timer);
+  }, [ready, sharedGroceryDoc?.id, sharedGroceryStartupExpected]);
+
+  useEffect(() => {
+    if (!sharedGroceryDoc || !isSupabaseSharedListId(sharedGroceryDoc.id)) return;
+    setStoredSupabaseGroceryId(sharedGroceryDoc.id);
+  }, [sharedGroceryDoc?.id]);
+
   const sharedGroceryItems = useMemo(() => {
     if (!sharedGroceryDoc) return [];
     return (sharedItems[sharedGroceryDoc.id] || []).map((it): GroceryItem => {
@@ -15530,13 +15790,6 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     });
   }, []);
 
-  const armGroceryResultGlow = useCallback((ids: string[]) => {
-    const cleanIds = ids.filter(Boolean);
-    if (cleanIds.length === 0) return;
-    armFocusedGrocery(cleanIds[0]);
-    armPendingGroceryGlow(cleanIds.slice(1));
-  }, [armFocusedGrocery, armPendingGroceryGlow]);
-
   const markFocusedGrocerySeen = useCallback(() => {
     if (!focusedGroceryId) return;
     setTimeout(() => {
@@ -15563,10 +15816,10 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
   }, [isActiveShared, activeListId, addSharedTaskItems, editSharedTaskItem, deleteSharedTaskItem, archiveSharedTaskItem]);
 
   useEffect(() => {
-    if (!sharedGroceryDoc && viewingSharedGrocery) {
+    if (!sharedGroceryDoc && viewingSharedGrocery && !sharedListsHydrating && !sharedGroceryStartupHold && syncedJoinedIds.length === 0 && !storedSupabaseGroceryId) {
       setViewingSharedGrocery(false);
     }
-  }, [sharedGroceryDoc, setViewingSharedGrocery, viewingSharedGrocery]);
+  }, [sharedGroceryDoc, setViewingSharedGrocery, sharedGroceryStartupHold, sharedListsHydrating, storedSupabaseGroceryId, syncedJoinedIds.length, viewingSharedGrocery]);
 
   useEffect(() => {
     if (!sharedGroceryDoc || viewingSharedGrocery) return;
@@ -15590,8 +15843,21 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     return addSharedGroceryItems(sharedGroceryDoc.id, items);
   }, [addGroceryItems, addSharedGroceryItems, sharedGroceryDoc, usingSharedGrocery]);
 
+  const openGroceryGroupsForDrafts = useCallback((items: GroceryDraft[]) => {
+    const categories = Array.from(new Set(items.map(item => item.category || GROCERY_UNCATEGORIZED)));
+    categories.forEach(category => setCollapsedGroup(groceryGroupCollapseKey(groceryGroupCollapseScope, `category:${category}`), false));
+  }, [groceryGroupCollapseScope, setCollapsedGroup]);
+
+  const armGroceryResultGlow = useCallback((ids: string[], items: GroceryDraft[] = []) => {
+    const cleanIds = ids.filter(Boolean);
+    if (cleanIds.length === 0) return;
+    openGroceryGroupsForDrafts(items);
+    armFocusedGrocery(cleanIds[0]);
+    armPendingGroceryGlow(cleanIds.slice(1));
+  }, [armFocusedGrocery, armPendingGroceryGlow, openGroceryGroupsForDrafts]);
+
   useEffect(() => {
-    if (!ready || !TriorityWidget?.consumePendingCaptures) return;
+    if (!ready || sharedListsHydrating || sharedListsStartupHold || sharedGroceryStartupHold || !TriorityWidget?.consumePendingCaptures) return;
 
     const resolveWidgetTargetListId = (candidate?: string | null) => {
       if (candidate && mergedLists.some(list => list.id === candidate)) return candidate;
@@ -15601,6 +15867,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
 
     const addWidgetItems = async (targetListId: string, items: TaskDraft[]) => {
       const resolvedListId = resolveWidgetTargetListId(targetListId);
+      openTaskGroupsForDrafts(resolvedListId, items);
       if (sharedTaskIdSet.has(resolvedListId)) {
         try {
           const ids = await addSharedTaskItems(resolvedListId, items);
@@ -15648,8 +15915,11 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
 
         const taskFocusCandidates: { listId: string; id: TaskId }[] = [];
         const groceryFocusIds: string[] = [];
+        const groceryFocusDrafts: GroceryDraft[] = [];
         let addedTasks = 0;
         let addedGroceries = 0;
+        let requestedGroceries = 0;
+        let failedGroceries = 0;
         let addedReminders = 0;
 
         for (const capture of parsed as WidgetPendingCapture[]) {
@@ -15687,25 +15957,39 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
           }
 
           if (draft.grocery.length > 0) {
-            const ids = await Promise.resolve(addGroceryItemsForScreen(draft.grocery));
-            addedGroceries += draft.grocery.length;
-            if (Array.isArray(ids)) {
-              groceryFocusIds.push(...ids.filter(Boolean));
+            requestedGroceries += draft.grocery.length;
+            let ids: string[] = [];
+            try {
+              const result = await Promise.resolve(addGroceryItemsForScreen(draft.grocery));
+              ids = Array.isArray(result) ? result.filter(Boolean) : [];
+            } catch {
+              failedGroceries += draft.grocery.length;
+            }
+            if (ids.length > 0) {
+              addedGroceries += ids.length;
+              groceryFocusDrafts.push(...draft.grocery);
+              groceryFocusIds.push(...ids);
             }
           }
         }
 
         const resultText = widgetResultSummary(addedTasks, addedGroceries, addedReminders);
         if (resultText) {
-          showWidgetImportToast(resultText, 'From widget');
+          const resultSub = failedGroceries > 0
+            ? 'Some groceries could not be added'
+            : requestedGroceries > addedGroceries
+              ? 'Already on grocery list'
+              : 'From widget';
+          showWidgetImportToast(resultText, resultSub);
           try { TriorityWidget.showWidgetResult?.(resultText); } catch {}
+        } else if (requestedGroceries > 0) {
+          showWidgetImportToast(
+            failedGroceries > 0 ? 'Could not add grocery' : 'Already on grocery list',
+            failedGroceries > 0 ? 'Check connection and try again' : undefined,
+          );
         } else {
           showWidgetImportToast('Widget capture finished');
         }
-        if (groceryFocusIds.length > 0) {
-          armGroceryResultGlow(groceryFocusIds);
-        }
-
         const leftmostTask = taskFocusCandidates
           .filter(candidate => mergedLists.some(list => list.id === candidate.listId))
           .sort((a, b) => {
@@ -15713,6 +15997,10 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
             const bi = mergedLists.findIndex(list => list.id === b.listId);
             return ai - bi;
           })[0] ?? taskFocusCandidates[0] ?? null;
+
+        if (groceryFocusIds.length > 0) {
+          armGroceryResultGlow(groceryFocusIds, groceryFocusDrafts);
+        }
 
         if (leftmostTask) {
           setScreen('list');
@@ -15757,9 +16045,13 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     isPaid,
     lists,
     mergedLists,
+    openTaskGroupsForDrafts,
     personalContext,
     ready,
     setActiveListId,
+    sharedGroceryStartupHold,
+    sharedListsHydrating,
+    sharedListsStartupHold,
     sharedTaskIdSet,
     showWidgetImportToast,
     widgetShorthand,
@@ -15907,7 +16199,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
         <PortalHost>
           <BackButtonManager screen={screen} setScreen={setScreen} />
           <View style={{ flex: 1, overflow: 'hidden' }}>
-            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} aiProvider={aiProvider} hasApiKey={hasApiKey} defaultTier={defaultTier} widgetShorthand={widgetShorthand} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} onGroceryOnlyAdded={(ids, navigate = true) => { armGroceryResultGlow(ids); if (navigate) setScreen('grocery'); }} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} focusedTaskNonce={focusedTaskNonce} onFocusedTaskSeen={markFocusedTaskSeen} externalPendingTaskGlowIds={externalPendingTaskGlowIds} onExternalPendingTaskGlowSeen={clearExternalPendingTaskGlow} calendarConflictKeys={calendarConflictKeys} calendarConflictNotice={calendarConflictNotice} />}
+            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} aiProvider={aiProvider} hasApiKey={hasApiKey} defaultTier={defaultTier} widgetShorthand={widgetShorthand} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} onGroceryOnlyAdded={(ids, navigate = true, items = []) => { armGroceryResultGlow(ids, items); if (navigate) setScreen('grocery'); }} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} focusedTaskNonce={focusedTaskNonce} onFocusedTaskSeen={markFocusedTaskSeen} externalPendingTaskGlowIds={externalPendingTaskGlowIds} onExternalPendingTaskGlowSeen={clearExternalPendingTaskGlow} calendarConflictKeys={calendarConflictKeys} calendarConflictNotice={calendarConflictNotice} />}
             {screen === 'grocery' && (
               <StandaloneGrocery
                 groceryItems={groceryItemsForScreen}
@@ -16172,7 +16464,7 @@ const styles = StyleSheet.create({
 
   // Used by sheets that want tap-anywhere-outside-to-close behavior. Overlay covers the
   // whole screen behind the sheet content; sheet view itself swallows taps via responder.
-  sheetFullBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.45)' },
+  sheetFullBackdrop: { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, backgroundColor: 'rgba(0,0,0,0.45)' },
   // Tighter padding/margins for compact sheets (upsell, list actions) so they don't
   // reach the screen edges on smaller phones.
   sheetCompact: { paddingHorizontal: 16, paddingBottom: 24, maxHeight: '85%', overflow: 'hidden' },

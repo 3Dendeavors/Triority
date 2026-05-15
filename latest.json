@@ -1,8 +1,9 @@
 {
-  "versionName": "1.4.12",
-  "versionCode": 28,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.12/Triority-v1.4.12.apk",
-  "releaseNotes": "Sync hotfix: recent task/list edits now stay protected while their cloud backup write is pending, and normal app-version marker changes no longer clear local task/list/archive data.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.12",
+  "versionName": "1.4.13",
+  "versionCode": 29,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.13/Triority-v1.4.13.apk",
+  "sha256": "E82CA33856C27D116FECED8F28756BAD7491A2EDBEE2887D164232055EECE7C8",
+  "releaseNotes": "AI and widget grocery hotfix: mixed task-plus-grocery captures now keep explicitly requested grocery rows, shared task/grocery snap-and-shine behavior is smoother, cold-start widget imports wait for shared targets, and release verification/GitHub automation were hardened.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.13",
   "required": false
 }

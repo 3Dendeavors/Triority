@@ -70,33 +70,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version_code="$(node <<'NODE'
-          const fs = require('fs');
-          const gradle = fs.readFileSync('android/app/build.gradle', 'utf8');
-          const versionCode = gradle.match(/versionCode\s+(\d+)/)?.[1];
-          if (!versionCode) throw new Error('Could not read versionCode from android/app/build.gradle');
-          console.log(versionCode);
-          NODE
-          )"
-          version_name="$(node <<'NODE'
-          const fs = require('fs');
-          const gradle = fs.readFileSync('android/app/build.gradle', 'utf8');
-          const versionName = gradle.match(/versionName\s+"([^"]+)"/)?.[1];
-          if (!versionName) throw new Error('Could not read versionName from android/app/build.gradle');
-          console.log(versionName);
-          NODE
-          )"
-          echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
-          echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
-
-          tag_version="${GITHUB_REF_NAME#v}"
-          if [ "$version_name" != "$tag_version" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match android versionName $version_name" >&2
-            exit 1
-          fi
+          node scripts/check-release-version.js --tag "$GITHUB_REF_NAME"
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Verify source
+        run: npm run verify
 
       - name: Build signed release APK
         working-directory: android
@@ -110,6 +90,9 @@ jobs:
           set -euo pipefail
           cp android/app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/$APK_BASENAME"
           echo "apk_path=$RUNNER_TEMP/$APK_BASENAME" >> "$GITHUB_ENV"
+          apk_sha256="$(sha256sum "$RUNNER_TEMP/$APK_BASENAME" | awk '{print toupper($1)}')"
+          printf '%s  %s\n' "$apk_sha256" "$APK_BASENAME" > "$RUNNER_TEMP/$APK_BASENAME.sha256"
+          echo "APK_SHA256=$apk_sha256" >> "$GITHUB_ENV"
 
       - name: Create or update GitHub Release
         shell: bash
@@ -123,6 +106,8 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --title "Triority $GITHUB_REF_NAME" --generate-notes
           fi
           gh release upload "$GITHUB_REF_NAME" "$apk_path#$APK_BASENAME" --clobber
+          gh release upload "$GITHUB_REF_NAME" "$apk_path.sha256#$APK_BASENAME.sha256" --clobber
+          gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | grep -Fx "$APK_BASENAME" >/dev/null
 
       - name: Update latest.json on main
         shell: bash
@@ -138,12 +123,13 @@ jobs:
           git checkout -B main origin/main
           git pull --ff-only origin main
 
-          APK_URL="$apk_url" RELEASE_URL="$release_url" RELEASE_NOTES="$release_notes" node <<'NODE'
+          APK_URL="$apk_url" APK_SHA256="$APK_SHA256" RELEASE_URL="$release_url" RELEASE_NOTES="$release_notes" node <<'NODE'
           const fs = require('fs');
           const manifest = {
             versionName: '${{ steps.version.outputs.version_name }}',
             versionCode: Number('${{ steps.version.outputs.version_code }}'),
             apkUrl: process.env.APK_URL,
+            sha256: process.env.APK_SHA256,
             releaseNotes: process.env.RELEASE_NOTES || '',
             releaseNotesUrl: process.env.RELEASE_URL,
             required: false,
