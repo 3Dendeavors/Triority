@@ -1,15 +1,20 @@
 name: Android Release
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and publish, such as v1.4.13.
+        required: true
+        type: string
+
+run-name: Android Release ${{ inputs.tag }}
 
 permissions:
   contents: write
 
 concurrency:
-  group: android-release-${{ github.ref_name }}
+  group: android-release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -18,13 +23,15 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      APK_BASENAME: Triority-${{ github.ref_name }}.apk
+      RELEASE_TAG: ${{ inputs.tag }}
+      APK_BASENAME: Triority-${{ inputs.tag }}.apk
 
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag }}
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -49,11 +56,22 @@ jobs:
           TRIORITY_RELEASE_KEY_PASSWORD: ${{ secrets.TRIORITY_RELEASE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          test -n "$GOOGLE_SERVICES_JSON_BASE64"
-          test -n "$TRIORITY_RELEASE_KEYSTORE_BASE64"
-          test -n "$TRIORITY_RELEASE_STORE_PASSWORD"
-          test -n "$TRIORITY_RELEASE_KEY_ALIAS"
-          test -n "$TRIORITY_RELEASE_KEY_PASSWORD"
+          missing=0
+          for secret_name in \
+            GOOGLE_SERVICES_JSON_BASE64 \
+            TRIORITY_RELEASE_KEYSTORE_BASE64 \
+            TRIORITY_RELEASE_STORE_PASSWORD \
+            TRIORITY_RELEASE_KEY_ALIAS \
+            TRIORITY_RELEASE_KEY_PASSWORD
+          do
+            if [ -z "${!secret_name}" ]; then
+              echo "::error title=Missing release secret::$secret_name is not configured. Run scripts/prepare-github-release-secrets.ps1 -Upload from the private release workspace."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
 
           printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | base64 --decode > android/app/google-services.json
           printf '%s' "$TRIORITY_RELEASE_KEYSTORE_BASE64" | base64 --decode > android/app/triority-release.keystore
@@ -70,7 +88,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/check-release-version.js --tag "$GITHUB_REF_NAME"
+          node scripts/check-release-version.js --tag "$RELEASE_TAG"
 
       - name: Install dependencies
         run: npm ci
@@ -100,14 +118,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --title "Triority $GITHUB_REF_NAME"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "Triority $RELEASE_TAG"
           else
-            gh release create "$GITHUB_REF_NAME" --title "Triority $GITHUB_REF_NAME" --generate-notes
+            gh release create "$RELEASE_TAG" --title "Triority $RELEASE_TAG" --generate-notes
           fi
-          gh release upload "$GITHUB_REF_NAME" "$apk_path#$APK_BASENAME" --clobber
-          gh release upload "$GITHUB_REF_NAME" "$apk_path.sha256#$APK_BASENAME.sha256" --clobber
-          gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | grep -Fx "$APK_BASENAME" >/dev/null
+          gh release upload "$RELEASE_TAG" "$apk_path#$APK_BASENAME" --clobber
+          gh release upload "$RELEASE_TAG" "$apk_path.sha256#$APK_BASENAME.sha256" --clobber
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | grep -Fx "$APK_BASENAME" >/dev/null
 
       - name: Update latest.json on main
         shell: bash
@@ -115,9 +133,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}"
-          apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${APK_BASENAME}"
-          release_notes="$(gh release view "$GITHUB_REF_NAME" --json body --jq '.body')"
+          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${APK_BASENAME}"
+          release_notes="$(gh release view "$RELEASE_TAG" --json body --jq '.body')"
 
           git fetch origin main
           git checkout -B main origin/main
@@ -138,12 +156,12 @@ jobs:
           NODE
 
           if git diff --quiet -- latest.json; then
-            echo "latest.json already points to $GITHUB_REF_NAME"
+            echo "latest.json already points to $RELEASE_TAG"
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add latest.json
-          git commit -m "Update latest.json for $GITHUB_REF_NAME"
+          git commit -m "Update latest.json for $RELEASE_TAG"
           git push origin main
