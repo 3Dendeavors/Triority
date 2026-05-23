@@ -1,9 +1,9 @@
 {
-  "versionName": "1.4.13",
-  "versionCode": 29,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.13/Triority-v1.4.13.apk",
-  "sha256": "E82CA33856C27D116FECED8F28756BAD7491A2EDBEE2887D164232055EECE7C8",
-  "releaseNotes": "AI and widget grocery hotfix: mixed task-plus-grocery captures now keep explicitly requested grocery rows, shared task/grocery snap-and-shine behavior is smoother, cold-start widget imports wait for shared targets, and release verification/GitHub automation were hardened.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.13",
+  "versionName": "1.4.18",
+  "versionCode": 34,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.18/Triority-v1.4.18.apk",
+  "sha256": "ACF02EECD7E2B6EAFBE8B88D87292846B401C17D0630316AC1BD5720B02F61D1",
+  "releaseNotes": "Included Triority AI is now the default tester path without storing a Gemini key in the APK. This release also fixes Test List routing, mixed Website/grocery splitting and shine, visible AI failures that preserve typed input, and mixed direct-task/grocery prompts that previously dropped early tasks.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.18",
   "required": false
 }
