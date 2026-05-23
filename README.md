@@ -1,6 +1,10 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Triority logo" width="96">
+</p>
+
 # Triority
 
-Triority is a private-first Android task, grocery, reminder, and AI triage app. It is built around quick capture, three practical priority tiers, optional Google sync, shared household-style lists, Android voice widgets, and bring-your-own AI provider access.
+Triority is a private-first Android task, grocery, reminder, and AI triage app. It is built around quick capture, three practical priority tiers, optional Google sync, shared household-style lists, Android voice widgets, included tester AI, and optional bring-your-own AI provider access.
 
 Triority is distributed as a signed Android APK through GitHub Releases. It is not currently distributed through the Play Store, so installation is a normal Android sideload.
 
@@ -9,15 +13,15 @@ Triority is distributed as a signed Android APK through GitHub Releases. It is n
 The current public beta APK is published on GitHub Releases:
 
 - Latest release: https://github.com/3Dendeavors/Triority/releases/latest
-- Current beta: `v1.4.13`
+- Current beta: `v1.4.18`
 - Android package id: `com.triority`
-- Current APK: `Triority-v1.4.13.apk`
-- SHA-256: `E82CA33856C27D116FECED8F28756BAD7491A2EDBEE2887D164232055EECE7C8`
+- Current APK: `Triority-v1.4.18.apk`
+- SHA-256: `ACF02EECD7E2B6EAFBE8B88D87292846B401C17D0630316AC1BD5720B02F61D1`
 
 To install:
 
 1. Open the latest release page on your Android device.
-2. Under **Assets**, download `Triority-v1.4.13.apk`.
+2. Under **Assets**, download `Triority-v1.4.18.apk`.
 3. If Android asks, allow your browser or file manager to install unknown apps.
 4. Open the downloaded APK and tap **Install**.
 5. Launch Triority from your app drawer.
@@ -34,7 +38,7 @@ Installed builds check this repo's `latest.json` and prompt when a newer APK is 
 - Shared task lists and one shared grocery page through optional sign-in and invite codes.
 - Local and shared task reminders, with each device alerting only when that user allows notifications.
 - Optional read-only Google Calendar conflict checks for reminder tasks.
-- Optional AI triage using your own Gemini or Claude Sonnet API key, Personal Context, and current task/grocery workspace.
+- Included tester AI by default, plus optional AI triage using your own Gemini or Claude Sonnet API key, Personal Context, and current task/grocery workspace.
 - Android launcher widgets for voice capture and Next Up previews.
 - Themes, accent colors, widget appearance controls, and optional support through Buy Me a Coffee.
 
@@ -49,11 +53,11 @@ Network calls are limited to:
 - Firebase for optional Google sign-in, sync, and legacy shared lists.
 - Supabase for current shared-list collaboration.
 - Google Calendar free/busy checks only when you enable calendar conflict checks.
-- The selected AI provider only when you provide an API key and use AI features.
+- Triority's included AI endpoint or the selected AI provider only when you use AI features.
 - GitHub for update checks.
 - Buy Me a Coffee only when you tap the support link.
 
-Google handles sign-in. Triority does not receive your Google password. Your AI provider key is stored locally with encrypted storage, is remembered per Google account on the same phone, and is not intentionally synced to the cloud.
+Google handles sign-in. Triority does not receive your Google password. If you use your own AI provider key, it is stored locally with encrypted storage, is remembered per Google account on the same phone, and is not intentionally synced to the cloud.
 
 Full policy: [PRIVACY.md](PRIVACY.md)
 

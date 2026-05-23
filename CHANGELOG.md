@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v1.4.18 - 2026-05-23
+
+- Added included Triority AI as the default tester path, while keeping Gemini and Claude bring-your-own-key options available.
+- Added a one-time included-AI announcement, updated Settings copy, and kept the Gemini secret out of the APK by routing built-in AI through a Supabase Edge Function with rate-limit storage.
+- Fixed AI task-list routing for generic list names such as "Test List" when the prompt explicitly says to put the captured tasks in that named list.
+- Fixed mixed AI prompts like "test page on website eggs milk bread" so the Website task is separated from the grocery rows, and delayed mixed-grocery rows still shine when Grocery is opened later.
+- Changed failed AI-mode submissions to fail visibly while preserving the typed input instead of silently adding a raw fallback row.
+- Fixed mixed direct-task/grocery prompts so an early task like "rub Kailyns back" is preserved when bare grocery words appear before another task clause.
+
 ## v1.4.12 - 2026-05-14
 
 - Protected recent local task/list edits from being overwritten by an older Firestore restore while the debounced sync write is still pending.

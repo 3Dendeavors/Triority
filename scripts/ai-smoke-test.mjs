@@ -48,6 +48,8 @@ const AI_INTENT_RULES = `Intent rules:
 - Use intent frames over memorized phrases: action verb + object = task; event/appointment noun + date/time = task with reminder; ingredients/supplies/materials + topic = grocery/material rows; plan/routine/checklist/tips + topic = concrete task rows.
 - If user asks for a routine, plan, checklist, ideas, tips, advice, steps, or "what should I do", convert that clause into task rows.
 - If user asks for ingredients, recipe, shopping, groceries, supplies, materials, equipment, accessories, gear, tools, packing, or buy-list items, convert that clause into grocery/material rows.
+- In mixed input, a trailing run of normal grocery item names like "eggs milk bread" becomes grocery rows even without buy/get words.
+- Keep every direct action clause as a task, even when grocery words appear between actions.
 - Casual words like stuff, junk, crap, or things also mean grocery/material rows when attached to a recipe, meal, smoothie, project, repair, packing, or buying clause.
 - If a clause says buy/get/grab/pick up a normal grocery item such as eggs, milk, bread, fruit, or rice, convert that clause into grocery/material rows instead of a task.
 - If ambiguous, prefer task rows.
@@ -91,6 +93,14 @@ const LISTS = [
     tasks: [
       { text: 'build BoM for sv4 and 8', tier: 'high' },
       { text: 'revise hardware list', tier: 'medium' },
+    ],
+  },
+  {
+    id: 'website',
+    name: 'Website',
+    tasks: [
+      { text: 'update product page', tier: 'medium' },
+      { text: 'test checkout flow', tier: 'medium' },
     ],
   },
   {
@@ -255,6 +265,29 @@ const CASES = {
       groceryText: ['eggs'],
       forbiddenListTaskText: [
         { text: 'eggs', listId: 'personal' },
+      ],
+    },
+  },
+  'todo-direct-bare-grocery-recovery': {
+    screen: 'tasks',
+    input: 'Rub Kailyns back eggs milk and setup website page for biomed.',
+    expect: {
+      minTasks: 2,
+      minGrocery: 2,
+      hasLists: ['personal', 'website'],
+      taskTextList: [
+        { text: 'kailyn', listId: 'personal' },
+        { text: 'website', listId: 'website' },
+      ],
+      taskTextMaxCount: [
+        { text: 'kailyn', max: 1 },
+        { text: 'website', max: 1 },
+      ],
+      groceryText: ['eggs', 'milk'],
+      forbiddenListTaskText: [
+        { text: 'eggs', listId: 'personal' },
+        { text: 'milk', listId: 'personal' },
+        { text: 'kailyn', listId: 'website' },
       ],
     },
   },
@@ -510,7 +543,7 @@ function normalizeAiListText(value) {
 
 const AI_LIST_GENERIC_TOKENS = new Set([
   'a', 'an', 'and', 'for', 'in', 'list', 'main', 'my', 'need', 'needs', 'of', 'on', 'our',
-  'body', 'shared', 'task', 'tasks', 'the', 'to', 'todo', 'work',
+  'body', 'shared', 'task', 'tasks', 'test', 'the', 'to', 'todo', 'work',
 ]);
 const AI_TASK_TEXT_STOP_TOKENS = new Set([
   'a', 'add', 'an', 'and', 'can', 'create', 'do', 'for', 'i', 'me', 'my', 'need',
@@ -627,6 +660,7 @@ function shouldInferGroceryQuantities(input) {
 function hasGroceryGenerationIntent(input) {
   const normalized = input.replace(/\s+/g, ' ').trim();
   return hasDirectGroceryAcquisitionIntent(normalized)
+    || inputHasBareGroceryItemList(normalized)
     || (shouldInferGroceryQuantities(normalized)
     && (/\b(ingredients?|supplies|materials?|equipment|accessories|gear|tools?|items)\b.{0,32}\b(for|to make|to build|to buy|to purchase|needed for|for making|for a|for an)\b/i.test(normalized)
       || /\b([a-z0-9]+[-\s]+)?ingredients?\b/i.test(normalized)
@@ -703,17 +737,34 @@ const DIRECT_GROCERY_ITEM_PATTERNS = [
   { re: /\bcereal\b/i, name: 'cereal', category: 'Canned & Dry Goods' },
 ];
 
+function directGroceryDraftCandidatesFromRaw(input) {
+  const existing = new Set();
+  return DIRECT_GROCERY_ITEM_PATTERNS
+    .filter(({ re }) => re.test(input))
+    .map(({ name, category }) => ({ name, category }))
+    .filter((item) => {
+      const key = normalizeAiNameToken(item.name);
+      if (!key || existing.has(key)) return false;
+      existing.add(key);
+      return true;
+    });
+}
+
 function hasDirectGroceryAcquisitionIntent(input) {
   const normalized = input.replace(/\s+/g, ' ').trim();
   return /\b(buy|grab|get|pick up|pickup|purchase)\b/i.test(normalized)
     && DIRECT_GROCERY_ITEM_PATTERNS.some(({ re }) => re.test(normalized));
 }
 
+function inputHasBareGroceryItemList(input) {
+  const candidates = directGroceryDraftCandidatesFromRaw(input);
+  if (candidates.length < 2) return false;
+  return hasDirectTaskActionIntent(input) || hasScheduledEventStatement(input);
+}
+
 function directGroceryDraftsFromRaw(input) {
-  if (!hasDirectGroceryAcquisitionIntent(input)) return [];
-  return DIRECT_GROCERY_ITEM_PATTERNS
-    .filter(({ re }) => re.test(input))
-    .map(({ name, category }) => ({ name, category }));
+  if (!hasDirectGroceryAcquisitionIntent(input) && !inputHasBareGroceryItemList(input)) return [];
+  return directGroceryDraftCandidatesFromRaw(input);
 }
 
 function mergeRecoveredGroceryDrafts(items, input) {
@@ -728,11 +779,40 @@ function mergeRecoveredGroceryDrafts(items, input) {
   return recovered.length > 0 ? [...items, ...recovered] : items;
 }
 
+function cleanRecoveredGroceryTermsFromTaskText(text, input) {
+  const recovered = directGroceryDraftsFromRaw(input);
+  if (recovered.length === 0) return String(text || '').trim();
+  let cleaned = String(text || '');
+  DIRECT_GROCERY_ITEM_PATTERNS
+    .filter(({ re }) => re.test(input))
+    .forEach(({ re }) => {
+      const flags = re.flags.includes('g') ? re.flags : `${re.flags}g`;
+      cleaned = cleaned.replace(new RegExp(re.source, flags), ' ');
+    });
+  cleaned = cleaned
+    .replace(/\b(?:and|plus|also|with)\b\s*$/i, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .replace(/^[,.;:\s-]+|[,.;:\s-]+$/g, '')
+    .trim();
+  return cleaned && hasDirectTaskActionIntent(cleaned) ? cleaned : String(text || '').trim();
+}
+
+function cleanRecoveredGroceryTermsFromTaskRows(items, input) {
+  if (directGroceryDraftsFromRaw(input).length === 0) return items;
+  return items.map((item) => {
+    const text = String(item?.text ?? '').trim();
+    const cleaned = cleanRecoveredGroceryTermsFromTaskText(text, input);
+    return cleaned && cleaned !== text ? { ...item, text: cleaned } : item;
+  });
+}
+
 function hasDirectTaskActionIntent(input) {
   const normalized = input.replace(/\s+/g, ' ').trim();
   if (/\b(remind me|set a reminder|add (a )?task|todo|to-do)\b/i.test(normalized)) return true;
-  const actionVerb = /\b(call|text|email|schedule|book|pay|order|fix|repair|clean|finish|submit|send|test|workout|exercise|train|walk|walking|wake|rub)\b/i;
+  const actionVerb = /\b(call|text|email|schedule|book|pay|order|fix|repair|clean|finish|submit|send|set\s+up|setup|test|workout|exercise|train|walk|walking|wake|rub)\b/i;
   if (new RegExp(`^\\s*${actionVerb.source}`, 'i').test(normalized)) return true;
+  if (new RegExp(`\\b(?:and|also|plus|then)\\s+${actionVerb.source}`, 'i').test(normalized)) return true;
   return actionVerb.test(normalized)
     && /\b(today|tomorrow|tonight|later|this morning|this afternoon|this evening|morning|afternoon|evening|noon|midnight|at\s+\d{1,2}|around\s+\d{1,2}|round\s+\d{1,2}|by\s+\d{1,2}|in\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)|\d{1,2}(:\d{2})?\s*(am|pm|a|p))\b/i.test(normalized);
 }
@@ -1139,6 +1219,18 @@ function dropCoveredCompoundTaskRows(items) {
   return items.filter((_item, index) => {
     const current = keyed[index];
     if (!current || current.tokens.length < 3) return true;
+    const coveringRows = keyed.filter(other => (
+      other.index !== index
+      && other.tokens.length >= 2
+      && other.tokens.length < current.tokens.length
+      && aiTaskTokensContainAll(current.tokens, other.tokens)
+    ));
+    if (
+      coveringRows.length >= 2
+      && aiTaskTokensContainAll(coveringRows.flatMap(other => other.tokens), current.tokens)
+    ) {
+      return false;
+    }
     return !keyed.some(other => (
       other.index !== index
       && other.tokens.length >= 2
@@ -1299,13 +1391,21 @@ function trimGeneratedTaskRowsPreservingDirect(items, input) {
 
 const AI_DIRECT_TASK_RECOVERY_TOKENS = new Set([
   'call', 'text', 'email', 'schedule', 'book', 'pay', 'order', 'fix', 'repair', 'clean',
-  'do', 'finish', 'submit', 'send', 'test', 'wake', 'walk', 'walking', 'rub',
+  'do', 'finish', 'submit', 'send', 'setup', 'test', 'wake', 'walk', 'walking', 'rub',
 ]);
 
-const AI_DIRECT_TASK_SEGMENT_SPLIT_TOKENS = new Set([
-  ...AI_DIRECT_TASK_RECOVERY_TOKENS,
-  'buy', 'get', 'grab', 'pick', 'purchase',
-]);
+const AI_DIRECT_GROCERY_SPLIT_TOKENS = new Set(['buy', 'get', 'grab', 'pick', 'purchase']);
+
+function isDirectTaskRecoveryToken(tokens, index) {
+  const token = tokens[index] ?? '';
+  return AI_DIRECT_TASK_RECOVERY_TOKENS.has(token)
+    || (token === 'set' && tokens[index + 1] === 'up');
+}
+
+function isDirectTaskSegmentSplitToken(tokens, index) {
+  const token = tokens[index] ?? '';
+  return isDirectTaskRecoveryToken(tokens, index) || AI_DIRECT_GROCERY_SPLIT_TOKENS.has(token);
+}
 
 const AI_GENERATED_CLAUSE_BOUNDARY_TOKENS = new Set([
   'advice', 'checklist', 'idea', 'ideas', 'ingredient', 'ingredients', 'grocery', 'groceries',
@@ -1356,15 +1456,15 @@ function aiTokensCloseEnough(a, b) {
 }
 
 function recoveredDirectTaskRowsFromRaw(raw, existingItems) {
-  if (!hasTaskGenerationIntent(raw)) return [];
+  if (!hasTaskGenerationIntent(raw) && !hasDirectTaskActionIntent(raw)) return [];
   const tokens = normalizeAiListText(raw).split(' ').filter(Boolean);
   const existingKeys = existingItems.map(item => aiTaskDedupeKey(String(item?.text ?? ''))).filter(Boolean);
   const recovered = [];
   tokens.forEach((token, index) => {
-    if (!AI_DIRECT_TASK_RECOVERY_TOKENS.has(token)) return;
+    if (!isDirectTaskRecoveryToken(tokens, index)) return;
     const nextActionIndex = tokens.findIndex((candidate, candidateIndex) => (
       candidateIndex > index
-      && (AI_DIRECT_TASK_SEGMENT_SPLIT_TOKENS.has(candidate) || candidate === 'and' || candidate === 'plus' || candidate === 'also' || candidate === 'then')
+      && (isDirectTaskSegmentSplitToken(tokens, candidateIndex) || candidate === 'and' || candidate === 'plus' || candidate === 'also' || candidate === 'then')
     ));
     const end = nextActionIndex >= 0 ? nextActionIndex : tokens.length;
     const segment = trimDirectTaskRecoverySegment(tokens.slice(index, end));
@@ -1512,12 +1612,17 @@ function taskRowsMissingGeneratedHint(items, raw, destinationHint) {
 }
 
 function inputUsesTaskListAsDestination(input, list) {
-  const normalizedInput = ` ${normalizeAiListText(input)} `;
+  const normalizedInput = normalizeAiListText(input);
   const normalizedName = normalizeAiListText(list.name);
-  return normalizedInput.includes(` to ${normalizedName} list `)
-    || normalizedInput.includes(` in ${normalizedName} list `)
-    || normalizedInput.includes(` into ${normalizedName} list `)
-    || normalizedInput.includes(` on ${normalizedName} list `);
+  if (!normalizedName) return false;
+  const escaped = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const listLikeName = /\b(?:list|tasks?|todo)\b/.test(normalizedName);
+  const targetPhrases = listLikeName
+    ? [normalizedName]
+    : [`${normalizedName} list`, `${normalizedName} tasks`];
+  return targetPhrases.some((phrase) => (
+    new RegExp(`\\b(?:to|in|into|on|under|inside|within)\\s+(?:the\\s+|my\\s+|our\\s+|a\\s+)?${escaped(phrase)}\\b`).test(normalizedInput)
+  ));
 }
 
 function resolveAiTaskListId({ text, raw, aiListIdValue, lists, destinationHint }) {
@@ -1908,6 +2013,8 @@ Rows:
 - plans/routines/checklists/tips/advice -> 3-5 concrete task rows, no meta rows like choose/create/plan the plan.
 - include compact practical details when needed, such as sets/reps/minutes for workout rows.
 - recipe/shopping/grocery/supplies/materials/equipment/accessories/gear/tools/packing/buy lists -> 5-8 grocery rows, not placeholder items; ${groceryQuantityInstruction(inferGroceryQuantities)}
+- In mixed input, normal grocery item runs like "eggs milk bread" are grocery rows even without buy/get words.
+- Keep every direct action clause as a task, even when grocery words appear between actions.
 - Split mixed clauses; do not duplicate a clause as both task and grocery. Ambiguous actionable input -> task. Non-empty actionable input must return a row.
 - Reminders only for explicit reminder/alarm/notify/repeat, scheduled-event wording with a time, or a clear clock time. Date-only today/tomorrow/later is not a reminder. Infer the next sensible occurrence from NOW.
 - listId per task from WORKSPACE; otherwise default. Keep user wording/register; do not sanitize names/relationships.
@@ -1928,6 +2035,8 @@ Rows:
 - Use intent frames over memorized phrases: action verb + object = task; event/appointment noun + date/time = task with reminder; ingredients/supplies/materials + topic = grocery/material rows; plan/routine/checklist/tips + topic = concrete task rows.
 - Plans/routines/checklists/tips/advice become concrete task rows, not meta rows like choose/create/schedule/plan the plan.
 - Ingredients/recipes/shopping/groceries/supplies/materials/equipment/accessories/gear/tools/packing/buy lists become grocery/material rows.
+- In mixed input, normal grocery item runs like "eggs milk bread" are grocery rows even without buy/get words.
+- Keep every direct action clause as a task, even when grocery words appear between actions.
 - Casual words like stuff, junk, crap, or things also mean grocery/material rows when attached to a recipe, meal, smoothie, project, repair, packing, or buying clause.
 - Broad/vague requests stay compact: 3-5 task rows and 5-8 grocery rows unless full/weekly/detailed/exact-count is requested.
 - Avoid vague group/session rows like "upper body strength", "cardio", "back session", or "meal prep list"; make rows directly usable.
@@ -2390,6 +2499,7 @@ Return only schema fields.`;
 
 function localRoute(parsed, input, destinationHint, personalContext = '') {
   let tasks = Array.isArray(parsed.tasks) ? dropGroceryClauseTaskLeaks(dropCoveredCompoundTaskRows(dedupeAiTaskRows(parsed.tasks)), input) : [];
+  tasks = cleanRecoveredGroceryTermsFromTaskRows(tasks, input);
   let grocery = Array.isArray(parsed.grocery) ? parsed.grocery.map(item => normalizeGroceryItem(item, input, shouldInferGroceryQuantities(input))) : [];
   grocery = mergeRecoveredGroceryDrafts(grocery, input);
   if (tasks.length === 0 && shouldDropIncidentalAiGroceryRows(input) && grocery.length > 0) {
@@ -2544,11 +2654,12 @@ async function runCase(provider, apiKey, caseName, promptOverride, promptVariant
       : mergeGeneratedTaskExpansionRows(parsedTasks, concreteGeneratedTasks, input);
   }
   parsed.tasks = dropCoveredCompoundTaskRows(dedupeAiTaskRows([...recoveredDirectTaskRowsFromRaw(input, Array.isArray(parsed.tasks) ? parsed.tasks : []), ...(Array.isArray(parsed.tasks) ? parsed.tasks : [])]));
+  parsed.tasks = cleanRecoveredGroceryTermsFromTaskRows(parsed.tasks, input);
   if (taskRowsUnderfillGeneratedTopic(parsed.tasks, input)) {
     parsed.tasks = mergeGeneratedTaskExpansionRows(parsed.tasks, fallbackGeneratedTaskRowsFromRaw(input), input);
   }
   if (parsed.tasks.length === 0 && (hasDirectTaskActionIntent(input) || hasScheduledEventStatement(input))) {
-    parsed.tasks = [taskDraftWithLocalReminder(input, 'medium')];
+    parsed.tasks = [taskDraftWithLocalReminder(cleanRecoveredGroceryTermsFromTaskText(input, input), 'medium')];
   }
   let parsedGrocery = Array.isArray(parsed.grocery)
     ? parsed.grocery

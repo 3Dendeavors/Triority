@@ -1,13 +1,14 @@
 param(
   [string]$RepoRoot = (Resolve-Path "$PSScriptRoot\..").Path,
   [switch]$Install,
+  [string]$GradleHome,
   [string]$AdbPath = 'C:\Users\Ross\AppData\Local\Android\Sdk\platform-tools\adb.exe'
 )
 
 $ErrorActionPreference = 'Stop'
 
 $androidDir = Join-Path $RepoRoot 'android'
-$gradleHome = Join-Path $RepoRoot '.gradle-home-build'
+$gradleHome = if ($GradleHome) { $GradleHome } else { Join-Path $RepoRoot '.gradle-home-build' }
 $apkPath = Join-Path $androidDir 'app\build\outputs\apk\release\app-release.apk'
 
 if (-not (Test-Path -LiteralPath (Join-Path $androidDir 'keystore.properties'))) {

@@ -565,6 +565,7 @@ function taskTextConflictsPersonalContext(text: string, input: string, personalC
 function hasGroceryGenerationIntent(input: string) {
   const normalized = input.replace(/\s+/g, ' ').trim();
   return hasDirectGroceryAcquisitionIntent(normalized)
+    || inputHasBareGroceryItemList(normalized)
     || (shouldInferGroceryQuantities(normalized)
     && (/\b(ingredients?|supplies|materials?|equipment|accessories|gear|tools?|items)\b.{0,32}\b(for|to make|to build|to buy|to purchase|needed for|for making|for a|for an)\b/i.test(normalized)
       || /\b([a-z0-9]+[-\s]+)?ingredients?\b/i.test(normalized)
@@ -597,17 +598,34 @@ const DIRECT_GROCERY_ITEM_PATTERNS: Array<{ re: RegExp; name: string; category: 
   { re: /\bcereal\b/i, name: 'cereal', category: 'Canned & Dry Goods' },
 ];
 
+function directGroceryDraftCandidatesFromRaw(input: string): GroceryDraft[] {
+  const existing = new Set<string>();
+  return DIRECT_GROCERY_ITEM_PATTERNS
+    .filter(({ re }) => re.test(input))
+    .map(({ name, category }) => ({ name, category }))
+    .filter((item) => {
+      const key = normalizeAiNameToken(item.name);
+      if (!key || existing.has(key)) return false;
+      existing.add(key);
+      return true;
+    });
+}
+
 function hasDirectGroceryAcquisitionIntent(input: string) {
   const normalized = input.replace(/\s+/g, ' ').trim();
   return /\b(buy|grab|get|pick up|pickup|purchase)\b/i.test(normalized)
     && DIRECT_GROCERY_ITEM_PATTERNS.some(({ re }) => re.test(normalized));
 }
 
+function inputHasBareGroceryItemList(input: string) {
+  const candidates = directGroceryDraftCandidatesFromRaw(input);
+  if (candidates.length < 2) return false;
+  return hasDirectTaskActionIntent(input) || hasScheduledEventStatement(input);
+}
+
 function directGroceryDraftsFromRaw(input: string): GroceryDraft[] {
-  if (!hasDirectGroceryAcquisitionIntent(input)) return [];
-  return DIRECT_GROCERY_ITEM_PATTERNS
-    .filter(({ re }) => re.test(input))
-    .map(({ name, category }) => ({ name, category }));
+  if (!hasDirectGroceryAcquisitionIntent(input) && !inputHasBareGroceryItemList(input)) return [];
+  return directGroceryDraftCandidatesFromRaw(input);
 }
 
 function mergeRecoveredGroceryDrafts(items: GroceryDraft[], input: string) {
@@ -620,6 +638,34 @@ function mergeRecoveredGroceryDrafts(items: GroceryDraft[], input: string) {
       return true;
     });
   return recovered.length > 0 ? [...items, ...recovered] : items;
+}
+
+function cleanRecoveredGroceryTermsFromTaskText(text: string, input: string) {
+  const recovered = directGroceryDraftsFromRaw(input);
+  if (recovered.length === 0) return text.trim();
+  let cleaned = text;
+  DIRECT_GROCERY_ITEM_PATTERNS
+    .filter(({ re }) => re.test(input))
+    .forEach(({ re }) => {
+      const flags = re.flags.includes('g') ? re.flags : `${re.flags}g`;
+      cleaned = cleaned.replace(new RegExp(re.source, flags), ' ');
+    });
+  cleaned = cleaned
+    .replace(/\b(?:and|plus|also|with)\b\s*$/i, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .replace(/^[,.;:\s-]+|[,.;:\s-]+$/g, '')
+    .trim();
+  return cleaned && hasDirectTaskActionIntent(cleaned) ? cleaned : text.trim();
+}
+
+function cleanRecoveredGroceryTermsFromTaskRows<T>(items: T[], input: string): T[] {
+  if (directGroceryDraftsFromRaw(input).length === 0) return items;
+  return items.map((item: any) => {
+    const text = String(item?.text ?? '').trim();
+    const cleaned = cleanRecoveredGroceryTermsFromTaskText(text, input);
+    return cleaned && cleaned !== text ? { ...item, text: cleaned } : item;
+  });
 }
 
 function extractGroceryGenerationClause(input: string) {
@@ -681,14 +727,15 @@ function groceryModeShouldUseMixedAiRouting(input: string) {
   if (hasDirectTaskActionIntent(normalized)) return true;
   if (hasTaskGenerationIntent(normalized)) return true;
   return hasGroceryGenerationIntent(normalized)
-    && /\b(call|text|email|schedule|book|fix|repair|clean|finish|submit|send|test|routine|plan|program|checklist|steps?|ideas?|tips?|advice|workout|exercise|training)\b/i.test(normalized);
+    && /\b(call|text|email|schedule|book|fix|repair|clean|finish|submit|send|set\s+up|setup|test|routine|plan|program|checklist|steps?|ideas?|tips?|advice|workout|exercise|training)\b/i.test(normalized);
 }
 
 function hasDirectTaskActionIntent(input: string) {
   const normalized = input.replace(/\s+/g, ' ').trim();
   if (/\b(remind me|set a reminder|add (a )?task|todo|to-do)\b/i.test(normalized)) return true;
-  const actionVerb = /\b(call|text|email|schedule|book|pay|order|fix|repair|clean|finish|submit|send|test|workout|exercise|train|walk|walking|wake|rub)\b/i;
+  const actionVerb = /\b(call|text|email|schedule|book|pay|order|fix|repair|clean|finish|submit|send|set\s+up|setup|test|workout|exercise|train|walk|walking|wake|rub)\b/i;
   if (new RegExp(`^\\s*${actionVerb.source}`, 'i').test(normalized)) return true;
+  if (new RegExp(`\\b(?:and|also|plus|then)\\s+${actionVerb.source}`, 'i').test(normalized)) return true;
   if (actionVerb.test(normalized)
     && /\b(today|tomorrow|tonight|later|this morning|this afternoon|this evening|morning|afternoon|evening|noon|midnight|at\s+\d{1,2}|around\s+\d{1,2}|round\s+\d{1,2}|by\s+\d{1,2}|in\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)|\d{1,2}(:\d{2})?\s*(am|pm|a|p))\b/i.test(normalized)) {
     return true;
@@ -1082,6 +1129,18 @@ function dropCoveredCompoundTaskRows<T>(items: T[]): T[] {
   return items.filter((_item, index) => {
     const current = keyed[index];
     if (!current || current.tokens.length < 3) return true;
+    const coveringRows = keyed.filter(other => (
+      other.index !== index
+      && other.tokens.length >= 2
+      && other.tokens.length < current.tokens.length
+      && aiTaskTokensContainAll(current.tokens, other.tokens)
+    ));
+    if (
+      coveringRows.length >= 2
+      && aiTaskTokensContainAll(coveringRows.flatMap(other => other.tokens), current.tokens)
+    ) {
+      return false;
+    }
     return !keyed.some(other => (
       other.index !== index
       && other.tokens.length >= 2
@@ -1243,13 +1302,21 @@ function trimGeneratedTaskRowsPreservingDirect<T>(items: T[], input: string): T[
 
 const AI_DIRECT_TASK_RECOVERY_TOKENS = new Set([
   'call', 'text', 'email', 'schedule', 'book', 'pay', 'order', 'fix', 'repair', 'clean',
-  'do', 'finish', 'submit', 'send', 'test', 'wake', 'walk', 'walking', 'rub',
+  'do', 'finish', 'submit', 'send', 'setup', 'test', 'wake', 'walk', 'walking', 'rub',
 ]);
 
-const AI_DIRECT_TASK_SEGMENT_SPLIT_TOKENS = new Set([
-  ...AI_DIRECT_TASK_RECOVERY_TOKENS,
-  'buy', 'get', 'grab', 'pick', 'purchase',
-]);
+const AI_DIRECT_GROCERY_SPLIT_TOKENS = new Set(['buy', 'get', 'grab', 'pick', 'purchase']);
+
+function isDirectTaskRecoveryToken(tokens: string[], index: number) {
+  const token = tokens[index] ?? '';
+  return AI_DIRECT_TASK_RECOVERY_TOKENS.has(token)
+    || (token === 'set' && tokens[index + 1] === 'up');
+}
+
+function isDirectTaskSegmentSplitToken(tokens: string[], index: number) {
+  const token = tokens[index] ?? '';
+  return isDirectTaskRecoveryToken(tokens, index) || AI_DIRECT_GROCERY_SPLIT_TOKENS.has(token);
+}
 
 const AI_GENERATED_CLAUSE_BOUNDARY_TOKENS = new Set([
   'advice', 'checklist', 'idea', 'ideas', 'ingredient', 'ingredients', 'grocery', 'groceries',
@@ -1300,15 +1367,15 @@ function aiTokensCloseEnough(a: string, b: string) {
 }
 
 function recoveredDirectTaskRowsFromRaw(raw: string, existingItems: any[]) {
-  if (!hasTaskGenerationIntent(raw)) return [];
+  if (!hasTaskGenerationIntent(raw) && !hasDirectTaskActionIntent(raw)) return [];
   const tokens = normalizeAiListText(raw).split(' ').filter(Boolean);
   const existingKeys = existingItems.map(item => aiTaskDedupeKey(String(item?.text ?? ''))).filter(Boolean);
   const recovered: any[] = [];
   tokens.forEach((token, index) => {
-    if (!AI_DIRECT_TASK_RECOVERY_TOKENS.has(token)) return;
+    if (!isDirectTaskRecoveryToken(tokens, index)) return;
     const nextActionIndex = tokens.findIndex((candidate, candidateIndex) => (
       candidateIndex > index
-      && (AI_DIRECT_TASK_SEGMENT_SPLIT_TOKENS.has(candidate) || candidate === 'and' || candidate === 'plus' || candidate === 'also' || candidate === 'then')
+      && (isDirectTaskSegmentSplitToken(tokens, candidateIndex) || candidate === 'and' || candidate === 'plus' || candidate === 'also' || candidate === 'then')
     ));
     const end = nextActionIndex >= 0 ? nextActionIndex : tokens.length;
     const segment = trimDirectTaskRecoverySegment(tokens.slice(index, end));
@@ -1402,7 +1469,7 @@ function normalizeAiListText(value: string) {
 
 const AI_LIST_GENERIC_TOKENS = new Set([
   'a', 'an', 'and', 'for', 'in', 'list', 'main', 'my', 'need', 'needs', 'of', 'on', 'our',
-  'body', 'shared', 'task', 'tasks', 'the', 'to', 'todo', 'work',
+  'body', 'shared', 'task', 'tasks', 'test', 'the', 'to', 'todo', 'work',
 ]);
 
 const AI_RELATIONSHIP_TERM_GROUPS = [
@@ -1689,16 +1756,17 @@ function inferTaskListFromListNameSignal(text: string, lists: TaskList[]) {
 }
 
 function inputUsesTaskListAsDestination(input: string, list: TaskList) {
-  const normalizedInput = ` ${normalizeAiListText(input)} `;
+  const normalizedInput = normalizeAiListText(input);
   const normalizedName = normalizeAiListText(list.name);
   if (!normalizedName) return false;
-  return normalizedInput.includes(` to ${normalizedName} list `)
-    || normalizedInput.includes(` in ${normalizedName} list `)
-    || normalizedInput.includes(` into ${normalizedName} list `)
-    || normalizedInput.includes(` on ${normalizedName} list `)
-    || normalizedInput.includes(` under ${normalizedName} list `)
-    || normalizedInput.includes(` to ${normalizedName} tasks `)
-    || normalizedInput.includes(` in ${normalizedName} tasks `);
+  const escaped = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const listLikeName = /\b(?:list|tasks?|todo)\b/.test(normalizedName);
+  const targetPhrases = listLikeName
+    ? [normalizedName]
+    : [`${normalizedName} list`, `${normalizedName} tasks`];
+  return targetPhrases.some((phrase) => (
+    new RegExp(`\\b(?:to|in|into|on|under|inside|within)\\s+(?:the\\s+|my\\s+|our\\s+|a\\s+)?${escaped(phrase)}\\b`).test(normalizedInput)
+  ));
 }
 
 function taskTextMatchesGeneratedListTopic(text: string, list: TaskList) {
@@ -2087,7 +2155,7 @@ async function parseWidgetAiCapture({
   widgetShorthand: boolean;
 }): Promise<WidgetAiCaptureDraft> {
   const fallbackListId = defaultTaskDestinationListId(lists);
-  if (!hasApiKey || !apiKey) return fallbackWidgetCapture(raw, defaultTier, fallbackListId);
+  if (!hasApiKey || (aiProviderRequiresKey(aiProvider) && !apiKey)) return fallbackWidgetCapture(raw, defaultTier, fallbackListId);
 
   try {
     const nowDate = new Date();
@@ -2135,6 +2203,7 @@ async function parseWidgetAiCapture({
     });
     let parsedTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
     const parsedGroceryItems = groceryItemsFromAiPayload(parsed?.grocery);
+    const recoveredGroceryItems = directGroceryDraftsFromRaw(raw);
     const retryGeneratedTasks = taskRowsNeedGenerationRetry(parsedTasks, raw);
     const missingGeneratedTasks = !retryGeneratedTasks
       && taskRowsMissingGeneratedHint(parsedTasks, raw, workspaceContext.destinationHint, lists, personalContext);
@@ -2160,17 +2229,18 @@ async function parseWidgetAiCapture({
     parsedTasks = dedupeAiTaskRows(parsedTasks);
     parsedTasks = dropCoveredCompoundTaskRows(parsedTasks);
     parsedTasks = dropGroceryClauseTaskLeaks(parsedTasks, raw);
+    parsedTasks = cleanRecoveredGroceryTermsFromTaskRows(parsedTasks, raw);
     parsedTasks = trimGeneratedTaskRowsPreservingDirect(parsedTasks, raw);
     if (taskRowsUnderfillGeneratedTopic(parsedTasks, raw)) {
       parsedTasks = mergeGeneratedTaskExpansionRows(parsedTasks, fallbackGeneratedTaskRowsFromRaw(raw), raw);
     }
     if (parsedTasks.length === 0 && (hasDirectTaskActionIntent(raw) || hasScheduledEventStatement(raw))) {
-      parsedTasks = [taskDraftWithLocalReminder(raw, defaultTier)];
+      parsedTasks = [taskDraftWithLocalReminder(cleanRecoveredGroceryTermsFromTaskText(raw, raw), defaultTier)];
     }
     if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw, parsedGroceryItems) && parsedGroceryItems.length > 0) {
       parsedTasks = [taskDraftWithLocalReminder(raw, defaultTier)];
     }
-    const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0;
+    const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0 && recoveredGroceryItems.length === 0;
     const validTier = new Set<string>(['high', 'medium', 'low']);
     const validListIds = new Set(listMap.map(l => l.id));
     const defaultRouteListId = multiList ? defaultTaskDestinationListId(lists) : null;
@@ -2310,17 +2380,18 @@ interface UserNotification {
   readAt: number | null;
 }
 
-type AiProvider = 'gemini' | 'claude';
+type AiProvider = 'built-in' | 'gemini' | 'claude';
 type StoredAiProvider = AiProvider | 'openai' | 'claude-haiku';
 
 const AI_PROVIDER_KEY = 'tri_ai_provider_v1';
-const DEFAULT_AI_PROVIDER: AiProvider = 'gemini';
+const DEFAULT_AI_PROVIDER: AiProvider = 'built-in';
 const ANTHROPIC_HAIKU_MODEL = 'claude-haiku-4-5';
 const ANTHROPIC_SONNET_MODEL = 'claude-sonnet-4-6';
 const ANTHROPIC_MODEL = ANTHROPIC_SONNET_MODEL;
 const OPENAI_MODEL = 'gpt-5.4-nano';
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
-const PUBLIC_AI_PROVIDERS: AiProvider[] = ['gemini', 'claude'];
+const TRIORITY_AI_PROXY_URL = 'https://ivzbipfmgpulsyzsamfx.supabase.co/functions/v1/triority-ai';
+const PUBLIC_AI_PROVIDERS: AiProvider[] = ['built-in', 'gemini', 'claude'];
 
 const AI_PROVIDER_META: Record<AiProvider, {
   label: string;
@@ -2331,6 +2402,15 @@ const AI_PROVIDER_META: Record<AiProvider, {
   invalidMessage: string;
   costHint: string;
 }> = {
+  'built-in': {
+    label: 'Included Triority AI',
+    shortLabel: 'Built-in',
+    model: GEMINI_MODEL,
+    keyPlaceholder: '',
+    keyUrl: '',
+    invalidMessage: '',
+    costHint: 'Included for testers through Triority, with no API key stored in the app.',
+  },
   gemini: {
     label: 'Gemini 2.5 Flash-Lite',
     shortLabel: 'Gemini',
@@ -2419,6 +2499,8 @@ Rows:
 - Use intent frames over memorized phrases: action verb + object = task; event/appointment noun + date/time = task with reminder; ingredients/supplies/materials + topic = grocery/material rows; plan/routine/checklist/tips + topic = concrete task rows.
 - Plans/routines/checklists/tips/advice become concrete task rows, not meta rows like choose/create/schedule/plan the plan.
 - Ingredients/recipes/shopping/groceries/supplies/materials/equipment/accessories/gear/tools/packing/buy lists become grocery/material rows.
+- In mixed input, a trailing run of normal grocery item names like "eggs milk bread" becomes grocery rows even without buy/get words.
+- Keep every direct action clause as a task, even when grocery words appear between actions.
 - Casual words like stuff, junk, crap, or things also mean grocery/material rows when attached to a recipe, meal, smoothie, project, repair, packing, or buying clause.
 - Broad/vague requests stay compact: 3-5 task rows and 5-8 grocery rows unless full/weekly/detailed/exact-count is requested.
 - Avoid vague group/session rows like "upper body strength", "cardio", "back session", or "meal prep list"; make rows directly usable.
@@ -2637,6 +2719,8 @@ const SHARED_STALE_RESTORE_CUTOFF_MS = new Date('2026-05-07T00:00:00-04:00').get
 const API_KEY_STORAGE_KEY = 'triority-api-key';
 const API_KEY_ACCOUNT_STORAGE_PREFIX = 'triority-api-key-v1:';
 const AI_PROVIDER_ACCOUNT_KEY_PREFIX = `${AI_PROVIDER_KEY}:account:`;
+const AI_INSTALL_ID_KEY = 'tri_ai_install_id_v1';
+const BUILT_IN_AI_ANNOUNCEMENT_KEY = 'tri_built_in_ai_v1_seen';
 
 function normalizeWidgetThemeId(value: unknown): WidgetThemeId {
   if (typeof value !== 'string') return WIDGET_THEME_MATCH_APP;
@@ -2705,6 +2789,8 @@ function triorityLocalDataKeys(uid?: string): string[] {
     WIDGET_MIC_SIDE_KEY,
     WIDGET_ONBOARDING_RELEASE_KEY,
     AI_PROVIDER_KEY,
+    AI_INSTALL_ID_KEY,
+    BUILT_IN_AI_ANNOUNCEMENT_KEY,
     REMINDER_NAV_KEY,
     SYNC_LAST_REMOTE_KEY,
     SYNC_LAST_LOCAL_KEY,
@@ -2744,9 +2830,13 @@ function anthropicToolInputFromResponse(data: any, toolName: string) {
 }
 
 function normalizeAiProvider(value: unknown, apiKey: string = ''): AiProvider {
+  if (value === 'built-in') return 'built-in';
   if (value === 'claude' || value === 'claude-haiku') return 'claude';
   if (value === 'gemini' || value === 'openai') return 'gemini';
-  return apiKey.trim().startsWith('sk-ant-') ? 'claude' : DEFAULT_AI_PROVIDER;
+  const trimmed = apiKey.trim();
+  if (trimmed.startsWith('sk-ant-')) return 'claude';
+  if (trimmed.startsWith('AIza')) return 'gemini';
+  return DEFAULT_AI_PROVIDER;
 }
 
 function isAnthropicAiProvider(provider: AiProvider) {
@@ -2764,6 +2854,32 @@ function isValidAiKey(provider: AiProvider, key: string) {
   if (isAnthropicAiProvider(provider)) return trimmed.startsWith('sk-ant-');
   if (provider === 'gemini') return trimmed.startsWith('AIza') && trimmed.length >= 20;
   return false;
+}
+
+function aiProviderRequiresKey(provider: AiProvider) {
+  return provider !== 'built-in';
+}
+
+function isBuiltInAiAvailable() {
+  return TRIORITY_AI_PROXY_URL.trim().length > 0;
+}
+
+function isAiReady(provider: AiProvider, key: string) {
+  return provider === 'built-in' ? isBuiltInAiAvailable() : isValidAiKey(provider, key);
+}
+
+function newAiInstallId() {
+  return `tri_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+}
+
+async function getAiInstallId() {
+  try {
+    const existing = await AsyncStorage.getItem(AI_INSTALL_ID_KEY);
+    if (existing && /^tri_[a-z0-9_]{12,80}$/i.test(existing)) return existing;
+  } catch {}
+  const next = newAiInstallId();
+  await AsyncStorage.setItem(AI_INSTALL_ID_KEY, next).catch(() => {});
+  return next;
 }
 
 function aiErrorDetail(provider: AiProvider, error: any) {
@@ -3131,6 +3247,45 @@ async function requestOpenAiStructuredOutput({
   return parseAiJson(openAiResponsesTextFromResponse(data));
 }
 
+async function requestBuiltInAiStructuredOutput({
+  system,
+  user,
+  maxTokens,
+  schema,
+  toolName,
+}: {
+  system: string;
+  user: string;
+  maxTokens: number;
+  schema: any;
+  toolName: string;
+}) {
+  if (!isBuiltInAiAvailable()) throw new Error('Built-in AI is not configured.');
+  const installId = await getAiInstallId();
+  const resp = await fetch(TRIORITY_AI_PROXY_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: SUPABASE_PUBLISHABLE_KEY,
+      Authorization: `Bearer ${SUPABASE_PUBLISHABLE_KEY}`,
+      'x-triority-install-id': installId,
+      'x-triority-app-version': CURRENT_APP_VERSION_NAME,
+    },
+    body: JSON.stringify({ system, user, maxTokens, schema, toolName }),
+  });
+  let data: any = null;
+  try {
+    data = await resp.json();
+  } catch {
+    data = { error: { message: resp.statusText || 'Built-in AI request failed.' } };
+  }
+  if (!resp.ok) {
+    throw new Error(String(data?.error?.message || data?.message || 'Built-in AI request failed.'));
+  }
+  if (data?.output == null) throw new Error('Built-in AI returned an unexpected format.');
+  return data.output;
+}
+
 async function requestAiStructuredOutput({
   provider,
   apiKey,
@@ -3152,6 +3307,9 @@ async function requestAiStructuredOutput({
     return requestAnthropicToolInput({ apiKey, model: anthropicModelForProvider(provider), system, user, maxTokens, tool, toolName });
   }
   const schema = tool?.input_schema || tool?.parameters || tool;
+  if (provider === 'built-in') {
+    return requestBuiltInAiStructuredOutput({ system, user, maxTokens, schema, toolName });
+  }
   return requestGeminiStructuredOutput({ apiKey, system, user, maxTokens, schema });
 }
 
@@ -6002,8 +6160,8 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 29;
-const CURRENT_APP_VERSION_NAME = '1.4.13';
+const CURRENT_APP_VERSION_CODE = 34;
+const CURRENT_APP_VERSION_NAME = '1.4.18';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {
@@ -6142,7 +6300,7 @@ async function loadAll() {
   if (version !== APP_VERSION) {
     await AsyncStorage.setItem('tri_version', APP_VERSION);
   }
-  const [listsRaw, legacyTasks, archive, activeIdRaw, legacyAccent, accentLightRaw, accentDarkRaw, themeRaw, darkMode, defaultTier, autoClear, context, onboarded, widgetOnboardingSeenRaw, listOrderRaw, customThemeRaw, customThemesRaw, groceryRaw, collapsedGroupsRaw, widgetThemeRaw, widgetClearRaw, widgetShorthandRaw, widgetCustomColorsRaw, widgetMicSideRaw, aiProviderRaw] = await Promise.all([
+  const [listsRaw, legacyTasks, archive, activeIdRaw, legacyAccent, accentLightRaw, accentDarkRaw, themeRaw, darkMode, defaultTier, autoClear, context, onboarded, widgetOnboardingSeenRaw, builtInAiAnnouncementSeenRaw, listOrderRaw, customThemeRaw, customThemesRaw, groceryRaw, collapsedGroupsRaw, widgetThemeRaw, widgetClearRaw, widgetShorthandRaw, widgetCustomColorsRaw, widgetMicSideRaw, aiProviderRaw] = await Promise.all([
     AsyncStorage.getItem('tri_lists'),
     AsyncStorage.getItem('tri_tasks'),
     AsyncStorage.getItem('tri_archive'),
@@ -6157,6 +6315,7 @@ async function loadAll() {
     AsyncStorage.getItem('triority-context'),
     AsyncStorage.getItem('tri_onboarded'),
     AsyncStorage.getItem(WIDGET_ONBOARDING_RELEASE_KEY),
+    AsyncStorage.getItem(BUILT_IN_AI_ANNOUNCEMENT_KEY),
     AsyncStorage.getItem('tri_list_order'),
     AsyncStorage.getItem('tri_custom_theme'),
     AsyncStorage.getItem('tri_custom_themes'),
@@ -6332,6 +6491,7 @@ async function loadAll() {
     context: context ? JSON.parse(context) : '',
     onboarded: onboarded === '1',
     widgetOnboardingSeen: widgetOnboardingSeenRaw === '1',
+    builtInAiAnnouncementSeen: builtInAiAnnouncementSeenRaw === '1',
     customThemeDrafts,
     groceryItems,
     collapsedGroups: parseCollapsedGroups(collapsedGroupsRaw),
@@ -6364,7 +6524,7 @@ function relTime(ms: number): string {
 }
 
 function isValidKey(k: string, provider: AiProvider = DEFAULT_AI_PROVIDER) {
-  return isValidAiKey(provider, k);
+  return isAiReady(provider, k);
 }
 
 function startOfDay(ts: number) {
@@ -8855,7 +9015,7 @@ function InputBar({ onAddMany, onAddManyToList, onTaskListRouted, onAddGroceryIt
   const T = useT();
   const isPaid = useIsPaid();
   const inputRef = useRef<TextInput | null>(null);
-  const [aiMode, setAiMode] = useState(false);
+  const [aiMode, setAiMode] = useState(true);
   const [value, setValue] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
   const [listening, setListening] = useState(false);
@@ -9008,7 +9168,11 @@ function InputBar({ onAddMany, onAddManyToList, onTaskListRouted, onAddGroceryIt
           const parsed = v ? JSON.parse(v) : '';
           return typeof parsed === 'string' ? parsed : '';
         });
-      if (!storedKey || !isValidKey(storedKey, aiProvider)) { showToast(`No ${AI_PROVIDER_META[aiProvider].shortLabel} key set`, 'Open Settings to add one'); return; }
+      if (!isAiReady(aiProvider, storedKey)) {
+        const meta = AI_PROVIDER_META[aiProvider];
+        showToast(aiProviderRequiresKey(aiProvider) ? `No ${meta.shortLabel} key set` : `${meta.shortLabel} AI unavailable`, 'Open Settings to change AI provider');
+        return;
+      }
       setAiLoading(true);
       try {
         const nowDate = new Date();
@@ -9151,6 +9315,7 @@ The tool input must include at least 6 items. Never return an empty items array.
           const validListIds = new Set(listMap.map(l => l.id));
           let parsedTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
           const parsedGroceryItems = groceryItemsFromAiPayload(parsed?.grocery);
+          const recoveredGroceryItems = directGroceryDraftsFromRaw(raw);
     const retryGeneratedTasks = taskRowsNeedGenerationRetry(parsedTasks, raw);
     const missingGeneratedTasks = !retryGeneratedTasks
       && taskRowsMissingGeneratedHint(parsedTasks, raw, workspaceContext.destinationHint, lists, storedCtx);
@@ -9176,17 +9341,18 @@ The tool input must include at least 6 items. Never return an empty items array.
           parsedTasks = dedupeAiTaskRows(parsedTasks);
           parsedTasks = dropCoveredCompoundTaskRows(parsedTasks);
           parsedTasks = dropGroceryClauseTaskLeaks(parsedTasks, raw);
+          parsedTasks = cleanRecoveredGroceryTermsFromTaskRows(parsedTasks, raw);
           parsedTasks = trimGeneratedTaskRowsPreservingDirect(parsedTasks, raw);
           if (taskRowsUnderfillGeneratedTopic(parsedTasks, raw)) {
             parsedTasks = mergeGeneratedTaskExpansionRows(parsedTasks, fallbackGeneratedTaskRowsFromRaw(raw), raw);
           }
           if (parsedTasks.length === 0 && (hasDirectTaskActionIntent(raw) || hasScheduledEventStatement(raw))) {
-            parsedTasks = [taskDraftWithLocalReminder(raw, 'medium')];
+            parsedTasks = [taskDraftWithLocalReminder(cleanRecoveredGroceryTermsFromTaskText(raw, raw), 'medium')];
           }
           if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw, parsedGroceryItems) && parsedGroceryItems.length > 0) {
             parsedTasks = [taskDraftWithLocalReminder(raw, 'medium')];
           }
-          const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0;
+          const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0 && recoveredGroceryItems.length === 0;
           const defaultRouteListId = multiList ? defaultListId : null;
 
           // Group tasks by target list
@@ -9290,15 +9456,8 @@ The tool input must include at least 6 items. Never return an empty items array.
         }
       } catch (e: any) {
         showToast('AI failed', aiErrorDetail(aiProvider, e));
-        if (groceryMode) {
-          const fallbackItems = [{ name: raw, category: GROCERY_UNCATEGORIZED }];
-          const groceryIds = await addGroceryItemsSafely(fallbackItems);
-          if (Array.isArray(groceryIds) && groceryIds[0]) {
-            onGroceryOnlyAdded?.(groceryIds, false, fallbackItems);
-          }
-        } else {
-          onAddMany([taskDraftWithLocalReminder(raw, defaultTier)]);
-        }
+        setAiLoading(false);
+        return;
       }
       setAiLoading(false);
       setValue('');
@@ -12053,6 +12212,37 @@ function SettingRow({ label, subtitle, right, onPress, noBorder }: { label: stri
 
 // ─── HSB Color Wheel ─────────────────────────────────────────────────────────
 
+function BuiltInAiAnnouncement({ accentColor, onClose, onSettings }: { accentColor: string; onClose: () => void; onSettings: () => void }) {
+  const T = useT();
+  const insets = useSafeAreaInsets();
+  return (
+    <Modal visible transparent animationType="fade" onRequestClose={onClose}>
+      <View style={styles.announcementRoot}>
+        <TouchableWithoutFeedback onPress={onClose}>
+          <View style={styles.backdrop} />
+        </TouchableWithoutFeedback>
+        <View style={[styles.announcementCard, { backgroundColor: T.s1, borderColor: T.border, marginBottom: Math.max(18, insets.bottom + 12) }]}>
+          <View style={[styles.announcementIcon, { backgroundColor: `${accentColor}18`, borderColor: `${accentColor}55` }]}>
+            <Icon name="sparkles" size={18} color={accentColor} />
+          </View>
+          <Text style={[styles.announcementTitle, { color: T.text, fontFamily: jks('800') }]}>Included AI is ready</Text>
+          <Text style={[styles.announcementBody, { color: T.textSub, fontFamily: jks('400') }]}>
+            Triority now defaults to built-in AI for testers. Requests go through Triority's protected server, so no Gemini API key is stored in the app. You can still switch to your own Gemini or Claude key in Settings.
+          </Text>
+          <View style={styles.announcementActions}>
+            <TouchableOpacity onPress={onSettings} style={[styles.announcementSecondaryBtn, { borderColor: T.borderMid, backgroundColor: T.s2 }]} activeOpacity={0.75}>
+              <Text style={[styles.announcementSecondaryLabel, { color: T.textSub, fontFamily: jks('700') }]}>Settings</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={onClose} style={[styles.announcementPrimaryBtn, { backgroundColor: accentColor }]} activeOpacity={0.85}>
+              <Text style={[styles.announcementPrimaryLabel, { color: readableOn(accentColor), fontFamily: jks('800') }]}>Got it</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 function hsbToHex(h: number, s: number, b: number): string {
   const hn = h / 360, sn = s / 100, bn = b / 100;
   const i = Math.floor(hn * 6);
@@ -12989,7 +13179,9 @@ function Settings({ accent, aiProvider, setAiProvider, apiKey, setApiKey, hasApi
 
   const AUTO_CLEAR_OPTIONS: AutoClear[] = ['Never', '7 days', '30 days', '90 days'];
   const providerMeta = AI_PROVIDER_META[aiProvider];
-  const keyIsValid = isValidKey(keyDraft, aiProvider);
+  const providerNeedsKey = aiProviderRequiresKey(aiProvider);
+  const keyIsValid = providerNeedsKey ? isValidAiKey(aiProvider, keyDraft) : true;
+  const aiStatusActive = isAiReady(aiProvider, apiKey);
   const [confirmNode, confirm] = useConfirm(accent);
   const themeDef = getTheme(themeId);
   const currentModeAccent = darkMode ? accentDark : accentLight;
@@ -13013,7 +13205,16 @@ function Settings({ accent, aiProvider, setAiProvider, apiKey, setApiKey, hasApi
     setAccentDark(null);
   };
 
-  const saveKey = () => { if (!keyIsValid) return; setApiKey(keyDraft.trim()); setHasApiKey(true); };
+  useEffect(() => {
+    setKeyDraft(apiKey);
+  }, [apiKey]);
+
+  const saveKey = () => {
+    if (!providerNeedsKey || !keyIsValid) return;
+    const trimmed = keyDraft.trim();
+    setApiKey(trimmed);
+    setHasApiKey(isAiReady(aiProvider, trimmed));
+  };
   const chooseAiProvider = (provider: AiProvider) => {
     setAiProvider(provider);
   };
@@ -13410,30 +13611,38 @@ function Settings({ accent, aiProvider, setAiProvider, apiKey, setApiKey, hasApi
             {providerMeta.model} - {providerMeta.costHint}
           </Text>
           <View style={styles.apiKeyHeader}>
-            <Text style={[styles.settingRowLabel, { color: T.text, fontFamily: jks('500') }]}>{providerMeta.shortLabel} API Key</Text>
-            <View style={[styles.statusPill, { backgroundColor: hasApiKey ? `${T.low}20` : T.s2, borderColor: hasApiKey ? `${T.low}40` : T.border }]}>
-              <View style={[styles.statusDot, { backgroundColor: hasApiKey ? T.low : T.textMute }]} />
-              <Text style={[styles.statusLabel, { color: hasApiKey ? T.low : T.textMute, fontFamily: jks('700') }]}>{hasApiKey ? 'Active' : 'Not set'}</Text>
+            <Text style={[styles.settingRowLabel, { color: T.text, fontFamily: jks('500') }]}>{providerNeedsKey ? `${providerMeta.shortLabel} API Key` : 'Included AI'}</Text>
+            <View style={[styles.statusPill, { backgroundColor: aiStatusActive ? `${T.low}20` : T.s2, borderColor: aiStatusActive ? `${T.low}40` : T.border }]}>
+              <View style={[styles.statusDot, { backgroundColor: aiStatusActive ? T.low : T.textMute }]} />
+              <Text style={[styles.statusLabel, { color: aiStatusActive ? T.low : T.textMute, fontFamily: jks('700') }]}>{aiStatusActive ? 'Active' : 'Unavailable'}</Text>
             </View>
           </View>
-          <View style={styles.apiKeyRow}>
-            <TextInput value={keyDraft} onChangeText={setKeyDraft} placeholder={providerMeta.keyPlaceholder} placeholderTextColor={T.textMute}
-              secureTextEntry={!showKey} autoCapitalize="none" autoCorrect={false}
-              style={[styles.apiKeyInput, { backgroundColor: T.s2, color: T.text, borderColor: keyDraft && !keyIsValid ? '#FF5040' : T.border, fontFamily: 'monospace' }]} />
-            <TouchableOpacity onPress={() => setShowKey(s => !s)} style={[styles.iconBtn, { backgroundColor: T.s2, borderColor: T.border }]}>
-              <Icon name={showKey ? 'eyeOff' : 'eye'} size={15} color={T.textSub} />
-            </TouchableOpacity>
-            <TouchableOpacity onPress={saveKey} disabled={!keyIsValid} style={[styles.saveKeyBtn, { backgroundColor: keyIsValid ? accent : T.s3 }]}>
-              <Text style={[styles.saveKeyLabel, { color: keyIsValid ? '#fff' : T.textMute, fontFamily: jks('700') }]}>Save</Text>
-            </TouchableOpacity>
-          </View>
-          {keyDraft && !keyIsValid ? <Text style={[styles.keyError, { fontFamily: jks('400') }]}>{providerMeta.invalidMessage}</Text> : null}
-          <Text style={[styles.keyHint, { color: T.textMute, fontFamily: jks('400') }]}>Triority uses one active provider key. It stays local on this device and is not synced.</Text>
-          <TouchableOpacity
-            onPress={() => Linking.openURL(providerMeta.keyUrl)}
-            style={styles.keyHelpRow}>
-            <Text style={[styles.keyHelpLink, { color: accent, fontFamily: jks('600') }]}>How to get an API key</Text>
-          </TouchableOpacity>
+          {providerNeedsKey ? (
+            <>
+              <View style={styles.apiKeyRow}>
+                <TextInput value={keyDraft} onChangeText={setKeyDraft} placeholder={providerMeta.keyPlaceholder} placeholderTextColor={T.textMute}
+                  secureTextEntry={!showKey} autoCapitalize="none" autoCorrect={false}
+                  style={[styles.apiKeyInput, { backgroundColor: T.s2, color: T.text, borderColor: keyDraft && !keyIsValid ? '#FF5040' : T.border, fontFamily: 'monospace' }]} />
+                <TouchableOpacity onPress={() => setShowKey(s => !s)} style={[styles.iconBtn, { backgroundColor: T.s2, borderColor: T.border }]}>
+                  <Icon name={showKey ? 'eyeOff' : 'eye'} size={15} color={T.textSub} />
+                </TouchableOpacity>
+                <TouchableOpacity onPress={saveKey} disabled={!keyIsValid} style={[styles.saveKeyBtn, { backgroundColor: keyIsValid ? accent : T.s3 }]}>
+                  <Text style={[styles.saveKeyLabel, { color: keyIsValid ? '#fff' : T.textMute, fontFamily: jks('700') }]}>Save</Text>
+                </TouchableOpacity>
+              </View>
+              {keyDraft && !keyIsValid ? <Text style={[styles.keyError, { fontFamily: jks('400') }]}>{providerMeta.invalidMessage}</Text> : null}
+              <Text style={[styles.keyHint, { color: T.textMute, fontFamily: jks('400') }]}>Triority uses one active provider key. It stays local on this device and is not synced.</Text>
+              <TouchableOpacity
+                onPress={() => Linking.openURL(providerMeta.keyUrl)}
+                style={styles.keyHelpRow}>
+                <Text style={[styles.keyHelpLink, { color: accent, fontFamily: jks('600') }]}>How to get an API key</Text>
+              </TouchableOpacity>
+            </>
+          ) : (
+            <Text style={[styles.keyHint, { color: T.textMute, fontFamily: jks('400') }]}>
+              Built-in AI is on by default for testers. Requests go through Triority's protected server, and the Gemini key is not stored in the app.
+            </Text>
+          )}
         </View>
         <View style={styles.settingsCardInner}>
           <Text style={[styles.contextLabel, { color: T.textSub, fontFamily: jks('400') }]}>Personal Context</Text>
@@ -14268,6 +14477,7 @@ function TriorityApp() {
   const [autoClear, setAutoClearState] = useState<AutoClear>('Never');
   const [darkMode, setDarkModeState] = useState(true);
   const [showOnboarding, setShowOnboarding] = useState(false);
+  const [showBuiltInAiAnnouncement, setShowBuiltInAiAnnouncement] = useState(false);
   const [groceryItems, setGroceryItemsState] = useState<GroceryItem[]>([]);
   const [viewingSharedGrocery, setViewingSharedGroceryState] = useState(false);
   const [storedSupabaseGroceryId, setStoredSupabaseGroceryId] = useState<string | null>(null);
@@ -14461,7 +14671,7 @@ function TriorityApp() {
   const aiSortGrocery = useCallback(async (onDone?: () => void) => {
     let storedKey = '';
     try { storedKey = await EncryptedStorage.getItem(API_KEY_STORAGE_KEY) || ''; } catch {}
-    if (!storedKey || !isValidKey(storedKey, aiProvider)) { onDone?.(); return; }
+    if (!isAiReady(aiProvider, storedKey)) { onDone?.(); return; }
     // Snapshot current items at call time — avoids stale closure inside setState
     const snapshot = groceryItems;
     if (snapshot.length === 0) { onDone?.(); return; }
@@ -14537,6 +14747,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
       const showWidgetReleaseTour = data.onboarded && !data.widgetOnboardingSeen;
       setOnboardingInitialStep(showWidgetReleaseTour ? WIDGET_ONBOARDING_STEP_INDEX : 0);
       setShowOnboarding(!data.onboarded || !data.widgetOnboardingSeen);
+      setShowBuiltInAiAnnouncement(data.onboarded && data.widgetOnboardingSeen && !data.builtInAiAnnouncementSeen);
       setReady(true);
       // Reminders are global across lists — flatten task arrays for the sync.
       // Always reconcile, even when no tasks have reminders, so orphaned alarms
@@ -15848,12 +16059,16 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     categories.forEach(category => setCollapsedGroup(groceryGroupCollapseKey(groceryGroupCollapseScope, `category:${category}`), false));
   }, [groceryGroupCollapseScope, setCollapsedGroup]);
 
-  const armGroceryResultGlow = useCallback((ids: string[], items: GroceryDraft[] = []) => {
+  const armGroceryResultGlow = useCallback((ids: string[], items: GroceryDraft[] = [], focusFirst = true) => {
     const cleanIds = ids.filter(Boolean);
     if (cleanIds.length === 0) return;
     openGroceryGroupsForDrafts(items);
-    armFocusedGrocery(cleanIds[0]);
-    armPendingGroceryGlow(cleanIds.slice(1));
+    if (focusFirst) {
+      armFocusedGrocery(cleanIds[0]);
+      armPendingGroceryGlow(cleanIds.slice(1));
+    } else {
+      armPendingGroceryGlow(cleanIds);
+    }
   }, [armFocusedGrocery, armPendingGroceryGlow, openGroceryGroupsForDrafts]);
 
   useEffect(() => {
@@ -16099,7 +16314,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     }
     let storedKey = '';
     try { storedKey = await EncryptedStorage.getItem(API_KEY_STORAGE_KEY) || ''; } catch {}
-    if (!storedKey || !isValidKey(storedKey, aiProvider) || sharedGroceryItems.length === 0) { onDone?.(); return; }
+    if (!isAiReady(aiProvider, storedKey) || sharedGroceryItems.length === 0) { onDone?.(); return; }
     const validCats = new Set([...GROCERY_CATEGORIES, GROCERY_UNCATEGORIZED]);
     const systemPrompt = `Assign one category per item. Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
 If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
@@ -16192,6 +16407,16 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
   const rootToast = widgetImportToast
     || (accountRestoreStatus ? { message: accountRestoreStatus, sub: 'Lists and settings may take a moment' } : null);
 
+  const dismissBuiltInAiAnnouncement = () => {
+    setShowBuiltInAiAnnouncement(false);
+    AsyncStorage.setItem(BUILT_IN_AI_ANNOUNCEMENT_KEY, '1').catch(() => {});
+  };
+
+  const openBuiltInAiSettings = () => {
+    dismissBuiltInAiAnnouncement();
+    setScreen('settings');
+  };
+
   return (
     <ThemeCtx.Provider value={T}>
       <StatusBar barStyle={darkMode ? 'light-content' : 'dark-content'} backgroundColor={T.bg} translucent={false} />
@@ -16199,7 +16424,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
         <PortalHost>
           <BackButtonManager screen={screen} setScreen={setScreen} />
           <View style={{ flex: 1, overflow: 'hidden' }}>
-            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} aiProvider={aiProvider} hasApiKey={hasApiKey} defaultTier={defaultTier} widgetShorthand={widgetShorthand} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} onGroceryOnlyAdded={(ids, navigate = true, items = []) => { armGroceryResultGlow(ids, items); if (navigate) setScreen('grocery'); }} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} focusedTaskNonce={focusedTaskNonce} onFocusedTaskSeen={markFocusedTaskSeen} externalPendingTaskGlowIds={externalPendingTaskGlowIds} onExternalPendingTaskGlowSeen={clearExternalPendingTaskGlow} calendarConflictKeys={calendarConflictKeys} calendarConflictNotice={calendarConflictNotice} />}
+            {screen === 'list' && <ActiveList tasks={activeList.tasks} setTasks={setTasks} setListTasks={setListTasks} accentColor={accentColor} aiProvider={aiProvider} hasApiKey={hasApiKey} defaultTier={defaultTier} widgetShorthand={widgetShorthand} setArchive={setArchive} activeListId={activeListId} lists={mergedLists} setActiveListId={setActiveListId} addList={addList} renameList={renameList} deleteList={deleteList} reorderLists={reorderLists} onAddGroceryItems={addGroceryItemsForScreen} setScreen={setScreen} onGroceryOnlyAdded={(ids, navigate = true, items = []) => { armGroceryResultGlow(ids, items, navigate); if (navigate) setScreen('grocery'); }} sharedActions={sharedActionsForActive} sharedIdSet={sharedTaskIdSet} collapsedGroups={collapsedGroups} setCollapsedGroup={setCollapsedGroup} focusedTaskId={focusedTaskId} focusedTaskNonce={focusedTaskNonce} onFocusedTaskSeen={markFocusedTaskSeen} externalPendingTaskGlowIds={externalPendingTaskGlowIds} onExternalPendingTaskGlowSeen={clearExternalPendingTaskGlow} calendarConflictKeys={calendarConflictKeys} calendarConflictNotice={calendarConflictNotice} />}
             {screen === 'grocery' && (
               <StandaloneGrocery
                 groceryItems={groceryItemsForScreen}
@@ -16284,6 +16509,13 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
         </PortalHost>
         {rootToast && <View style={styles.toastContainer} pointerEvents="none"><Toast message={rootToast.message} sub={rootToast.sub} /></View>}
         {showGroceryUpsell && <ProUpsellSheet accentColor={accentColor} onClose={() => setShowGroceryUpsell(false)} showToast={() => {}} />}
+        {showBuiltInAiAnnouncement && !showOnboarding && (
+          <BuiltInAiAnnouncement
+            accentColor={accentColor}
+            onClose={dismissBuiltInAiAnnouncement}
+            onSettings={openBuiltInAiSettings}
+          />
+        )}
         {showOnboarding && <Onboarding onDone={finishOnboarding} accentColor={accentColor} initialStep={onboardingInitialStep} />}
       </View>
     </ThemeCtx.Provider>
@@ -16316,6 +16548,17 @@ const styles = StyleSheet.create({
   toastWrap: { borderRadius: 12, paddingHorizontal: 16, paddingVertical: 10, borderWidth: 1, maxWidth: '100%' },
   toastMsg: { fontSize: 13 },
   toastSub: { fontSize: 11, marginTop: 2 },
+
+  announcementRoot: { flex: 1, justifyContent: 'flex-end' },
+  announcementCard: { marginHorizontal: 16, borderRadius: 18, borderWidth: 1, padding: 18 },
+  announcementIcon: { width: 38, height: 38, borderRadius: 19, borderWidth: 1, alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
+  announcementTitle: { fontSize: 20, lineHeight: 25, letterSpacing: 0 },
+  announcementBody: { fontSize: 13, lineHeight: 19, marginTop: 8 },
+  announcementActions: { flexDirection: 'row', gap: 10, marginTop: 16 },
+  announcementSecondaryBtn: { flex: 1, minHeight: 42, borderRadius: 12, borderWidth: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 12 },
+  announcementPrimaryBtn: { flex: 1, minHeight: 42, borderRadius: 12, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 12 },
+  announcementSecondaryLabel: { fontSize: 13 },
+  announcementPrimaryLabel: { fontSize: 13 },
 
   // Portal sheets fill the app root absolutely so the backdrop captures every
   // touch outside the panel — preventing background TextInputs (InputBar) from
