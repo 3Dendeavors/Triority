@@ -1,8 +1,8 @@
 # Triority Privacy Policy
 
-Effective date: May 14, 2026
+Effective date: May 23, 2026
 
-Triority is a private-first Android task, grocery, reminder, and AI triage app. It is built to keep your planning data under your control and to avoid analytics, telemetry, and hosted AI services.
+Triority is a private-first Android task, grocery, reminder, and AI triage app. It is built to keep your planning data under your control and to avoid analytics, telemetry, and sale of user data.
 
 ## Scope
 
@@ -21,6 +21,7 @@ Triority can store:
 - Optional Google sign-in identifiers needed for sync and shared lists.
 - Optional shared-list membership data, invite codes, item metadata, and collaborator display initials.
 - Optional AI provider API key. This key is stored locally with encrypted storage and is not intentionally synced.
+- A non-secret local install id used only to rate-limit included AI requests.
 
 ## Local-Only Use
 
@@ -38,9 +39,9 @@ If you enable calendar conflict checks, Triority asks Google for read-only calen
 
 ## Optional AI Triage
 
-AI features are bring-your-own-key. If you add a Gemini or Claude API key and use AI triage, Triority sends the relevant prompt and limited app context directly to the provider you selected. This can include the text you typed, selected app context such as list names or visible rows, and your Personal Context when needed for routing.
+AI features can use included Triority AI or your own Gemini/Claude key. If you use included AI, Triority sends the relevant prompt and limited app context to Triority's protected AI endpoint, which forwards it to Gemini without storing a Gemini key in the app. If you add your own Gemini or Claude API key, Triority sends the relevant prompt and limited app context directly to the provider you selected.
 
-Triority does not provide a hosted AI service and does not intentionally send AI requests unless you use an AI feature.
+AI prompts can include the text you typed, selected app context such as list names or visible rows, and your Personal Context when needed for routing. Triority does not intentionally send AI requests unless you use an AI feature.
 
 ## Network Services
 
@@ -48,8 +49,9 @@ Depending on the features you use, Triority may connect to:
 
 - Firebase for optional Google sign-in, sync, and legacy shared-list support.
 - Supabase for current shared-list collaboration.
+- Triority's Supabase Edge Function for included AI requests.
 - Google Calendar APIs for optional read-only free/busy checks.
-- Gemini or Claude only when you provide an API key and use AI features.
+- Gemini or Claude when AI features are used through included AI or your own provider key.
 - GitHub to check for newer APK releases.
 - Buy Me a Coffee only if you tap the optional support link.
 

@@ -1,0 +1,4 @@
+project_id = "ivzbipfmgpulsyzsamfx"
+
+[functions.triority-ai]
+verify_jwt = false
