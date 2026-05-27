@@ -434,6 +434,25 @@ function cleanGroceryNameText(value: string, stripBalancedNote = false) {
   return withoutBalanced || withoutDangling;
 }
 
+function capitalizeGroceryItemName(value: string) {
+  const trimmed = value.trim().replace(/\s+/g, ' ');
+  const quantityPrefix = /^((?:(?:\d+(?:[./]\d+)?|\d+\s+\d+\/\d+|one|two|three|four|five|six|seven|eight|nine|ten|dozen|half|quarter)\s+)?(?:ct|count|packs?|boxes|bags?|loaves|dozen|gal|gallons?|qt|quarts?|oz|ounces?|lb|lbs|pounds?|cups?|tbsp|tsp|scoops?|cloves?|sheets?|screws?|ft|feet|foot|inches?|pieces?|bunch|head|sticks?|bottles?|jars?|cartons?|tubs?|containers?|cans?)\s+)((?:["'([{]\s*)?)([a-z])/i;
+  const quantityMatch = trimmed.match(quantityPrefix);
+  if (quantityMatch?.index === 0) {
+    const index = quantityMatch[1].length + quantityMatch[2].length;
+    if (trimmed[index + 1] && /[A-Z]/.test(trimmed[index + 1])) return trimmed;
+    return `${trimmed.slice(0, index)}${trimmed[index].toUpperCase()}${trimmed.slice(index + 1)}`;
+  }
+  const index = trimmed.search(/[a-z]/);
+  if (index < 0) return trimmed;
+  if (trimmed[index + 1] && /[A-Z]/.test(trimmed[index + 1])) return trimmed;
+  return `${trimmed.slice(0, index)}${trimmed[index].toUpperCase()}${trimmed.slice(index + 1)}`;
+}
+
+function capitalizeGroceryDrafts<T extends { name: string }>(items: T[]): T[] {
+  return items.map((item) => ({ ...item, name: capitalizeGroceryItemName(item.name) }));
+}
+
 function groceryNameFromAiItem(item: any) {
   if (typeof item === 'string') return cleanGroceryNameText(item);
   if (!item || typeof item !== 'object') return '';
@@ -461,7 +480,7 @@ function normalizeGroceryDraft(item: any, input = '', allowInferredQuantity = tr
     quantity = undefined;
   }
   return stripUndefined({
-    name,
+    name: capitalizeGroceryItemName(name),
     category,
     quantity,
     unit,
@@ -2303,7 +2322,7 @@ async function parseWidgetAiCapture({
       }).catch(() => []);
       if (generatedGrocery.length > 0) grocery = generatedGrocery;
     }
-    grocery = trimGeneratedGroceryRowsForScope(grocery, raw);
+    grocery = capitalizeGroceryDrafts(trimGeneratedGroceryRowsForScope(grocery, raw));
 
     const taskGroups = Array.from(tasksByList.entries())
       .filter(([, items]) => items.length > 0)
@@ -4168,7 +4187,7 @@ interface SharedListsContextValue {
   updateSharedGroceryItem: (listId: string, itemId: string, patch: { name?: string; category?: string; checked?: boolean }) => Promise<void>;
   deleteSharedGroceryItem: (listId: string, itemId: string) => Promise<void>;
   deleteSharedGroceryItems: (listId: string, itemIds: string[]) => Promise<void>;
-  updateSharedGroceryCategories: (listId: string, assignments: { id: string; category: string }[]) => Promise<void>;
+  updateSharedGroceryCategories: (listId: string, assignments: { id: string; category: string; name?: string }[]) => Promise<void>;
   // Step 10: list-level operations for the unified ListActionSheet.
   // rotateShareCode — owner-only; replaces shareCode on the parent doc.
   // renameSharedList — anyone in acl can rename (consensus model; matches
@@ -5420,7 +5439,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
     }
   }, [user]);
 
-  const updateSharedGroceryCategories = useCallback(async (listId: string, assignments: { id: string; category: string }[]) => {
+  const updateSharedGroceryCategories = useCallback(async (listId: string, assignments: { id: string; category: string; name?: string }[]) => {
     if (!user) throw new Error('Not signed in');
     if (assignments.length === 0) return;
     if (isSupabaseSharedListId(listId)) {
@@ -5428,6 +5447,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       const results = await Promise.all(assignments.map((assignment) => supabase
         .from('tri_shared_items')
         .update({
+          ...(assignment.name ? { name: assignment.name } : {}),
           category: assignment.category || GROCERY_UNCATEGORIZED,
           last_edited_by: user.uid,
           last_edited_at: now,
@@ -5444,6 +5464,7 @@ function SharedListsProvider({ children }: { children: React.ReactNode }) {
       const batch = writeBatch(db);
       for (const assignment of assignments.slice(i, i + 500)) {
         batch.update(doc(db, 'sharedLists', listId, 'items', assignment.id), stripUndefined({
+          name: assignment.name,
           category: assignment.category || GROCERY_UNCATEGORIZED,
           lastEditedBy: user.uid,
           lastEditedAt: now,
@@ -6160,8 +6181,8 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 34;
-const CURRENT_APP_VERSION_NAME = '1.4.18';
+const CURRENT_APP_VERSION_CODE = 35;
+const CURRENT_APP_VERSION_NAME = '1.4.19';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {
@@ -9015,7 +9036,7 @@ function InputBar({ onAddMany, onAddManyToList, onTaskListRouted, onAddGroceryIt
   const T = useT();
   const isPaid = useIsPaid();
   const inputRef = useRef<TextInput | null>(null);
-  const [aiMode, setAiMode] = useState(true);
+  const [aiMode, setAiMode] = useState(false);
   const [value, setValue] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
   const [listening, setListening] = useState(false);
@@ -9260,7 +9281,7 @@ The tool input must include at least 6 items. Never return an empty items array.
               .filter((item: GroceryDraft | null): item is GroceryDraft => !!item)
               .filter((item: GroceryDraft) => groceryDraftAllowedByPersonalContext(item, storedCtx));
           }
-          grocItems = trimGeneratedGroceryRowsForScope(grocItems, raw);
+          grocItems = capitalizeGroceryDrafts(trimGeneratedGroceryRowsForScope(grocItems, raw));
           if (grocItems.length > 0) {
             const groceryIds = await addGroceryItemsSafely(grocItems);
             if (Array.isArray(groceryIds) && groceryIds[0]) {
@@ -9268,7 +9289,7 @@ The tool input must include at least 6 items. Never return an empty items array.
             }
             showToast(`${grocItems.length} item${grocItems.length !== 1 ? 's' : ''} added`);
           } else {
-            const fallbackItems = [{ name: raw, category: GROCERY_UNCATEGORIZED }];
+            const fallbackItems = [{ name: capitalizeGroceryItemName(raw), category: GROCERY_UNCATEGORIZED }];
             const groceryIds = await addGroceryItemsSafely(fallbackItems);
             if (Array.isArray(groceryIds) && groceryIds[0]) {
               onGroceryOnlyAdded?.(groceryIds, false, fallbackItems);
@@ -9409,7 +9430,7 @@ The tool input must include at least 6 items. Never return an empty items array.
             }).catch(() => []);
             if (generatedGrocery.length > 0) grocItems = generatedGrocery;
           }
-          grocItems = trimGeneratedGroceryRowsForScope(grocItems, raw);
+          grocItems = capitalizeGroceryDrafts(trimGeneratedGroceryRowsForScope(grocItems, raw));
 
           const taskGroupEntries = Array.from(tasksByList.entries())
             .filter(([, items]) => items.length > 0);
@@ -14691,7 +14712,11 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
       const assignments: { id: string; category: string }[] = Array.isArray(parsed.assignments) ? parsed.assignments : [];
       const map = new Map(assignments.map(a => [a.id, validCats.has(a.category) ? a.category : GROCERY_UNCATEGORIZED]));
       setGroceryItemsState(current => {
-        const next = current.map(i => map.has(i.id) ? { ...i, category: map.get(i.id)! } : i);
+        const next = current.map(i => ({
+          ...i,
+          name: capitalizeGroceryItemName(i.name),
+          category: map.get(i.id) ?? i.category,
+        }));
         persistGrocery(next);
         return next;
       });
@@ -16329,9 +16354,14 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
       toolName: AI_GROCERY_CATEGORY_TOOL_NAME,
     }).then(parsed => {
       const parsedAssignments: { id: string; category: string }[] = Array.isArray(parsed.assignments) ? parsed.assignments : [];
-      const assignments = parsedAssignments.map((a) => ({
-        id: a.id,
-        category: validCats.has(a.category) ? a.category : GROCERY_UNCATEGORIZED,
+      const categoryMap = new Map(parsedAssignments.map((a) => [
+        a.id,
+        validCats.has(a.category) ? a.category : GROCERY_UNCATEGORIZED,
+      ]));
+      const assignments = sharedGroceryItems.map((item) => ({
+        id: item.id,
+        name: item.name ? capitalizeGroceryItemName(item.name) : undefined,
+        category: categoryMap.get(item.id) ?? item.category ?? GROCERY_UNCATEGORIZED,
       }));
       updateSharedGroceryCategories(sharedGroceryDoc.id, assignments).finally(() => onDone?.());
     }).catch(() => { onDone?.(); });
