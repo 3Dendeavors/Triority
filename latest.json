@@ -1,9 +1,9 @@
 {
-  "versionName": "1.4.18",
-  "versionCode": 34,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.18/Triority-v1.4.18.apk",
-  "sha256": "ACF02EECD7E2B6EAFBE8B88D87292846B401C17D0630316AC1BD5720B02F61D1",
-  "releaseNotes": "Included Triority AI is now the default tester path without storing a Gemini key in the APK. This release also fixes Test List routing, mixed Website/grocery splitting and shine, visible AI failures that preserve typed input, and mixed direct-task/grocery prompts that previously dropped early tasks.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.18",
+  "versionName": "1.4.19",
+  "versionCode": 35,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.19/Triority-v1.4.19.apk",
+  "sha256": "B702A17B14FDBF44307A502A6FF02AC51C03C00A6E4D91B05EF27B83E9FAD270",
+  "releaseNotes": "AI triage now starts off in the capture bar so users opt into AI routing. AI-created and AI-organized grocery/material items now use sensible display capitalization.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.19",
   "required": false
 }
