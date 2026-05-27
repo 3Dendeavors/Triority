@@ -13,15 +13,15 @@ Triority is distributed as a signed Android APK through GitHub Releases. It is n
 The current public beta APK is published on GitHub Releases:
 
 - Latest release: https://github.com/3Dendeavors/Triority/releases/latest
-- Current beta: `v1.4.18`
+- Current beta: `v1.4.19`
 - Android package id: `com.triority`
-- Current APK: `Triority-v1.4.18.apk`
-- SHA-256: `ACF02EECD7E2B6EAFBE8B88D87292846B401C17D0630316AC1BD5720B02F61D1`
+- Current APK: `Triority-v1.4.19.apk`
+- SHA-256: `B702A17B14FDBF44307A502A6FF02AC51C03C00A6E4D91B05EF27B83E9FAD270`
 
 To install:
 
 1. Open the latest release page on your Android device.
-2. Under **Assets**, download `Triority-v1.4.18.apk`.
+2. Under **Assets**, download `Triority-v1.4.19.apk`.
 3. If Android asks, allow your browser or file manager to install unknown apps.
 4. Open the downloaded APK and tap **Install**.
 5. Launch Triority from your app drawer.
