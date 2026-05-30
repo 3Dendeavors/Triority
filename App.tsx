@@ -6184,8 +6184,8 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 35;
-const CURRENT_APP_VERSION_NAME = '1.4.19';
+const CURRENT_APP_VERSION_CODE = 36;
+const CURRENT_APP_VERSION_NAME = '1.4.20';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {

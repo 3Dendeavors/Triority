@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.4.20 - 2026-05-30
+
 - Fixed AI grocery/material display capitalization so repeated AI parse/sort passes do not turn already-capitalized names like `Eggs` into `EGgs`/`EGGs`.
 - Added regression coverage for grocery capitalization idempotence.
 

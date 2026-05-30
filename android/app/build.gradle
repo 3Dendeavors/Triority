@@ -99,8 +99,8 @@ android {
         applicationId "com.triority"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 35
-        versionName "1.4.19"
+        versionCode 36
+        versionName "1.4.20"
     }
     signingConfigs {
         debug {
