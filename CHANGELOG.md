@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed AI grocery/material display capitalization so repeated AI parse/sort passes do not turn already-capitalized names like `Eggs` into `EGgs`/`EGGs`.
+- Added regression coverage for grocery capitalization idempotence.
+
 ## v1.4.18 - 2026-05-23
 
 - Added included Triority AI as the default tester path, while keeping Gemini and Claude bring-your-own-key options available.

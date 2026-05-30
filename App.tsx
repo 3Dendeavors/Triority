@@ -434,17 +434,20 @@ function cleanGroceryNameText(value: string, stripBalancedNote = false) {
   return withoutBalanced || withoutDangling;
 }
 
-function capitalizeGroceryItemName(value: string) {
+export function capitalizeGroceryItemName(value: string) {
   const trimmed = value.trim().replace(/\s+/g, ' ');
   const quantityPrefix = /^((?:(?:\d+(?:[./]\d+)?|\d+\s+\d+\/\d+|one|two|three|four|five|six|seven|eight|nine|ten|dozen|half|quarter)\s+)?(?:ct|count|packs?|boxes|bags?|loaves|dozen|gal|gallons?|qt|quarts?|oz|ounces?|lb|lbs|pounds?|cups?|tbsp|tsp|scoops?|cloves?|sheets?|screws?|ft|feet|foot|inches?|pieces?|bunch|head|sticks?|bottles?|jars?|cartons?|tubs?|containers?|cans?)\s+)((?:["'([{]\s*)?)([a-z])/i;
   const quantityMatch = trimmed.match(quantityPrefix);
   if (quantityMatch?.index === 0) {
     const index = quantityMatch[1].length + quantityMatch[2].length;
+    if (trimmed[index] && /[A-Z]/.test(trimmed[index])) return trimmed;
     if (trimmed[index + 1] && /[A-Z]/.test(trimmed[index + 1])) return trimmed;
     return `${trimmed.slice(0, index)}${trimmed[index].toUpperCase()}${trimmed.slice(index + 1)}`;
   }
-  const index = trimmed.search(/[a-z]/);
+  const match = trimmed.match(/[A-Za-z]/);
+  const index = match?.index ?? -1;
   if (index < 0) return trimmed;
+  if (trimmed[index] && /[A-Z]/.test(trimmed[index])) return trimmed;
   if (trimmed[index + 1] && /[A-Z]/.test(trimmed[index + 1])) return trimmed;
   return `${trimmed.slice(0, index)}${trimmed[index].toUpperCase()}${trimmed.slice(index + 1)}`;
 }

@@ -39,6 +39,7 @@ Installed builds check this repo's `latest.json` and prompt when a newer APK is 
 - Local and shared task reminders, with each device alerting only when that user allows notifications.
 - Optional read-only Google Calendar conflict checks for reminder tasks.
 - Included tester AI by default, plus optional AI triage using your own Gemini or Claude Sonnet API key, Personal Context, and current task/grocery workspace.
+- AI-created and AI-organized grocery/material names keep sensible display capitalization without drifting into all-caps after repeated AI sort passes.
 - Android launcher widgets for voice capture and Next Up previews.
 - Themes, accent colors, widget appearance controls, and optional support through Buy Me a Coffee.
 
