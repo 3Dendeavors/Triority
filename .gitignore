@@ -121,12 +121,20 @@ AI_ROUTING.md
 WIDGETS.md
 RELEASES.md
 HISTORY.md
+docs/CURRENT_STATE.md
+docs/ROADMAP.md
+docs/CHANGELOG.md
 docs/archive/
 C:Tempmetro.log
 CTempmetro.log
 
 # Claude Code local session data
 .claude/
+.ai/
+.ai-tmp/
+.claude-tmp/
+tmp/
+logs/
 .gradle-home/
 .gradle-home-build*/
 CTempmetro.log
