@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fixed mixed AI task/grocery captures so grocery or material item names parsed into Grocery do not also leak onto task text.
+- Improved Personal Context task-list routing for project, device, model, relationship, and domain terms when the user does not say the exact list name.
+- Added a built-in AI proxy guardrail so the Supabase `triority-ai` function gives Gemini the same generic mixed-capture routing rules before app-side cleanup runs.
+- Added regression coverage for generic mixed grocery/material cleanup and Personal Context list routing.
+
 ## v1.4.20 - 2026-05-30
 
 - Fixed AI grocery/material display capitalization so repeated AI parse/sort passes do not turn already-capitalized names like `Eggs` into `EGgs`/`EGGs`.
