@@ -681,11 +681,98 @@ function cleanRecoveredGroceryTermsFromTaskText(text: string, input: string) {
   return cleaned && hasDirectTaskActionIntent(cleaned) ? cleaned : text.trim();
 }
 
+function escapeAiRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function groceryCleanupTokenPattern(token: string) {
+  if (token.endsWith('s') && token.length > 3 && !/(ss|us)$/.test(token)) {
+    return `${escapeAiRegExp(token.slice(0, -1))}s?`;
+  }
+  if (!token.endsWith('s')) return `${escapeAiRegExp(token)}s?`;
+  return escapeAiRegExp(token);
+}
+
+function groceryNameCleanupPattern(item: { name?: string }) {
+  const tokens = normalizedAiTokens(String(item?.name ?? ''))
+    .filter(token => token.length >= 3 && !AI_GROCERY_MENTION_STOP_TOKENS.has(token));
+  if (tokens.length === 0) return null;
+  if (tokens.length === 1 && /^(item|thing|stuff|supply|supplies|material|materials|tool|tools|unit|units)$/i.test(tokens[0])) return null;
+  return `\\b${tokens.map(groceryCleanupTokenPattern).join('[^a-z0-9]+')}\\b`;
+}
+
+function groceryRowsForTaskCleanup(input: string, items: Array<{ name?: string }> = []) {
+  const seen = new Set<string>();
+  return [...items, ...directGroceryDraftsFromRaw(input)].filter((item) => {
+    const key = normalizeAiNameToken(String(item?.name ?? ''));
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function cleanKnownGroceryTermsFromTaskText(
+  text: string,
+  input: string,
+  groceryItems: Array<{ name?: string }> = [],
+) {
+  const patterns = groceryRowsForTaskCleanup(input, groceryItems)
+    .map(groceryNameCleanupPattern)
+    .filter((pattern): pattern is string => !!pattern)
+    .sort((a, b) => b.length - a.length);
+  if (patterns.length === 0) return text.trim();
+
+  let cleaned = text.replace(/\s+/g, ' ').trim();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pattern of patterns) {
+      const before = cleaned;
+      cleaned = cleaned
+        .replace(new RegExp(`(?:\\s*(?:[,;:/+-]|\\b(?:and|plus|also|with)\\b)\\s*)*${pattern}\\s*$`, 'i'), '')
+        .replace(/\b(?:and|plus|also|with)\b\s*$/i, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/\s+([,.;:!?])/g, '$1')
+        .replace(/^[,.;:\s-]+|[,.;:\s-]+$/g, '')
+        .trim();
+      if (cleaned !== before) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  return cleaned && hasDirectTaskActionIntent(cleaned) ? cleaned : text.trim();
+}
+
+function cleanMixedGroceryTermsFromTaskText(
+  text: string,
+  input: string,
+  groceryItems: Array<{ name?: string }> = [],
+) {
+  return cleanRecoveredGroceryTermsFromTaskText(
+    cleanKnownGroceryTermsFromTaskText(text, input, groceryItems),
+    input,
+  );
+}
+
 function cleanRecoveredGroceryTermsFromTaskRows<T>(items: T[], input: string): T[] {
   if (directGroceryDraftsFromRaw(input).length === 0) return items;
   return items.map((item: any) => {
     const text = String(item?.text ?? '').trim();
     const cleaned = cleanRecoveredGroceryTermsFromTaskText(text, input);
+    return cleaned && cleaned !== text ? { ...item, text: cleaned } : item;
+  });
+}
+
+function cleanMixedGroceryTermsFromTaskRows<T>(
+  items: T[],
+  input: string,
+  groceryItems: Array<{ name?: string }> = [],
+): T[] {
+  if (groceryRowsForTaskCleanup(input, groceryItems).length === 0) return items;
+  return items.map((item: any) => {
+    const text = String(item?.text ?? '').trim();
+    const cleaned = cleanMixedGroceryTermsFromTaskText(text, input, groceryItems);
     return cleaned && cleaned !== text ? { ...item, text: cleaned } : item;
   });
 }
@@ -1388,10 +1475,12 @@ function aiTokensCloseEnough(a: string, b: string) {
   return edits + (a.length - i) + (b.length - j) <= 1;
 }
 
-function recoveredDirectTaskRowsFromRaw(raw: string, existingItems: any[]) {
+function recoveredDirectTaskRowsFromRaw(raw: string, existingItems: any[], groceryItems: Array<{ name?: string }> = []) {
   if (!hasTaskGenerationIntent(raw) && !hasDirectTaskActionIntent(raw)) return [];
   const tokens = normalizeAiListText(raw).split(' ').filter(Boolean);
-  const existingKeys = existingItems.map(item => aiTaskDedupeKey(String(item?.text ?? ''))).filter(Boolean);
+  const existingKeys = existingItems
+    .map(item => aiTaskDedupeKey(cleanMixedGroceryTermsFromTaskText(String(item?.text ?? ''), raw, groceryItems)))
+    .filter(Boolean);
   const recovered: any[] = [];
   tokens.forEach((token, index) => {
     if (!isDirectTaskRecoveryToken(tokens, index)) return;
@@ -1401,10 +1490,11 @@ function recoveredDirectTaskRowsFromRaw(raw: string, existingItems: any[]) {
     ));
     const end = nextActionIndex >= 0 ? nextActionIndex : tokens.length;
     const segment = trimDirectTaskRecoverySegment(tokens.slice(index, end));
-    if (!segment || /\b(workout|routine|plan|program|checklist|ingredients?|groceries|grocery|shopping|smoothie|supplies|materials?|equipment|accessories|gear|tools?)\b/i.test(segment)) return;
-    const segmentKey = aiTaskDedupeKey(segment);
+    const cleanedSegment = cleanMixedGroceryTermsFromTaskText(segment, raw, groceryItems);
+    if (!cleanedSegment || /\b(workout|routine|plan|program|checklist|ingredients?|groceries|grocery|shopping|smoothie|supplies|materials?|equipment|accessories|gear|tools?)\b/i.test(cleanedSegment)) return;
+    const segmentKey = aiTaskDedupeKey(cleanedSegment);
     if (!segmentKey || existingKeys.some(existing => aiTaskDedupeKeysMatch(segmentKey, existing))) return;
-    recovered.push({ text: segment, tier: 'medium' });
+    recovered.push({ text: cleanedSegment, tier: 'medium' });
     existingKeys.push(segmentKey);
   });
   return recovered;
@@ -1475,6 +1565,20 @@ function dropGroceryClauseTaskLeaks<T>(items: T[], input: string): T[] {
   if (!hasGroceryGenerationIntent(input)) return items;
   if (!hasTaskGenerationIntent(input) && !hasDirectTaskActionIntent(input)) return [];
   return items.filter(item => !taskRepeatsGroceryGenerationClause(item, input));
+}
+
+export function normalizeMixedAiTaskRows(
+  parsedTasks: any[],
+  raw: string,
+  groceryItems: Array<{ name?: string }> = [],
+) {
+  const recoveredTasks = recoveredDirectTaskRowsFromRaw(raw, parsedTasks, groceryItems);
+  let tasks = cleanMixedGroceryTermsFromTaskRows([...recoveredTasks, ...parsedTasks], raw, groceryItems);
+  tasks = dedupeAiTaskRows(tasks);
+  tasks = dropCoveredCompoundTaskRows(tasks);
+  tasks = dropGroceryClauseTaskLeaks(tasks, raw);
+  tasks = cleanMixedGroceryTermsFromTaskRows(tasks, raw, groceryItems);
+  return trimGeneratedTaskRowsPreservingDirect(tasks, raw);
 }
 
 function normalizeAiListText(value: string) {
@@ -1612,12 +1716,19 @@ function defaultTaskDestinationListId(lists: TaskList[]) {
 function personalContextLinksListToInput(input: string, personalContext: string, list: TaskList) {
   const listTokens = getTaskListSignalTokens(list.name);
   if (listTokens.length === 0 || !personalContext.trim()) return false;
-  const matchedRelationshipGroups = AI_RELATIONSHIP_TERM_GROUPS.filter(group => aiTextHasAnyRelationshipTerm(input, group));
-  if (matchedRelationshipGroups.length === 0) return false;
+  const inputTokens = routingSampleTokens(input);
   const contextChunks = personalContext.split(/[\n.!?;]+/).map(chunk => chunk.trim()).filter(Boolean);
-  return contextChunks.some((chunk) => (
-    listTokens.some(token => aiTextHasToken(chunk, token))
+  const chunkNamesList = (chunk: string) => listTokens.some(token => aiTextHasToken(chunk, token));
+  const matchedRelationshipGroups = AI_RELATIONSHIP_TERM_GROUPS.filter(group => aiTextHasAnyRelationshipTerm(input, group));
+  if (matchedRelationshipGroups.length > 0 && contextChunks.some((chunk) => (
+    chunkNamesList(chunk)
     && matchedRelationshipGroups.some(group => aiTextHasAnyRelationshipTerm(chunk, group))
+  ))) {
+    return true;
+  }
+  return inputTokens.length > 0 && contextChunks.some((chunk) => (
+    chunkNamesList(chunk)
+    && inputTokens.some(token => aiTextHasToken(chunk, token))
   ));
 }
 
@@ -1640,6 +1751,10 @@ function inferTaskDestinationHint(input: string, lists: TaskList[], activeListId
 
   const contextMatches = lists.filter(list => personalContextLinksListToInput(input, personalContext, list));
   return uniqueMatch(contextMatches, 'personal-context-alias');
+}
+
+export function inferTaskDestinationHintForTest(input: string, lists: TaskList[], activeListId: string, personalContext = '') {
+  return inferTaskDestinationHint(input, lists, activeListId, personalContext);
 }
 
 function shouldGuardPlainTaskText(input: string) {
@@ -2247,17 +2362,12 @@ async function parseWidgetAiCapture({
         ? mergeGeneratedTaskRetryRows(parsedTasks, concreteGeneratedTasks, raw)
         : mergeGeneratedTaskExpansionRows(parsedTasks, concreteGeneratedTasks, raw);
     }
-    parsedTasks = [...recoveredDirectTaskRowsFromRaw(raw, parsedTasks), ...parsedTasks];
-    parsedTasks = dedupeAiTaskRows(parsedTasks);
-    parsedTasks = dropCoveredCompoundTaskRows(parsedTasks);
-    parsedTasks = dropGroceryClauseTaskLeaks(parsedTasks, raw);
-    parsedTasks = cleanRecoveredGroceryTermsFromTaskRows(parsedTasks, raw);
-    parsedTasks = trimGeneratedTaskRowsPreservingDirect(parsedTasks, raw);
+    parsedTasks = normalizeMixedAiTaskRows(parsedTasks, raw, parsedGroceryItems);
     if (taskRowsUnderfillGeneratedTopic(parsedTasks, raw)) {
       parsedTasks = mergeGeneratedTaskExpansionRows(parsedTasks, fallbackGeneratedTaskRowsFromRaw(raw), raw);
     }
     if (parsedTasks.length === 0 && (hasDirectTaskActionIntent(raw) || hasScheduledEventStatement(raw))) {
-      parsedTasks = [taskDraftWithLocalReminder(cleanRecoveredGroceryTermsFromTaskText(raw, raw), defaultTier)];
+      parsedTasks = [taskDraftWithLocalReminder(cleanMixedGroceryTermsFromTaskText(raw, raw, parsedGroceryItems), defaultTier)];
     }
     if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw, parsedGroceryItems) && parsedGroceryItems.length > 0) {
       parsedTasks = [taskDraftWithLocalReminder(raw, defaultTier)];
@@ -2522,20 +2632,21 @@ Rows:
 - Plans/routines/checklists/tips/advice become concrete task rows, not meta rows like choose/create/schedule/plan the plan.
 - Ingredients/recipes/shopping/groceries/supplies/materials/equipment/accessories/gear/tools/packing/buy lists become grocery/material rows.
 - In mixed input, a trailing run of normal grocery item names like "eggs milk bread" becomes grocery rows even without buy/get words.
-- Keep every direct action clause as a task, even when grocery words appear between actions.
+- Grocery/material item nouns are open-ended household, medical, hardware, office, project, and food items; do not depend on a fixed grocery vocabulary.
+- Keep every direct action clause as a task, even when grocery words appear between actions, but do not append grocery/material item names to the task text when those items are returned as grocery rows.
 - Casual words like stuff, junk, crap, or things also mean grocery/material rows when attached to a recipe, meal, smoothie, project, repair, packing, or buying clause.
 - Broad/vague requests stay compact: 3-5 task rows and 5-8 grocery rows unless full/weekly/detailed/exact-count is requested.
 - Avoid vague group/session rows like "upper body strength", "cardio", "back session", or "meal prep list"; make rows directly usable.
 ${groceryEnabled
   ? `- Workout routines are concrete exercises with sets/reps/rounds/minutes or "to failure" when practical; grocery/material lists should not also create tasks to choose, prep, shop, or pack the list.
-- Split mixed prompts by clause; do not duplicate the same clause as both task and grocery. If ambiguous, prefer task rows.
+- Split mixed prompts by ownership span; do not duplicate the same phrase as both task and grocery. If ambiguous, prefer task rows.
 ${groceryContextRules}
 - Categories: ${GROCERY_CATEGORIES.join(', ')}, or "${GROCERY_UNCATEGORIZED}".
 - ${AI_GROCERY_CATEGORY_HINTS}
 - ${quantityInstruction}
 - ${seasoningInstruction}`
   : '- All items are tasks.'}
-${multiList ? '- Tasks set listId from WORKSPACE when named/implied; otherwise use default, not active.' : ''}
+${multiList ? '- Tasks set listId from WORKSPACE when named/implied by list names, samples, Personal Context, or domain/model/device/project terms; otherwise use default, not active.' : ''}
 - Tasks get tier high/medium/low; high only for urgent/important, low for optional/light, otherwise medium.
 - ${widgetShorthand ? 'Set widgetLabel to 1-5 words. Keep meaning/action/final object; if text is already short, use full text.' : 'Do not include widgetLabel.'}
 - Reminders only for explicit reminder/alarm/notify/repeat wording, scheduled-event wording with a time ("appointment tomorrow at 330"), or a clear clock time ("at 4", "at 12:30", "at 1230"). Date-only today/tomorrow/later is not a reminder. repeat* only if explicit.
@@ -3411,7 +3522,7 @@ async function generateTaskRowsForAiSlice({
 NOW: ${nowDescr}
 ${taskContextRules}
 ${workspacePrompt}
-Rules: ignore grocery/material clauses; plans/routines/checklists/tips/advice become 3-5 concrete useful task rows, not meta rows; avoid vague group/session rows like "upper body strength" or "back session"; workout strength rows should include simple sets/reps, rounds, minutes, or "to failure" when practical; other advice/checklist rows should include the concrete object/tool/location/frequency when needed; tasks are short actions with tier high/medium/low; reminders only for explicit reminder/alarm/notify/repeat or clear clock time; ${multiList ? 'listId from WORKSPACE else default' : 'do not include listId'}; ${widgetShorthand ? 'set widgetLabel to 1-5 words' : 'do not include widgetLabel'}.
+Rules: ignore grocery/material clauses; plans/routines/checklists/tips/advice become 3-5 concrete useful task rows, not meta rows; avoid vague group/session rows like "upper body strength" or "back session"; workout strength rows should include simple sets/reps, rounds, minutes, or "to failure" when practical; other advice/checklist rows should include the concrete object/tool/location/frequency when needed; tasks are short actions with tier high/medium/low; reminders only for explicit reminder/alarm/notify/repeat or clear clock time; ${multiList ? 'listId from WORKSPACE list names, samples, Personal Context, or domain/model/device/project terms else default' : 'do not include listId'}; ${widgetShorthand ? 'set widgetLabel to 1-5 words' : 'do not include widgetLabel'}.
 Return only schema fields.`;
   const parsed = await requestAiStructuredOutput({
     provider,
@@ -6184,8 +6295,8 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 36;
-const CURRENT_APP_VERSION_NAME = '1.4.20';
+const CURRENT_APP_VERSION_CODE = 37;
+const CURRENT_APP_VERSION_NAME = '1.4.21';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {
@@ -9361,17 +9472,12 @@ The tool input must include at least 6 items. Never return an empty items array.
               ? mergeGeneratedTaskRetryRows(parsedTasks, concreteGeneratedTasks, raw)
               : mergeGeneratedTaskExpansionRows(parsedTasks, concreteGeneratedTasks, raw);
           }
-          parsedTasks = [...recoveredDirectTaskRowsFromRaw(raw, parsedTasks), ...parsedTasks];
-          parsedTasks = dedupeAiTaskRows(parsedTasks);
-          parsedTasks = dropCoveredCompoundTaskRows(parsedTasks);
-          parsedTasks = dropGroceryClauseTaskLeaks(parsedTasks, raw);
-          parsedTasks = cleanRecoveredGroceryTermsFromTaskRows(parsedTasks, raw);
-          parsedTasks = trimGeneratedTaskRowsPreservingDirect(parsedTasks, raw);
+          parsedTasks = normalizeMixedAiTaskRows(parsedTasks, raw, parsedGroceryItems);
           if (taskRowsUnderfillGeneratedTopic(parsedTasks, raw)) {
             parsedTasks = mergeGeneratedTaskExpansionRows(parsedTasks, fallbackGeneratedTaskRowsFromRaw(raw), raw);
           }
           if (parsedTasks.length === 0 && (hasDirectTaskActionIntent(raw) || hasScheduledEventStatement(raw))) {
-            parsedTasks = [taskDraftWithLocalReminder(cleanRecoveredGroceryTermsFromTaskText(raw, raw), 'medium')];
+            parsedTasks = [taskDraftWithLocalReminder(cleanMixedGroceryTermsFromTaskText(raw, raw, parsedGroceryItems), 'medium')];
           }
           if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw, parsedGroceryItems) && parsedGroceryItems.length > 0) {
             parsedTasks = [taskDraftWithLocalReminder(raw, 'medium')];

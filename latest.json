@@ -1,9 +1,9 @@
 {
-  "versionName": "1.4.20",
-  "versionCode": 36,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.20/Triority-v1.4.20.apk",
-  "sha256": "661E26DDE26FA186006D7823AB28FE886F06B144DA381085C8A63B0E5C907A21",
-  "releaseNotes": "AI grocery/material capitalization now stays stable after repeated AI parse or sort passes.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.20",
+  "versionName": "1.4.21",
+  "versionCode": 37,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.21/Triority-v1.4.21.apk",
+  "sha256": "82AB8C080703493E05C0D9C8230A3D58B14DDFEF66259D94CE1F2B68B74D33B2",
+  "releaseNotes": "Mixed AI captures now keep task text clean while routing parsed grocery/material items to Grocery, with better Personal Context list routing.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.21",
   "required": false
 }
