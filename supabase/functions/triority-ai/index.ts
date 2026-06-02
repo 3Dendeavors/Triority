@@ -269,14 +269,25 @@ function outputMatchesSchema(value: unknown, schema: unknown): boolean {
   return true;
 }
 
+function serverRouteGuardrail(toolName: string) {
+  if (toolName !== 'route_triority_input' && toolName !== 'capture_widget_tasks') return '';
+  return `Server routing override:
+- Split mixed captures into ownership spans before writing JSON. A task row owns only the direct action/event clause; grocery/material rows own item nouns.
+- Do not duplicate the same user phrase as both a task and grocery/material row. If an item appears in grocery/material output, do not append that item name to task text.
+- A direct action with a person/object plus date/time remains one task; a trailing run of buyable grocery/material nouns after it becomes grocery/material rows, even without "buy/get" wording.
+- Grocery/material nouns are open-ended household, medical, hardware, office, project, and food items. Do not depend on a fixed grocery vocabulary.
+- For task list routing, use WORKSPACE list names, samples, Personal Context, and domain/model/device/project terms. Exact list names are not required when the task clearly matches a list's context.`;
+}
+
 async function requestGemini(system: string, user: string, maxTokens: number, schema: unknown, toolName: string, apiKey: string) {
   const jsonSchema = geminiJsonSchema(schema);
   const legacySchema = geminiLegacySchema(schema);
   const schemaText = JSON.stringify(jsonSchema);
   const shapeInstruction = `Return ONLY a valid JSON object matching this exact top-level shape. No markdown, no explanation, no wrapper key:\n${schemaText}`;
+  const guardedSystem = [system, serverRouteGuardrail(toolName)].filter(Boolean).join('\n\n');
   const outputTokens = Math.min(8192, Math.max(4096, maxTokens * 4, maxTokens + 3000));
   const base = {
-    systemInstruction: { parts: [{ text: `${system}\n\n${shapeInstruction}` }] },
+    systemInstruction: { parts: [{ text: `${guardedSystem}\n\n${shapeInstruction}` }] },
     contents: [{ role: 'user', parts: [{ text: user }] }],
   };
   const requests = [
