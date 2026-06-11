@@ -106,6 +106,8 @@ Release signing files and Firebase config are intentionally not committed. See `
 
 Triority is free. If it earns a spot on your home screen, you can [buy me a coffee](https://buymeacoffee.com/3DEndeavors).
 
+Check my other works on my website! https://3dendeavors.com/
+
 ## Documentation Map
 
 Public/user-facing docs:
