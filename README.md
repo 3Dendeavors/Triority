@@ -1,14 +1,56 @@
+<!-- ============================================================
+  🎬 VIDEO — FEATURE DEMO (30 seconds)
+  ROSS: open this README in the GitHub WEB editor, delete the
+  single blockquote line between these markers, and drag-drop:
+  E:\Creative\Triority\marketing\triority-demos\out\triority-hero-30s.mp4
+  GitHub uploads it to user-attachments and the bare URL renders
+  as a native video player. Do NOT wrap the URL in a link.
+============================================================ -->
+> 🎬 **Video coming shortly — 30-second feature demo.**
+<!-- ====================== END VIDEO ====================== -->
+
 <p align="center">
   <img src="assets/logo.png" alt="Triority logo" width="96">
 </p>
 
 # Triority
 
-Triority is a private-first Android task, grocery, reminder, and AI triage app. It is built around quick capture, three practical priority tiers, optional Google sync, shared household-style lists, Android voice widgets, included tester AI, and optional bring-your-own AI provider access.
+**Intuitive to-do list with a three-tier priority queue and cloud sync.**
 
-Triority is distributed as a signed Android APK through GitHub Releases. It is not currently distributed through the Play Store, so installation is a normal Android sideload.
+<p align="center">
+  <a href="https://github.com/3Dendeavors/Triority/releases/latest">
+    <img src="https://img.shields.io/github/v/release/3Dendeavors/Triority?style=for-the-badge&label=DOWNLOAD%20APK&logo=android&logoColor=white&color=5b9eff" alt="Download the latest Triority APK">
+  </a>
+  &nbsp;
+  <a href="https://buymeacoffee.com/3DEndeavors">
+    <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Support Triority on Buy Me a Coffee">
+  </a>
+</p>
+
+Long flat to-do lists hide what actually matters. Triority ranks everything you capture into **High, Medium, and Low** — across as many lists as you need — so the next action is always obvious. AI sorting, shared household lists, and optional Google sync are built in.
+
+Triority is free and distributed as a signed Android APK through GitHub Releases. It is not currently on the Play Store, so installation is a normal Android sideload.
+
+## Features
+
+- **AI Sort** — dump everything in one line; the included tester AI (or your own Gemini or Claude Sonnet key) splits it into ranked tasks and grocery items, aware of your current lists, Personal Context, and workspace.
+- **Shared Lists** — household-style task lists and one shared grocery page through optional sign-in and invite codes.
+- **Grocery List Separation** — groceries and materials live in their own lane with category sorting, Got It, recipe/project quantities, and duplicate protection.
+- **Three-Tier Priority Queue** — High / Medium / Low across multiple task lists, with drag reorder, archive/restore, reminders, and new-row focus shine.
+
+Also includes: Android launcher widgets for voice capture and Next Up previews, local and shared reminders that alert only where each user allows notifications, optional read-only Google Calendar conflict checks, themes and accent colors, and AI capitalization that keeps sensible display casing without drifting into all-caps.
+
+<p align="center">
+  <img src="assets/landing%20page.jpg" alt="Triority landing page with High, Medium, and Low tiers" width="220">
+  &nbsp;
+  <img src="assets/setting%20page.jpg" alt="Triority settings page" width="220">
+  &nbsp;
+  <img src="assets/archive%20page.jpg" alt="Triority archive page" width="220">
+</p>
 
 ## Install
+
+Sideloading is normal for Triority: enable installs from unknown sources in **Settings → Apps** when Android asks.
 
 The current public beta APK is published on GitHub Releases:
 
@@ -29,21 +71,6 @@ To install:
 Use the APK asset for installs. The source-code `.zip` and `.tar.gz` files attached to GitHub tags are for developers and will not install the Android app.
 
 Installed builds check this repo's `latest.json` and prompt when a newer APK is available. Installing a newer signed APK over the old one should preserve local app data as long as the package id and signing key match.
-
-## What It Does
-
-- Tasks organized into High, Medium, and Low tiers.
-- Multiple task lists with drag reorder, archive/restore, reminders, and new-row focus shine.
-- Grocery/material list with category sorting, Got It, recipe/project quantities, and duplicate protection.
-- Shared task lists and one shared grocery page through optional sign-in and invite codes.
-- Local and shared task reminders, with each device alerting only when that user allows notifications.
-- Optional read-only Google Calendar conflict checks for reminder tasks.
-- Included tester AI by default, plus optional AI triage using your own Gemini or Claude Sonnet API key, Personal Context, and current task/grocery workspace.
-- AI-created and AI-organized grocery/material names keep sensible display capitalization without drifting into all-caps after repeated AI sort passes.
-- Android launcher widgets for voice capture and Next Up previews.
-- Themes, accent colors, widget appearance controls, and optional support through Buy Me a Coffee.
-
-Support link: https://buymeacoffee.com/3DEndeavors
 
 ## Privacy
 
@@ -66,19 +93,18 @@ Full policy: [PRIVACY.md](PRIVACY.md)
 
 This is a React Native Android app. Most app logic intentionally lives in `App.tsx`.
 
-For local release builds after JavaScript changes:
+For local release builds after JavaScript changes, then installing over an attached Android device without wiping app data:
 
 ```powershell
 npm run android:release
-```
-
-To install that signed build over an attached Android device without wiping app data:
-
-```powershell
 npm run android:install-release
 ```
 
 Release signing files and Firebase config are intentionally not committed. See `scripts/prepare-github-release-secrets.ps1` for preparing GitHub Actions release secrets from local private files.
+
+## Support
+
+Triority is free. If it earns a spot on your home screen, you can [buy me a coffee](https://buymeacoffee.com/3DEndeavors).
 
 ## Documentation Map
 
