@@ -101,6 +101,9 @@ yarn-error.log
 /_screenshots/
 /Triority/
 
+# Internal marketing assets (tracked in their own local-only git repo)
+/marketing/
+
 # Local working docs and agent handoffs
 CODEX_CHANGES.md
 CODEX_WORKSPACE.md
