@@ -39,12 +39,38 @@ class TriorityWidgetModule(private val reactContext: ReactApplicationContext) : 
   @ReactMethod
   fun consumePendingCaptures(promise: Promise) {
     try {
-      val prefs = reactContext.getSharedPreferences(TriorityQuickCaptureWidgetProvider.CAPTURE_PREFS_NAME, Context.MODE_PRIVATE)
-      val pending = prefs.getString(TriorityQuickCaptureWidgetProvider.PENDING_CAPTURES_KEY, "[]") ?: "[]"
-      prefs.edit().putString(TriorityQuickCaptureWidgetProvider.PENDING_CAPTURES_KEY, "[]").commit()
-      promise.resolve(pending)
+      promise.resolve(TriorityQuickCaptureWidgetProvider.consumeCaptures(reactContext))
     } catch (e: Throwable) {
       promise.reject("widget_capture_consume_failed", e)
+    }
+  }
+
+  @ReactMethod
+  fun peekPendingCaptures(promise: Promise) {
+    try {
+      promise.resolve(TriorityQuickCaptureWidgetProvider.pendingCaptures(reactContext))
+    } catch (e: Throwable) {
+      promise.reject("widget_capture_read_failed", e)
+    }
+  }
+
+  @ReactMethod
+  fun acknowledgePendingCapture(captureId: String, promise: Promise) {
+    try {
+      TriorityQuickCaptureWidgetProvider.acknowledgeCapture(reactContext, captureId)
+      promise.resolve(null)
+    } catch (e: Throwable) {
+      promise.reject("widget_capture_ack_failed", e)
+    }
+  }
+
+  @ReactMethod
+  fun updatePendingCaptureDraft(captureId: String, draftJson: String, promise: Promise) {
+    try {
+      TriorityQuickCaptureWidgetProvider.updateCaptureDraft(reactContext, captureId, draftJson)
+      promise.resolve(null)
+    } catch (e: Throwable) {
+      promise.reject("widget_capture_update_failed", e)
     }
   }
 

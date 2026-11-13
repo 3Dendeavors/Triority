@@ -114,6 +114,7 @@ interface WidgetPendingCapture {
   mode?: WidgetCaptureMode;
   listId?: string;
   createdAt?: number;
+  remainingDraft?: WidgetAiCaptureDraft;
 }
 
 interface WidgetNextUpItem {
@@ -863,6 +864,7 @@ function aiTextHasReminderCue(input: string) {
   const normalized = input.replace(/\s+/g, ' ').trim();
   if (!normalized) return false;
   return /\b(remind me|reminder|set a reminder|alarm|notify|notification|repeat|repeating|hourly|daily|weekly)\b/i.test(normalized)
+    || /\b(noon|midnight)\b/i.test(normalized)
     || /\b(at|around|round|by|before|after)\s+(?:\d{1,2}(?::\d{2}|\s+[0-5]\d)?|\d{3,4})\s*(am|pm|a|p)?\b/i.test(normalized)
     || /\bevery\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?|weeks?)\b/i.test(normalized)
     || /\bin\s+\d+\s*(m|min|mins|minutes|h|hr|hrs|hours|days?)\b/i.test(normalized)
@@ -986,15 +988,26 @@ function aiInputAllowsReminder(raw: string, taskText?: string) {
 }
 
 function reminderDateFromClockClause(clause: string, nowMs = Date.now()) {
-  const clockMatch = clause.match(/\b(?:at|around|round|by|before|after)?\s*(?:(\d{3,4})|(\d{1,2})(?::(\d{2})|\s+([0-5]\d))?)\s*(am|pm|a|p)?\b/i);
+  const namedClock = clause.match(/\b(noon|midnight)\b/i);
+  const clockValue = '(?:(\\d{3,4})|(\\d{1,2})(?::(\\d{2})|\\s+([0-5]\\d))?)';
+  // An object number or a relative day count is not a clock time.
+  const clockMatch = clause.match(new RegExp(`\\b(?:at|around|round|by|before|after)\\s+${clockValue}\\s*(am|pm|a|p)?\\b`, 'i'))
+    ?? clause.match(new RegExp(`\\b${clockValue}\\s*(am|pm)\\b`, 'i'));
+  if (namedClock && !clockMatch) {
+    const date = new Date(nowMs);
+    if (/\btomorrow\b/i.test(clause)) date.setDate(date.getDate() + 1);
+    date.setHours(namedClock[1].toLowerCase() === 'noon' ? 12 : 0, 0, 0, 0);
+    if (date.getTime() < nowMs - 60000 && !/\btomorrow\b/i.test(clause)) date.setDate(date.getDate() + 1);
+    return date;
+  }
   if (!clockMatch) return null;
   const compactTime = clockMatch[1];
   let hour = compactTime
     ? Number(compactTime.slice(0, -2))
     : Number(clockMatch[2]);
-  const minute = Math.max(0, Math.min(59, Number(compactTime ? compactTime.slice(-2) : (clockMatch[3] ?? clockMatch[4] ?? 0))));
+  const minute = Number(compactTime ? compactTime.slice(-2) : (clockMatch[3] ?? clockMatch[4] ?? 0));
   const suffix = clockMatch[5]?.toLowerCase();
-  hour = Math.max(0, Math.min(23, hour));
+  if (hour > 23 || minute > 59 || (suffix && (hour < 1 || hour > 12))) return null;
   if (suffix === 'pm' || suffix === 'p') {
     if (hour < 12) hour += 12;
   } else if (suffix === 'am' || suffix === 'a') {
@@ -1080,9 +1093,15 @@ function buildLocalReminderFromTaskText(text: string, nowMs = Date.now()): Remin
   return buildReminderFallbackFromRaw(raw, raw, nowMs);
 }
 
-function taskDraftWithLocalReminder(text: string, tier: Tier, reminder?: Reminder): TaskDraft {
+export function widgetCaptureReferenceTime(createdAt: unknown, nowMs = Date.now()): number {
+  return typeof createdAt === 'number' && Number.isFinite(createdAt) && createdAt > 0 && createdAt <= nowMs
+    ? createdAt
+    : nowMs;
+}
+
+export function taskDraftWithLocalReminder(text: string, tier: Tier, reminder?: Reminder, referenceTimeMs = Date.now()): TaskDraft {
   const raw = text.replace(/\s+/g, ' ').trim();
-  const resolvedReminder = reminder ?? buildLocalReminderFromTaskText(raw);
+  const resolvedReminder = reminder ?? buildLocalReminderFromTaskText(raw, referenceTimeMs);
   return {
     text: resolvedReminder ? cleanReminderTimingFromTaskText(raw) : raw,
     tier,
@@ -1792,6 +1811,7 @@ function protectPlainTaskTextRegister(input: string, aiText: string) {
 
 function cleanReminderTimingFromTaskText(text: string) {
   const cleaned = text
+    .replace(/\b(?:at|around|round|by|before|after)\s+(?:noon|midnight)\b/gi, ' ')
     .replace(/\b(?:at|around|round|by|before|after)\s+(?:\d{1,2}(?::\d{2}|\s+[0-5]\d)?|\d{3,4})\s*(?:am|pm|a|p)?\b/gi, ' ')
     .replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a|p)\b/gi, ' ')
     .replace(/\bin\s+\d+\s*(?:m|min|mins|minutes|h|hr|hrs|hours|days?)\b/gi, ' ')
@@ -2127,17 +2147,20 @@ ${allowMultiDestination
   return { blocked: null, prompt, destinationHint };
 }
 
-function buildReminderFromAIResult(r: any, raw = '', taskText = ''): Reminder | undefined {
+export function buildReminderFromAIResult(r: any, raw = '', taskText = '', referenceTimeMs = Date.now()): Reminder | undefined {
   if (raw && !shouldAllowAiReminderForTask(raw, taskText)) return undefined;
-  if (!r || typeof r.hour !== 'number') return raw ? buildReminderFallbackFromRaw(raw, taskText) : undefined;
+  if (!r || typeof r.hour !== 'number' || !Number.isFinite(r.hour)
+    || !Number.isFinite(Number(r.daysFromNow ?? 0)) || !Number.isFinite(Number(r.minute ?? 0))) {
+    return raw ? buildReminderFallbackFromRaw(raw, taskText, referenceTimeMs) : undefined;
+  }
   const days = Math.max(0, Math.min(365, Number(r.daysFromNow ?? 0)));
   const hour = Math.max(0, Math.min(23, Math.round(Number(r.hour))));
   const minute = Math.max(0, Math.min(59, Math.round(Number(r.minute ?? 0))));
-  const d = new Date();
+  const d = new Date(referenceTimeMs);
   d.setDate(d.getDate() + days);
   d.setHours(hour, minute, 0, 0);
   let remindAt = d.getTime();
-  if (remindAt < Date.now() - 60000 && days === 0) {
+  if (remindAt < referenceTimeMs - 60000 && days === 0) {
     d.setDate(d.getDate() + 1);
     remindAt = d.getTime();
   }
@@ -2263,12 +2286,7 @@ function widgetDisplayLabel(task: Pick<Task, 'text' | 'widgetLabel'>): string {
   return local || stored || fullText;
 }
 
-function fallbackWidgetCapture(raw: string, defaultTier: Tier, listId: string | null = null): WidgetAiCaptureDraft {
-  const tasks = [taskDraftWithLocalReminder(raw, defaultTier)];
-  return { listId, tasks, taskGroups: [{ listId, tasks }], grocery: [] };
-}
-
-async function parseWidgetAiCapture({
+export async function parseWidgetAiCapture({
   raw,
   lists,
   activeListId,
@@ -2279,6 +2297,7 @@ async function parseWidgetAiCapture({
   personalContext,
   isPaid,
   widgetShorthand,
+  referenceTimeMs = Date.now(),
 }: {
   raw: string;
   lists: TaskList[];
@@ -2290,162 +2309,160 @@ async function parseWidgetAiCapture({
   personalContext: string;
   isPaid: boolean;
   widgetShorthand: boolean;
+  referenceTimeMs?: number;
 }): Promise<WidgetAiCaptureDraft> {
-  const fallbackListId = defaultTaskDestinationListId(lists);
-  if (!hasApiKey || (aiProviderRequiresKey(aiProvider) && !apiKey)) return fallbackWidgetCapture(raw, defaultTier, fallbackListId);
+  if (!hasApiKey || (aiProviderRequiresKey(aiProvider) && !apiKey)) {
+    throw new Error('Set up your AI provider in Settings, then retry the saved widget capture.');
+  }
 
-  try {
-    const nowDate = new Date();
-    const nowDescr = nowDate.toLocaleString('en-US', {
-      weekday: 'long',
-      month: 'long',
-      day: 'numeric',
-      year: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-    });
-    const listMap = lists.map(l => ({ id: l.id, name: l.name }));
-    const multiList = isPaid && listMap.length > 1;
-    const groceryEnabled = isPaid;
-    const workspaceContext = buildTaskWorkspaceContext(raw, lists, activeListId, personalContext, true);
-    if (workspaceContext.blocked) return fallbackWidgetCapture(raw, defaultTier, fallbackListId);
-    const aiPersonalContext = compactPersonalContextForAi(personalContext);
-    const groceryContextRules = groceryPersonalContextInstruction(personalContext);
-    const taskContextRules = taskPersonalContextInstruction(personalContext);
-    const inferGroceryQuantities = shouldInferGroceryQuantities(raw);
-    const quantityInstruction = groceryQuantityInstruction(inferGroceryQuantities);
-    const seasoningInstruction = cookingSeasoningInstruction(raw);
-    const systemPrompt = buildAiRouteSystemPrompt({
-      nowDescr,
-      aiPersonalContext,
-      taskContextRules,
-      workspacePrompt: workspaceContext.prompt,
-      groceryEnabled,
-      groceryContextRules,
-      quantityInstruction,
-      seasoningInstruction,
-      multiList,
-      widgetShorthand,
-    });
+  const nowDate = new Date(referenceTimeMs);
+  const nowDescr = nowDate.toLocaleString('en-US', {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+  const listMap = lists.map(l => ({ id: l.id, name: l.name }));
+  const multiList = isPaid && listMap.length > 1;
+  const groceryEnabled = isPaid;
+  const workspaceContext = buildTaskWorkspaceContext(raw, lists, activeListId, personalContext, true);
+  if (workspaceContext.blocked) throw new Error(`${workspaceContext.blocked.message}. ${workspaceContext.blocked.sub}`);
+  const aiPersonalContext = compactPersonalContextForAi(personalContext);
+  const groceryContextRules = groceryPersonalContextInstruction(personalContext);
+  const taskContextRules = taskPersonalContextInstruction(personalContext);
+  const inferGroceryQuantities = shouldInferGroceryQuantities(raw);
+  const quantityInstruction = groceryQuantityInstruction(inferGroceryQuantities);
+  const seasoningInstruction = cookingSeasoningInstruction(raw);
+  const systemPrompt = buildAiRouteSystemPrompt({
+    nowDescr,
+    aiPersonalContext,
+    taskContextRules,
+    workspacePrompt: workspaceContext.prompt,
+    groceryEnabled,
+    groceryContextRules,
+    quantityInstruction,
+    seasoningInstruction,
+    multiList,
+    widgetShorthand,
+  });
 
-    const parsed = await requestAiStructuredOutput({
+  const parsed = await requestAiStructuredOutput({
+    provider: aiProvider,
+    apiKey,
+    system: systemPrompt,
+    user: raw,
+    maxTokens: 800,
+    tool: aiRouteInputTool(multiList, widgetShorthand),
+    toolName: AI_ROUTE_INPUT_TOOL_NAME,
+  });
+  let parsedTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+  const parsedGroceryItems = groceryItemsFromAiPayload(parsed?.grocery);
+  const recoveredGroceryItems = directGroceryDraftsFromRaw(raw);
+  const retryGeneratedTasks = taskRowsNeedGenerationRetry(parsedTasks, raw);
+  const missingGeneratedTasks = !retryGeneratedTasks
+    && taskRowsMissingGeneratedHint(parsedTasks, raw, workspaceContext.destinationHint, lists, personalContext);
+  const thinGeneratedTasks = !retryGeneratedTasks && taskRowsNeedGenerationDetailRetry(parsedTasks, raw);
+  const underfilledGeneratedTasks = !retryGeneratedTasks && !thinGeneratedTasks && taskRowsUnderfillGeneratedTopic(parsedTasks, raw);
+  if (retryGeneratedTasks || missingGeneratedTasks || underfilledGeneratedTasks || thinGeneratedTasks) {
+    const generatedTasks = await generateTaskRowsForAiSlice({
       provider: aiProvider,
       apiKey,
-      system: systemPrompt,
-      user: raw,
-      maxTokens: 800,
-      tool: aiRouteInputTool(multiList, widgetShorthand),
-      toolName: AI_ROUTE_INPUT_TOOL_NAME,
-    });
-    let parsedTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
-    const parsedGroceryItems = groceryItemsFromAiPayload(parsed?.grocery);
-    const recoveredGroceryItems = directGroceryDraftsFromRaw(raw);
-    const retryGeneratedTasks = taskRowsNeedGenerationRetry(parsedTasks, raw);
-    const missingGeneratedTasks = !retryGeneratedTasks
-      && taskRowsMissingGeneratedHint(parsedTasks, raw, workspaceContext.destinationHint, lists, personalContext);
-    const thinGeneratedTasks = !retryGeneratedTasks && taskRowsNeedGenerationDetailRetry(parsedTasks, raw);
-    const underfilledGeneratedTasks = !retryGeneratedTasks && !thinGeneratedTasks && taskRowsUnderfillGeneratedTopic(parsedTasks, raw);
-    if (retryGeneratedTasks || missingGeneratedTasks || underfilledGeneratedTasks || thinGeneratedTasks) {
-      const generatedTasks = await generateTaskRowsForAiSlice({
-        provider: aiProvider,
-        apiKey,
-        raw,
-        personalContext,
-        nowDescr,
-        workspacePrompt: workspaceContext.prompt,
-        multiList,
-        widgetShorthand,
-      }).catch(() => []);
-      const concreteGeneratedTasks = concreteGeneratedTaskRows(generatedTasks, raw);
-      parsedTasks = retryGeneratedTasks
-        ? mergeGeneratedTaskRetryRows(parsedTasks, concreteGeneratedTasks, raw)
-        : mergeGeneratedTaskExpansionRows(parsedTasks, concreteGeneratedTasks, raw);
-    }
-    parsedTasks = normalizeMixedAiTaskRows(parsedTasks, raw, parsedGroceryItems);
-    if (taskRowsUnderfillGeneratedTopic(parsedTasks, raw)) {
-      parsedTasks = mergeGeneratedTaskExpansionRows(parsedTasks, fallbackGeneratedTaskRowsFromRaw(raw), raw);
-    }
-    if (parsedTasks.length === 0 && (hasDirectTaskActionIntent(raw) || hasScheduledEventStatement(raw))) {
-      parsedTasks = [taskDraftWithLocalReminder(cleanMixedGroceryTermsFromTaskText(raw, raw, parsedGroceryItems), defaultTier)];
-    }
-    if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw, parsedGroceryItems) && parsedGroceryItems.length > 0) {
-      parsedTasks = [taskDraftWithLocalReminder(raw, defaultTier)];
-    }
-    const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0 && recoveredGroceryItems.length === 0;
-    const validTier = new Set<string>(['high', 'medium', 'low']);
-    const validListIds = new Set(listMap.map(l => l.id));
-    const defaultRouteListId = multiList ? defaultTaskDestinationListId(lists) : null;
-    const tasksByList = new Map<string | null, TaskDraft[]>();
-
-    parsedTasks.forEach((item: any) => {
-      let text = String(item?.text ?? '').trim();
-      if (onePlainTaskOnly) text = protectPlainTaskTextRegister(raw, text);
-      if (!text) return;
-      if (taskTextConflictsPersonalContext(text, raw, personalContext)) return;
-      const tier = (validTier.has(item?.tier) ? item.tier : defaultTier) as Tier;
-      const listId = resolveAiTaskListId({
-        text,
-        raw,
-        aiListIdValue: item?.listId,
-        lists,
-        multiList,
-        validListIds,
-        destinationHint: workspaceContext.destinationHint,
-        defaultRouteListId,
-        personalContext,
-      });
-      const reminder = buildReminderFromAIResult(item?.reminder, raw, text);
-      const taskText = reminder ? cleanReminderTimingFromTaskText(text) : text;
-      const bucket = tasksByList.get(listId) ?? [];
-      bucket.push({
-        text: taskText,
-        widgetLabel: normalizeWidgetLabel(item?.widgetLabel, taskText),
-        tier,
-        reminder,
-      });
-      tasksByList.set(listId, bucket);
-    });
-
-    let grocery = groceryEnabled
-      ? parsedGroceryItems
-          .map((item: any) => normalizeGroceryDraft(item, raw, inferGroceryQuantities))
-          .filter((item: GroceryDraft | null): item is GroceryDraft => !!item)
-          .filter((item: GroceryDraft) => groceryDraftAllowedByPersonalContext(item, personalContext))
-      : [];
-    grocery = mergeRecoveredGroceryDrafts(grocery, raw);
-    if (shouldDropIncidentalAiGroceryRows(raw, grocery)) {
-      grocery = [];
-    }
-    if (groceryEnabled && groceryDraftsNeedGenerationRetry(grocery, raw)) {
-      const generatedGrocery = await generateGroceryItemsForAiSlice({
-        provider: aiProvider,
-        apiKey,
-        raw,
-        personalContext,
-      }).catch(() => []);
-      if (generatedGrocery.length > 0) grocery = generatedGrocery;
-    }
-    if (groceryEnabled && (groceryDraftsNeedPackageSizeRetry(grocery, raw) || groceryDraftsNeedNeededAmountRetry(grocery, raw))) {
-      const generatedGrocery = await generateGroceryItemsForAiSlice({
-        provider: aiProvider,
-        apiKey,
-        raw,
-        personalContext,
-      }).catch(() => []);
-      if (generatedGrocery.length > 0) grocery = generatedGrocery;
-    }
-    grocery = capitalizeGroceryDrafts(trimGeneratedGroceryRowsForScope(grocery, raw));
-
-    const taskGroups = Array.from(tasksByList.entries())
-      .filter(([, items]) => items.length > 0)
-      .map(([listId, items]) => ({ listId, tasks: items }));
-    const first = taskGroups[0];
-    if (!first && grocery.length === 0) return fallbackWidgetCapture(raw, defaultTier, fallbackListId);
-    return { listId: first?.listId ?? null, tasks: first?.tasks ?? [], taskGroups, grocery };
-  } catch {
-    return fallbackWidgetCapture(raw, defaultTier, fallbackListId);
+      raw,
+      personalContext,
+      nowDescr,
+      workspacePrompt: workspaceContext.prompt,
+      multiList,
+      widgetShorthand,
+    }).catch(() => []);
+    const concreteGeneratedTasks = concreteGeneratedTaskRows(generatedTasks, raw);
+    parsedTasks = retryGeneratedTasks
+      ? mergeGeneratedTaskRetryRows(parsedTasks, concreteGeneratedTasks, raw)
+      : mergeGeneratedTaskExpansionRows(parsedTasks, concreteGeneratedTasks, raw);
   }
+  parsedTasks = normalizeMixedAiTaskRows(parsedTasks, raw, parsedGroceryItems);
+  if (taskRowsUnderfillGeneratedTopic(parsedTasks, raw)) {
+    parsedTasks = mergeGeneratedTaskExpansionRows(parsedTasks, fallbackGeneratedTaskRowsFromRaw(raw), raw);
+  }
+  if (parsedTasks.length === 0 && (hasDirectTaskActionIntent(raw) || hasScheduledEventStatement(raw))) {
+    parsedTasks = [taskDraftWithLocalReminder(cleanMixedGroceryTermsFromTaskText(raw, raw, parsedGroceryItems), defaultTier, undefined, referenceTimeMs)];
+  }
+  if (parsedTasks.length === 0 && shouldDropIncidentalAiGroceryRows(raw, parsedGroceryItems) && parsedGroceryItems.length > 0) {
+    parsedTasks = [taskDraftWithLocalReminder(raw, defaultTier, undefined, referenceTimeMs)];
+  }
+  const onePlainTaskOnly = parsedTasks.length === 1 && parsedGroceryItems.length === 0 && recoveredGroceryItems.length === 0;
+  const validTier = new Set<string>(['high', 'medium', 'low']);
+  const validListIds = new Set(listMap.map(l => l.id));
+  const defaultRouteListId = multiList ? defaultTaskDestinationListId(lists) : null;
+  const tasksByList = new Map<string | null, TaskDraft[]>();
+
+  parsedTasks.forEach((item: any) => {
+    let text = String(item?.text ?? '').trim();
+    if (onePlainTaskOnly) text = protectPlainTaskTextRegister(raw, text);
+    if (!text) return;
+    if (taskTextConflictsPersonalContext(text, raw, personalContext)) return;
+    const tier = (validTier.has(item?.tier) ? item.tier : defaultTier) as Tier;
+    const listId = resolveAiTaskListId({
+      text,
+      raw,
+      aiListIdValue: item?.listId,
+      lists,
+      multiList,
+      validListIds,
+      destinationHint: workspaceContext.destinationHint,
+      defaultRouteListId,
+      personalContext,
+    });
+    const reminder = buildReminderFromAIResult(item?.reminder, raw, text, referenceTimeMs);
+    const taskText = reminder ? cleanReminderTimingFromTaskText(text) : text;
+    const bucket = tasksByList.get(listId) ?? [];
+    bucket.push({
+      text: taskText,
+      widgetLabel: normalizeWidgetLabel(item?.widgetLabel, taskText),
+      tier,
+      reminder,
+    });
+    tasksByList.set(listId, bucket);
+  });
+
+  let grocery = groceryEnabled
+    ? parsedGroceryItems
+        .map((item: any) => normalizeGroceryDraft(item, raw, inferGroceryQuantities))
+        .filter((item: GroceryDraft | null): item is GroceryDraft => !!item)
+        .filter((item: GroceryDraft) => groceryDraftAllowedByPersonalContext(item, personalContext))
+    : [];
+  grocery = mergeRecoveredGroceryDrafts(grocery, raw);
+  if (shouldDropIncidentalAiGroceryRows(raw, grocery)) {
+    grocery = [];
+  }
+  if (groceryEnabled && groceryDraftsNeedGenerationRetry(grocery, raw)) {
+    const generatedGrocery = await generateGroceryItemsForAiSlice({
+      provider: aiProvider,
+      apiKey,
+      raw,
+      personalContext,
+    }).catch(() => []);
+    if (generatedGrocery.length > 0) grocery = generatedGrocery;
+  }
+  if (groceryEnabled && (groceryDraftsNeedPackageSizeRetry(grocery, raw) || groceryDraftsNeedNeededAmountRetry(grocery, raw))) {
+    const generatedGrocery = await generateGroceryItemsForAiSlice({
+      provider: aiProvider,
+      apiKey,
+      raw,
+      personalContext,
+    }).catch(() => []);
+    if (generatedGrocery.length > 0) grocery = generatedGrocery;
+  }
+  grocery = capitalizeGroceryDrafts(trimGeneratedGroceryRowsForScope(grocery, raw));
+
+  const taskGroups = Array.from(tasksByList.entries())
+    .filter(([, items]) => items.length > 0)
+    .map(([listId, items]) => ({ listId, tasks: items }));
+  const first = taskGroups[0];
+  if (!first && grocery.length === 0) throw new Error('AI returned no tasks or groceries. Retry the saved widget capture.');
+  return { listId: first?.listId ?? null, tasks: first?.tasks ?? [], taskGroups, grocery };
 }
 
 type SharedListKind = 'tasks' | 'grocery';
@@ -2512,18 +2529,18 @@ interface UserNotification {
   readAt: number | null;
 }
 
-type AiProvider = 'built-in' | 'gemini' | 'claude';
-type StoredAiProvider = AiProvider | 'openai' | 'claude-haiku';
+type AiProvider = 'built-in' | 'openai' | 'gemini' | 'claude';
+type StoredAiProvider = AiProvider | 'claude-haiku';
 
 const AI_PROVIDER_KEY = 'tri_ai_provider_v1';
 const DEFAULT_AI_PROVIDER: AiProvider = 'built-in';
 const ANTHROPIC_HAIKU_MODEL = 'claude-haiku-4-5';
 const ANTHROPIC_SONNET_MODEL = 'claude-sonnet-4-6';
 const ANTHROPIC_MODEL = ANTHROPIC_SONNET_MODEL;
-const OPENAI_MODEL = 'gpt-5.4-nano';
+const OPENAI_MODEL = 'gpt-6-luna';
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 const TRIORITY_AI_PROXY_URL = 'https://ivzbipfmgpulsyzsamfx.supabase.co/functions/v1/triority-ai';
-const PUBLIC_AI_PROVIDERS: AiProvider[] = ['built-in', 'gemini', 'claude'];
+const PUBLIC_AI_PROVIDERS: AiProvider[] = ['built-in', 'openai', 'gemini', 'claude'];
 
 const AI_PROVIDER_META: Record<AiProvider, {
   label: string;
@@ -2537,11 +2554,20 @@ const AI_PROVIDER_META: Record<AiProvider, {
   'built-in': {
     label: 'Included Triority AI',
     shortLabel: 'Built-in',
-    model: GEMINI_MODEL,
+    model: 'Triority AI',
     keyPlaceholder: '',
     keyUrl: '',
     invalidMessage: '',
     costHint: 'Included for testers through Triority, with no API key stored in the app.',
+  },
+  openai: {
+    label: 'OpenAI GPT-6 Luna',
+    shortLabel: 'OpenAI',
+    model: OPENAI_MODEL,
+    keyPlaceholder: 'sk-...',
+    keyUrl: 'https://platform.openai.com/api-keys',
+    invalidMessage: 'OpenAI keys start with sk- (not sk-ant-).',
+    costHint: 'Uses your OpenAI API account for task and grocery organization.',
   },
   gemini: {
     label: 'Gemini 2.5 Flash-Lite',
@@ -2580,6 +2606,9 @@ const { TriorityWidget } = NativeModules as {
       micSide?: WidgetMicSide;
     }) => void;
     consumePendingCaptures: () => Promise<string>;
+    peekPendingCaptures: () => Promise<string>;
+    acknowledgePendingCapture: (id: string) => Promise<void>;
+    updatePendingCaptureDraft: (id: string, draft: string) => Promise<void>;
     showWidgetResult?: (message: string) => void;
   };
 };
@@ -2962,12 +2991,13 @@ function anthropicToolInputFromResponse(data: any, toolName: string) {
   return parseAiJson(anthropicTextFromResponse(data));
 }
 
-function normalizeAiProvider(value: unknown, apiKey: string = ''): AiProvider {
+export function normalizeAiProvider(value: unknown, apiKey: string = ''): AiProvider {
   if (value === 'built-in') return 'built-in';
   if (value === 'claude' || value === 'claude-haiku') return 'claude';
-  if (value === 'gemini' || value === 'openai') return 'gemini';
+  if (value === 'gemini' || value === 'openai') return value;
   const trimmed = apiKey.trim();
   if (trimmed.startsWith('sk-ant-')) return 'claude';
+  if (trimmed.startsWith('sk-')) return 'openai';
   if (trimmed.startsWith('AIza')) return 'gemini';
   return DEFAULT_AI_PROVIDER;
 }
@@ -2981,10 +3011,11 @@ function anthropicModelForProvider(provider: AiProvider) {
   return ANTHROPIC_MODEL;
 }
 
-function isValidAiKey(provider: AiProvider, key: string) {
+export function isValidAiKey(provider: AiProvider, key: string) {
   const trimmed = key.trim();
   if (!trimmed) return false;
   if (isAnthropicAiProvider(provider)) return trimmed.startsWith('sk-ant-');
+  if (provider === 'openai') return trimmed.startsWith('sk-') && !trimmed.startsWith('sk-ant-') && trimmed.length >= 20;
   if (provider === 'gemini') return trimmed.startsWith('AIza') && trimmed.length >= 20;
   return false;
 }
@@ -3030,7 +3061,7 @@ function aiErrorDetail(provider: AiProvider, error: any) {
   if (lower.includes('overload') || lower.includes('unavailable') || lower.includes('try again later') || lower.includes('temporarily')) return `${providerName} is temporarily busy; try again.`;
   if (lower.includes('not found') || lower.includes('not supported') || lower.includes('does not exist') || lower.includes('model')) return `The configured ${providerName} model was rejected.`;
   if (lower.includes('output limit') || lower.includes('max_tokens') || lower.includes('max tokens')) return `${providerName} response was cut off; retry or shorten the request.`;
-  if (lower.includes('structured json') || lower.includes('json') || lower.includes('schema')) return `${providerName} returned an unexpected format; the raw item was added instead.`;
+  if (lower.includes('structured json') || lower.includes('json') || lower.includes('schema')) return `${providerName} returned an unexpected format. Please retry.`;
   if (lower.includes('network') || lower.includes('failed to fetch') || lower.includes('timeout')) return 'Network request failed.';
   return message.slice(0, 90);
 }
@@ -3056,9 +3087,12 @@ function groceryItemsFromAiPayload(payload: any) {
 }
 
 function openAiResponsesTextFromResponse(data: any) {
-  if (data?.status === 'incomplete' && data?.incomplete_details?.reason === 'max_output_tokens') {
-    throw new Error('OpenAI response hit the output limit before valid JSON.');
+  if (data?.status === 'incomplete') {
+    throw new Error(data?.incomplete_details?.reason === 'max_output_tokens'
+      ? 'OpenAI response hit the output limit before valid JSON.'
+      : 'OpenAI could not finish organizing this capture. Please retry.');
   }
+  if (data?.error || data?.status === 'failed') throw new Error(String(data?.error?.message || 'OpenAI request failed.'));
   if (typeof data?.output_text === 'string' && data.output_text.trim()) return data.output_text;
   const chunks: string[] = [];
   const pushContentText = (content: any) => {
@@ -3180,8 +3214,23 @@ function geminiBackoffMs(attempt: number, data: any, headers?: any) {
   return base + Math.floor(Math.random() * 250);
 }
 
-function openAiStructuredSchema(schema: any) {
-  return JSON.parse(JSON.stringify(schema));
+export function openAiStructuredSchema(schema: any): any {
+  if (Array.isArray(schema)) return schema.map(openAiStructuredSchema);
+  if (!schema || typeof schema !== 'object') return schema;
+  const result: Record<string, any> = { ...schema };
+  if (schema.properties) {
+    const required = new Set<string>(schema.required || []);
+    result.properties = Object.fromEntries(Object.entries(schema.properties).map(([key, value]) => {
+      const property = openAiStructuredSchema(value);
+      return [key, required.has(key) ? property : { anyOf: [property, { type: 'null' }] }];
+    }));
+    result.required = Object.keys(schema.properties);
+    result.additionalProperties = false;
+  }
+  if (schema.items) result.items = openAiStructuredSchema(schema.items);
+  if (schema.anyOf) result.anyOf = schema.anyOf.map(openAiStructuredSchema);
+  if (schema.$defs) result.$defs = Object.fromEntries(Object.entries(schema.$defs).map(([key, value]) => [key, openAiStructuredSchema(value)]));
+  return result;
 }
 
 function geminiJsonSchema(schema: any) {
@@ -3230,7 +3279,8 @@ function geminiLegacySchema(schema: any): any {
 }
 
 function openAiOutputBudget(maxTokens: number) {
-  return Math.min(4096, Math.max(maxTokens * 2, maxTokens + 700));
+  // Strict schemas include nullable keys on every row, including absent reminders.
+  return Math.min(8192, Math.max(4096, maxTokens * 4));
 }
 
 function geminiOutputBudget(maxTokens: number) {
@@ -3355,29 +3405,51 @@ async function requestOpenAiStructuredOutput({
   schema: any;
   toolName: string;
 }) {
-  const resp = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      instructions: `${system}${openAiInstructionDetail(toolName)}`,
-      input: [{ role: 'user', content: user }],
-      max_output_tokens: openAiOutputBudget(maxTokens),
-      reasoning: { effort: 'none' },
-      store: false,
-      text: {
-        format: {
-          type: 'json_schema',
-          name: toolName,
-          strict: false,
-          schema: openAiStructuredSchema(schema),
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const resp = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        instructions: `${system}${openAiInstructionDetail(toolName)}\nReturn null for optional fields that do not apply. Do not invent reminders or destinations to fill nullable fields.`,
+        input: [{ role: 'user', content: user }],
+        max_output_tokens: openAiOutputBudget(maxTokens),
+        reasoning: { effort: 'none' },
+        store: false,
+        text: {
+          format: {
+            type: 'json_schema',
+            name: toolName,
+            strict: true,
+            schema: openAiStructuredSchema(schema),
+          },
         },
-      },
-    }),
-  });
-  const data = await resp.json();
-  if (!resp.ok) throw new Error(JSON.stringify(data));
-  return parseAiJson(openAiResponsesTextFromResponse(data));
+      }),
+    });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      if (resp.status === 401 || resp.status === 403) throw new Error('OpenAI API key or permission was rejected.');
+      if (resp.status === 429) throw new Error(data?.error?.code === 'insufficient_quota'
+        ? 'OpenAI billing quota needs attention.' : 'OpenAI is temporarily busy; try again.');
+      if (resp.status >= 500) throw new Error('OpenAI is temporarily unavailable; try again.');
+      throw new Error('OpenAI rejected the model or structured output request.');
+    }
+    const parsed = parseAiJson(openAiResponsesTextFromResponse(data));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || Object.entries(schema.properties || {}).some(([key, value]: [string, any]) =>
+        value.type === 'array' && !Array.isArray(parsed[key]))) {
+      throw new Error('OpenAI returned an unexpected JSON schema.');
+    }
+    return parsed;
+  } catch (error: any) {
+    if (controller.signal.aborted) throw new Error('OpenAI network request timed out. Please retry.');
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function requestBuiltInAiStructuredOutput({
@@ -3419,7 +3491,7 @@ async function requestBuiltInAiStructuredOutput({
   return data.output;
 }
 
-async function requestAiStructuredOutput({
+export async function requestAiStructuredOutput({
   provider,
   apiKey,
   system,
@@ -3442,6 +3514,9 @@ async function requestAiStructuredOutput({
   const schema = tool?.input_schema || tool?.parameters || tool;
   if (provider === 'built-in') {
     return requestBuiltInAiStructuredOutput({ system, user, maxTokens, schema, toolName });
+  }
+  if (provider === 'openai') {
+    return requestOpenAiStructuredOutput({ apiKey, system, user, maxTokens, schema, toolName });
   }
   return requestGeminiStructuredOutput({ apiKey, system, user, maxTokens, schema });
 }
@@ -6295,8 +6370,8 @@ const TIERS_DEF = (T: ThemeTokens) => [
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const CURRENT_APP_VERSION_CODE = 37;
-const CURRENT_APP_VERSION_NAME = '1.4.21';
+const CURRENT_APP_VERSION_CODE = 38;
+const CURRENT_APP_VERSION_NAME = '1.4.22';
 const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/3Dendeavors/Triority/main/latest.json';
 
 interface UpdateManifest {
@@ -13770,7 +13845,7 @@ function Settings({ accent, aiProvider, setAiProvider, apiKey, setApiKey, hasApi
             </>
           ) : (
             <Text style={[styles.keyHint, { color: T.textMute, fontFamily: jks('400') }]}>
-              Built-in AI is on by default for testers. Requests go through Triority's protected server, and the Gemini key is not stored in the app.
+              Built-in AI is on by default for testers. Requests go through Triority's protected server, and the provider key is not stored in the app.
             </Text>
           )}
         </View>
@@ -14625,6 +14700,9 @@ function TriorityApp() {
   const [widgetImportToast, setWidgetImportToast] = useState<ToastData | null>(null);
   const [accountRestoreStatus, setAccountRestoreStatus] = useState<string | null>(null);
   const widgetCaptureRunningRef = useRef(false);
+  const widgetCaptureAttemptedIdsRef = useRef(new Set<string>());
+  const widgetGroceryItemsRef = useRef(groceryItems);
+  useEffect(() => { widgetGroceryItemsRef.current = groceryItems; }, [groceryItems]);
   const widgetImportToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [calendarConflictsEnabled, setCalendarConflictsEnabledState] = useState(false);
   const [calendarConflictKeys, setCalendarConflictKeys] = useState<Set<string>>(new Set());
@@ -15485,17 +15563,19 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     return newTasks.map((task) => task.id);
   }, [armExternalPendingTaskGlow, armFocusedTask, openTaskGroupsForDrafts, setListTasks]);
 
-  const addManyToListFromWidget = useCallback((listId: string, items: TaskDraft[]) => {
+  const addManyToListFromWidget = useCallback(async (listId: string, items: TaskDraft[], captureId: string) => {
     openTaskGroupsForDrafts(listId, items);
     const now = Date.now();
-    const newTasks: Task[] = items.map((item, i) => ({
-      id: now + i,
+    const existingIds = new Set(listsRef.current.find(list => list.id === listId)?.tasks.map(task => task.id));
+    const capturedTasks: Task[] = items.map((item, i) => ({
+      id: `${captureId}:${listId}:${i}`,
       text: item.text,
       widgetLabel: item.widgetLabel,
       tier: item.tier,
       createdAt: now + i,
       reminder: item.reminder,
     }));
+    const newTasks = capturedTasks.filter(task => !existingIds.has(task.id));
     const reminderTiers = new Set<Tier>(newTasks.filter(task => !!task.reminder).map(task => task.tier));
     setListTasks(listId, (existing) => {
       if (reminderTiers.size === 0) return [...existing, ...newTasks];
@@ -15535,9 +15615,18 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
       });
       return ordered;
     });
-    scheduleRemindersBatch(newTasks, () => {}, listId);
-    return newTasks.map((task) => task.id);
-  }, [openTaskGroupsForDrafts, setListTasks]);
+    // Wait for a durable local save before acknowledging the queued capture.
+    await AsyncStorage.setItem('tri_lists', JSON.stringify(listsRef.current));
+    let warning: string | undefined;
+    await scheduleRemindersBatch(capturedTasks, (message, sub) => {
+      warning = sub ? `${message}. ${sub}` : message;
+      showWidgetImportToast(message, sub, true);
+    }, listId).catch(() => {
+      warning = 'Reminder could not be scheduled. Check Settings → Alarms & reminders';
+      showWidgetImportToast('Reminder could not be scheduled', 'Check Settings → Alarms & reminders', true);
+    });
+    return { ids: newTasks.map((task) => task.id), warning };
+  }, [openTaskGroupsForDrafts, setListTasks, showWidgetImportToast]);
 
   const setActiveListId = useCallback((id: string) => {
     markLocalDirty();
@@ -16206,37 +16295,56 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
   }, [armFocusedGrocery, armPendingGroceryGlow, openGroceryGroupsForDrafts]);
 
   useEffect(() => {
-    if (!ready || sharedListsHydrating || sharedListsStartupHold || sharedGroceryStartupHold || !TriorityWidget?.consumePendingCaptures) return;
+    if (!ready || sharedListsHydrating || sharedListsStartupHold || sharedGroceryStartupHold || !TriorityWidget?.peekPendingCaptures) return;
 
     const resolveWidgetTargetListId = (candidate?: string | null) => {
-      if (candidate && mergedLists.some(list => list.id === candidate)) return candidate;
+      if (candidate) {
+        if (mergedLists.some(list => list.id === candidate)) return candidate;
+        throw new Error('The destination list is not available yet');
+      }
       if (mergedLists.some(list => list.id === activeListId)) return activeListId;
       return lists[0]?.id ?? DEFAULT_LIST_ID;
     };
 
-    const addWidgetItems = async (targetListId: string, items: TaskDraft[]) => {
-      const resolvedListId = resolveWidgetTargetListId(targetListId);
+    const addWidgetItems = async (targetListId: string, items: TaskDraft[], captureId: string) => {
+      if (!mergedLists.some(list => list.id === targetListId)) throw new Error('The destination list is not available yet');
+      const resolvedListId = targetListId;
       openTaskGroupsForDrafts(resolvedListId, items);
       if (sharedTaskIdSet.has(resolvedListId)) {
-        try {
-          const ids = await addSharedTaskItems(resolvedListId, items);
-          return { listId: resolvedListId, ids: Array.isArray(ids) ? ids : [] };
-        } catch {
-          const fallbackListId = lists[0]?.id ?? DEFAULT_LIST_ID;
-          const ids = addManyToListFromWidget(fallbackListId, items);
-          return { listId: fallbackListId, ids: Array.isArray(ids) ? ids : [] };
-        }
+        const ids = await addSharedTaskItems(resolvedListId, items);
+        const addedIds = Array.isArray(ids) ? ids : [];
+        const tasksToSchedule: Task[] = addedIds.map((id, index) => ({
+          ...items[index], id: `shared_${resolvedListId}_${id}`, createdAt: Date.now(),
+          reminderListId: resolvedListId, reminderTaskId: id,
+        }));
+        return { listId: resolvedListId, ids: addedIds, warning: undefined as string | undefined, tasksToSchedule };
       }
-      const ids = addManyToListFromWidget(resolvedListId, items);
-      return { listId: resolvedListId, ids: Array.isArray(ids) ? ids : [] };
+      const result = await addManyToListFromWidget(resolvedListId, items, captureId);
+      return { listId: resolvedListId, ...result, tasksToSchedule: [] as Task[] };
     };
 
-    const widgetResultSummary = (taskCount: number, groceryCount: number, reminderCount: number) => {
+    const addWidgetGroceries = async (items: GroceryDraft[], captureId: string) => {
+      if (usingSharedGrocery) return addGroceryItemsForScreen(items);
+      const existing = widgetGroceryItemsRef.current;
+      const filtered = filterUncheckedGroceryDuplicates(items, existing);
+      const now = Date.now();
+      const added: GroceryItem[] = filtered.map((item, index) => ({
+        id: `${captureId}:grocery:${items.indexOf(item)}`, name: item.name.trim(),
+        category: item.category || GROCERY_UNCATEGORIZED,
+        quantity: formatGroceryQuantityText(item.quantity), unit: cleanOptionalGroceryPart(item.unit),
+        packageSize: cleanPackageSize(item.packageSize), checked: false, createdAt: now + index,
+      }));
+      const next = [...existing, ...added];
+      widgetGroceryItemsRef.current = next;
+      setGroceryItemsState(next);
+      markLocalDirty();
+      await AsyncStorage.setItem('tri_grocery', JSON.stringify(next));
+      return added.map(item => item.id);
+    };
+
+    const widgetResultSummary = (taskCount: number, groceryCount: number) => {
       if (taskCount === 0 && groceryCount > 0) {
         return `Added ${groceryCount} ${groceryCount === 1 ? 'grocery' : 'groceries'}`;
-      }
-      if (groceryCount === 0 && taskCount > 0 && reminderCount === taskCount) {
-        return `Created ${taskCount} ${taskCount === 1 ? 'reminder' : 'reminders'}`;
       }
       if (groceryCount > 0 && taskCount > 0) {
         return `Added ${taskCount} ${taskCount === 1 ? 'task' : 'tasks'} + ${groceryCount} ${groceryCount === 1 ? 'grocery' : 'groceries'}`;
@@ -16247,18 +16355,23 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
       return '';
     };
 
-    const consumeWidgetCaptures = async () => {
+    const consumeWidgetCaptures = async (retryPending = false) => {
       if (widgetCaptureRunningRef.current) return;
+      if (retryPending) widgetCaptureAttemptedIdsRef.current.clear();
       widgetCaptureRunningRef.current = true;
       try {
-        const raw = await TriorityWidget.consumePendingCaptures();
+        const raw = await TriorityWidget.peekPendingCaptures();
         if (!raw) return;
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed) || parsed.length === 0) return;
+        const queued = JSON.parse(raw);
+        if (!Array.isArray(queued)) throw new Error('Could not read queued widget captures');
+        const parsed = (queued as WidgetPendingCapture[]).filter(capture => (
+          typeof capture.id === 'string' && !widgetCaptureAttemptedIdsRef.current.has(capture.id)
+        ));
+        if (parsed.length === 0) return;
         const aiCaptureCount = parsed.filter((capture: WidgetPendingCapture) => capture?.mode === 'ai').length;
         showWidgetImportToast(
           aiCaptureCount > 0 ? 'Organizing widget capture' : 'Adding widget capture',
-          aiCaptureCount > 0 ? 'AI starts when Triority opens' : undefined,
+          'Your capture stays queued until it is added',
           true,
         );
 
@@ -16268,73 +16381,107 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
         let addedTasks = 0;
         let addedGroceries = 0;
         let requestedGroceries = 0;
-        let failedGroceries = 0;
-        let addedReminders = 0;
+        let failedCaptures = 0;
+        let failureMessage = '';
+        let schedulingWarning: string | undefined;
+        let overdueReminders = 0;
 
         for (const capture of parsed as WidgetPendingCapture[]) {
+          const captureId = capture.id!;
+          widgetCaptureAttemptedIdsRef.current.add(captureId);
           const text = String(capture?.text ?? '').trim();
-          if (!text) continue;
-          try { TriorityWidget.showWidgetResult?.('Organizing in Triority'); } catch {}
-          const tier = capture?.tier === 'high' || capture?.tier === 'low' || capture?.tier === 'medium' ? capture.tier : 'medium';
-          const preferredListId = resolveWidgetTargetListId(typeof capture?.listId === 'string' ? capture.listId : activeListId);
-          const draft = capture?.mode === 'ai'
-            ? await parseWidgetAiCapture({
-                raw: text,
-                lists: mergedLists,
-                activeListId: preferredListId,
-                defaultTier: tier,
-                aiProvider,
-                apiKey,
-                hasApiKey,
-                personalContext,
-                isPaid,
-                widgetShorthand,
-              })
-            : { listId: preferredListId, tasks: [{ text, tier }], grocery: [] };
-
-          const taskGroups = draft.taskGroups && draft.taskGroups.length > 0
-            ? draft.taskGroups
-            : [{ listId: draft.listId, tasks: draft.tasks }];
-          for (const group of taskGroups) {
-            if (group.tasks.length === 0) continue;
-            const addResult = await addWidgetItems(group.listId ?? preferredListId, group.tasks);
-            addedTasks += group.tasks.length;
-            addedReminders += group.tasks.filter(item => !!item.reminder).length;
-            (addResult.ids || []).forEach((id) => {
-              if (id != null) taskFocusCandidates.push({ listId: addResult.listId, id });
-            });
+          if (!text) {
+            await TriorityWidget.acknowledgePendingCapture(captureId);
+            continue;
           }
+          try {
+            try { TriorityWidget.showWidgetResult?.('Organizing in Triority'); } catch {}
+            const tier = capture?.tier === 'high' || capture?.tier === 'low' || capture?.tier === 'medium' ? capture.tier : 'medium';
+            const preferredListId = resolveWidgetTargetListId(typeof capture?.listId === 'string' ? capture.listId : activeListId);
+            const referenceTimeMs = widgetCaptureReferenceTime(capture.createdAt);
+            const draft: WidgetAiCaptureDraft = capture.remainingDraft ?? (capture?.mode === 'ai'
+              ? await parseWidgetAiCapture({
+                  raw: text,
+                  lists: mergedLists,
+                  activeListId: preferredListId,
+                  defaultTier: tier,
+                  aiProvider,
+                  apiKey,
+                  hasApiKey,
+                  personalContext,
+                  isPaid,
+                  widgetShorthand,
+                  referenceTimeMs,
+                })
+              : { listId: preferredListId, tasks: [taskDraftWithLocalReminder(text, tier, undefined, referenceTimeMs)], grocery: [] });
 
-          if (draft.grocery.length > 0) {
-            requestedGroceries += draft.grocery.length;
-            let ids: string[] = [];
-            try {
-              const result = await Promise.resolve(addGroceryItemsForScreen(draft.grocery));
-              ids = Array.isArray(result) ? result.filter(Boolean) : [];
-            } catch {
-              failedGroceries += draft.grocery.length;
+            let taskGroups = draft.taskGroups
+              ? draft.taskGroups
+              : [{ listId: draft.listId, tasks: draft.tasks }];
+            const saveRemaining = (grocery = draft.grocery) => TriorityWidget.updatePendingCaptureDraft(captureId, JSON.stringify({
+              listId: null, tasks: [], taskGroups, grocery,
+            }));
+            await saveRemaining();
+            while (taskGroups.length > 0) {
+              const group = taskGroups[0];
+              const addResult = group.tasks.length > 0
+                ? await addWidgetItems(group.listId ?? preferredListId, group.tasks, captureId)
+                : { listId: group.listId ?? preferredListId, ids: [] as TaskId[], warning: undefined, tasksToSchedule: [] as Task[] };
+              addedTasks += addResult.ids.length;
+              schedulingWarning = addResult.warning ?? schedulingWarning;
+              overdueReminders += group.tasks.filter(item => item.reminder
+                && !item.reminder.repeatHourly && !item.reminder.repeatDaily
+                && item.reminder.remindAt <= Date.now()).length;
+              (addResult.ids || []).forEach((id) => {
+                if (id != null) taskFocusCandidates.push({ listId: addResult.listId, id });
+              });
+              taskGroups = taskGroups.slice(1);
+              await saveRemaining();
+              // Checkpoint a shared write before permission UI can background the app.
+              await scheduleRemindersBatch(addResult.tasksToSchedule, (message, sub) => {
+                schedulingWarning = sub ? `${message}. ${sub}` : message;
+                showWidgetImportToast(message, sub, true);
+              }, addResult.listId).catch(() => {
+                schedulingWarning = 'Reminder could not be scheduled. Check Settings → Alarms & reminders';
+              });
             }
-            if (ids.length > 0) {
-              addedGroceries += ids.length;
-              groceryFocusDrafts.push(...draft.grocery);
-              groceryFocusIds.push(...ids);
+
+            if (draft.grocery.length > 0) {
+              requestedGroceries += draft.grocery.length;
+              const result = await addWidgetGroceries(draft.grocery, captureId);
+              const ids = Array.isArray(result) ? result.filter(Boolean) : [];
+              if (ids.length > 0) {
+                addedGroceries += ids.length;
+                groceryFocusDrafts.push(...draft.grocery);
+                groceryFocusIds.push(...ids);
+              }
+              await saveRemaining([]);
             }
+            await TriorityWidget.acknowledgePendingCapture(captureId);
+          } catch (error) {
+            failedCaptures++;
+            failureMessage = error instanceof Error ? error.message : 'Could not finish organizing';
           }
         }
 
-        const resultText = widgetResultSummary(addedTasks, addedGroceries, addedReminders);
-        if (resultText) {
-          const resultSub = failedGroceries > 0
-            ? 'Some groceries could not be added'
+        const resultText = widgetResultSummary(addedTasks, addedGroceries);
+        if (failedCaptures > 0) {
+          const message = resultText ? `${resultText}; ${failedCaptures} capture${failedCaptures === 1 ? '' : 's'} still queued` : 'Widget capture still queued';
+          showWidgetImportToast(message, `${failureMessage}. Reopen Triority to retry.`, true);
+          try { TriorityWidget.showWidgetResult?.('Capture queued — reopen to retry'); } catch {}
+        } else if (resultText) {
+          const resultSub = schedulingWarning ?? (overdueReminders > 0
+            ? `${overdueReminders} reminder time${overdueReminders === 1 ? ' has' : 's have'} already passed; check the saved task${overdueReminders === 1 ? '' : 's'}`
             : requestedGroceries > addedGroceries
               ? 'Already on grocery list'
-              : 'From widget';
-          showWidgetImportToast(resultText, resultSub);
+              : 'From widget');
+          showWidgetImportToast(resultText, resultSub, !!schedulingWarning || overdueReminders > 0);
           try { TriorityWidget.showWidgetResult?.(resultText); } catch {}
+        } else if (schedulingWarning || overdueReminders > 0) {
+          showWidgetImportToast('Widget tasks saved', schedulingWarning ?? 'A saved reminder time has already passed; check the task', true);
         } else if (requestedGroceries > 0) {
           showWidgetImportToast(
-            failedGroceries > 0 ? 'Could not add grocery' : 'Already on grocery list',
-            failedGroceries > 0 ? 'Check connection and try again' : undefined,
+            'Already on grocery list',
           );
         } else {
           showWidgetImportToast('Widget capture finished');
@@ -16365,7 +16512,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
           setScreen('grocery');
         }
       } catch {
-        showWidgetImportToast('Widget capture failed', 'Try again from the widget');
+        showWidgetImportToast('Widget capture still queued', 'Reopen Triority to retry', true);
       }
       finally {
         widgetCaptureRunningRef.current = false;
@@ -16374,7 +16521,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
 
     consumeWidgetCaptures();
     const sub = AppState.addEventListener('change', (next) => {
-      if (next === 'active') consumeWidgetCaptures();
+      if (next === 'active') consumeWidgetCaptures(true);
     });
 
     return () => {
@@ -16393,6 +16540,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     hasApiKey,
     isPaid,
     lists,
+    markLocalDirty,
     mergedLists,
     openTaskGroupsForDrafts,
     personalContext,
@@ -16403,6 +16551,7 @@ If text fallback happens, return JSON: [{"id":"item_id","category":"Dairy"}]`;
     sharedListsStartupHold,
     sharedTaskIdSet,
     showWidgetImportToast,
+    usingSharedGrocery,
     widgetShorthand,
   ]);
 

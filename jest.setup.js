@@ -5,6 +5,9 @@ import { NativeModules, Text } from 'react-native';
 NativeModules.TriorityWidget = NativeModules.TriorityWidget || {
   configure: jest.fn(),
   consumePendingCaptures: jest.fn(() => Promise.resolve('[]')),
+  peekPendingCaptures: jest.fn(() => Promise.resolve('[]')),
+  acknowledgePendingCapture: jest.fn(() => Promise.resolve()),
+  updatePendingCaptureDraft: jest.fn(() => Promise.resolve()),
   showWidgetResult: jest.fn(),
 };
 

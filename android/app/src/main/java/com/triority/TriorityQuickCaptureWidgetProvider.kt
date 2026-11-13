@@ -19,8 +19,10 @@ import android.os.SystemClock
 import android.util.TypedValue
 import android.view.View
 import android.widget.RemoteViews
+import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
 class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
   override fun onReceive(context: Context, intent: Intent) {
@@ -40,6 +42,7 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
     const val PREFS_NAME = "triority_widget_prefs"
     const val CAPTURE_PREFS_NAME = "triority_widget_capture_prefs"
     const val PENDING_CAPTURES_KEY = "pending_captures"
+    const val EXTRA_SUBMIT_CAPTURE = "triority.widget.submitCapture"
 
     const val ACTION_REFRESH_WIDGET = "com.triority.widget.REFRESH"
     private const val ACTION_CANCEL_REVIEW = "com.triority.widget.CANCEL_REVIEW"
@@ -142,7 +145,7 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
         .apply()
     }
 
-    private fun submitTranscript(context: Context) {
+    fun submitTranscript(context: Context) {
       val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
       val transcript = prefs.getString(KEY_TRANSCRIPT, "")?.trim().orEmpty()
       if (transcript.isBlank()) {
@@ -154,26 +157,70 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
       val hasApiKey = prefs.getBoolean("hasApiKey", false)
       val mode = if (hasApiKey) "ai" else "manual"
       val activeListId = prefs.getString("activeListId", "default") ?: "default"
-      queueCapture(context, transcript, mode, activeListId)
-      showTemporaryResult(context, if (hasApiKey) "Queued for Triority" else "Task saved")
+      try {
+        queueCapture(context, transcript, mode, activeListId)
+        showTemporaryResult(context, "Opening Triority")
+      } catch (_: Throwable) {
+        // Keep the review transcript available when the queue could not be saved.
+        Toast.makeText(context, "Could not save capture. Try Organize again.", Toast.LENGTH_LONG).show()
+        updateAll(context)
+      }
     }
 
+    @Synchronized
     private fun queueCapture(context: Context, text: String, mode: String, activeListId: String) {
       val prefs = context.getSharedPreferences(CAPTURE_PREFS_NAME, Context.MODE_PRIVATE)
-      val arr = try {
-        JSONArray(prefs.getString(PENDING_CAPTURES_KEY, "[]"))
-      } catch (_: Throwable) {
-        JSONArray()
-      }
+      val arr = JSONArray(prefs.getString(PENDING_CAPTURES_KEY, "[]"))
       arr.put(JSONObject().apply {
-        put("id", "widget_${System.currentTimeMillis()}")
+        put("id", "widget_${UUID.randomUUID()}")
         put("text", text)
         put("tier", "medium")
         put("mode", mode)
         put("listId", activeListId)
         put("createdAt", System.currentTimeMillis())
       })
-      prefs.edit().putString(PENDING_CAPTURES_KEY, arr.toString()).commit()
+      check(prefs.edit().putString(PENDING_CAPTURES_KEY, arr.toString()).commit())
+    }
+
+    @Synchronized
+    fun pendingCaptures(context: Context): String {
+      val prefs = context.getSharedPreferences(CAPTURE_PREFS_NAME, Context.MODE_PRIVATE)
+      return prefs.getString(PENDING_CAPTURES_KEY, "[]") ?: "[]"
+    }
+
+    @Synchronized
+    fun acknowledgeCapture(context: Context, captureId: String) {
+      val prefs = context.getSharedPreferences(CAPTURE_PREFS_NAME, Context.MODE_PRIVATE)
+      val pending = JSONArray(prefs.getString(PENDING_CAPTURES_KEY, "[]"))
+      val remaining = JSONArray()
+      for (index in 0 until pending.length()) {
+        val capture = pending.getJSONObject(index)
+        if (capture.optString("id") != captureId) remaining.put(capture)
+      }
+      check(prefs.edit().putString(PENDING_CAPTURES_KEY, remaining.toString()).commit())
+    }
+
+    @Synchronized
+    fun updateCaptureDraft(context: Context, captureId: String, draftJson: String) {
+      val prefs = context.getSharedPreferences(CAPTURE_PREFS_NAME, Context.MODE_PRIVATE)
+      val pending = JSONArray(prefs.getString(PENDING_CAPTURES_KEY, "[]"))
+      for (index in 0 until pending.length()) {
+        val capture = pending.getJSONObject(index)
+        if (capture.optString("id") == captureId) {
+          capture.put("remainingDraft", JSONObject(draftJson))
+          check(prefs.edit().putString(PENDING_CAPTURES_KEY, pending.toString()).commit())
+          return
+        }
+      }
+      error("Widget capture no longer exists")
+    }
+
+    @Synchronized
+    fun consumeCaptures(context: Context): String {
+      val prefs = context.getSharedPreferences(CAPTURE_PREFS_NAME, Context.MODE_PRIVATE)
+      val pending = prefs.getString(PENDING_CAPTURES_KEY, "[]") ?: "[]"
+      check(prefs.edit().putString(PENDING_CAPTURES_KEY, "[]").commit())
+      return pending
     }
 
     private fun showTemporaryState(context: Context, state: String, message: String, durationMs: Long) {
@@ -387,7 +434,7 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
       val cycleIntent = broadcastIntent(context, ACTION_ROTATE_NEXT_UP, 41)
       val previousIntent = broadcastIntent(context, ACTION_ROTATE_PREVIOUS_NEXT_UP, 42)
       val openIntent = nextUpItem?.let { openTaskIntent(context, it) }
-      val submitIntent = broadcastIntent(context, ACTION_SUBMIT_TRANSCRIPT, 33)
+      val submitIntent = submitCaptureIntent(context)
       val cancelIntent = broadcastIntent(context, ACTION_CANCEL_REVIEW, 31)
       val refreshIntent = broadcastIntent(context, ACTION_REFRESH_WIDGET, 50)
       val previewOpenIntent = openIntent ?: cycleIntent
@@ -421,7 +468,7 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
       views.setOnClickPendingIntent(R.id.widget_cancel_button, cancelIntent)
       views.setOnClickPendingIntent(R.id.widget_cancel_text, broadcastIntent(context, ACTION_CANCEL_REVIEW, 32))
       views.setOnClickPendingIntent(R.id.widget_submit_button, submitIntent)
-      views.setOnClickPendingIntent(R.id.widget_submit_text, broadcastIntent(context, ACTION_SUBMIT_TRANSCRIPT, 34))
+      views.setOnClickPendingIntent(R.id.widget_submit_text, submitIntent)
 
       appWidgetManager.updateAppWidget(appWidgetId, views)
     }
@@ -516,6 +563,14 @@ class TriorityQuickCaptureWidgetProvider : AppWidgetProvider() {
         intent,
         PendingIntent.FLAG_UPDATE_CURRENT or immutableFlag()
       )
+    }
+
+    private fun submitCaptureIntent(context: Context): PendingIntent {
+      val intent = Intent(context, MainActivity::class.java).apply {
+        putExtra(EXTRA_SUBMIT_CAPTURE, true)
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+      }
+      return PendingIntent.getActivity(context, 433, intent, PendingIntent.FLAG_UPDATE_CURRENT or immutableFlag())
     }
 
     private fun broadcastIntent(context: Context, action: String, requestCode: Int): PendingIntent {

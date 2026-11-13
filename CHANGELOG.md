@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v1.4.22 - 2026-11-13
+
+- Widget Organize/Add now opens Triority and processes the capture immediately, so reminders no longer wait for a separate app launch.
+- Reminder parsing keeps the original capture time, recognizes noon and midnight, and avoids confusing task numbers with clock times.
+- Failed widget captures stay available for retry instead of becoming raw fallback tasks. Reminder scheduling failures and elapsed reminder times are shown clearly.
+- Added OpenAI GPT-6 Luna as a personal API-key option. Included Triority AI continues to use Gemini; no OpenAI key is bundled or shared through the included-AI service.
+- Improved capture retry handling and added regression coverage for widget reminders, mixed tasks/groceries, and provider-key separation.
+
 ## v1.4.21 - 2026-06-02
 
 - Fixed mixed AI task/grocery captures so grocery or material item names parsed into Grocery do not also leak onto task text.
