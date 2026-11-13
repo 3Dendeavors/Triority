@@ -33,7 +33,7 @@ Triority is free and distributed as a signed Android APK through GitHub Releases
 
 ## Features
 
-- **AI Sort** — dump everything in one line; the included tester AI (or your own Gemini or Claude Sonnet key) splits it into ranked tasks and grocery items, aware of your current lists, Personal Context, and workspace.
+- **AI Sort** — dump everything in one line; the included tester AI (or your own OpenAI GPT-6 Luna, Gemini, or Claude Sonnet key) splits it into ranked tasks and grocery items, aware of your current lists, Personal Context, and workspace.
 - **Shared Lists** — household-style task lists and one shared grocery page through optional sign-in and invite codes.
 - **Grocery List Separation** — groceries and materials live in their own lane with category sorting, Got It, recipe/project quantities, and duplicate protection.
 - **Three-Tier Priority Queue** — High / Medium / Low across multiple task lists, with drag reorder, archive/restore, reminders, and new-row focus shine.
@@ -55,15 +55,15 @@ Sideloading is normal for Triority: enable installs from unknown sources in **Se
 The current public beta APK is published on GitHub Releases:
 
 - Latest release: https://github.com/3Dendeavors/Triority/releases/latest
-- Current beta: `v1.4.21`
+- Current beta: `v1.4.22`
 - Android package id: `com.triority`
-- Current APK: `Triority-v1.4.21.apk`
-- SHA-256: `82AB8C080703493E05C0D9C8230A3D58B14DDFEF66259D94CE1F2B68B74D33B2`
+- Current APK: `Triority-v1.4.22.apk`
+- SHA-256: `C634409216628AC1FE3668714559BDBD661B6B3EB96CAC9E27A5441768583CB5`
 
 To install:
 
 1. Open the latest release page on your Android device.
-2. Under **Assets**, download `Triority-v1.4.21.apk`.
+2. Under **Assets**, download `Triority-v1.4.22.apk`.
 3. If Android asks, allow your browser or file manager to install unknown apps.
 4. Open the downloaded APK and tap **Install**.
 5. Launch Triority from your app drawer.

@@ -1,9 +1,9 @@
 {
-  "versionName": "1.4.21",
-  "versionCode": 37,
-  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.21/Triority-v1.4.21.apk",
-  "sha256": "82AB8C080703493E05C0D9C8230A3D58B14DDFEF66259D94CE1F2B68B74D33B2",
-  "releaseNotes": "Mixed AI captures now keep task text clean while routing parsed grocery/material items to Grocery, with better Personal Context list routing.",
-  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.21",
+  "versionName": "1.4.22",
+  "versionCode": 38,
+  "apkUrl": "https://github.com/3Dendeavors/Triority/releases/download/v1.4.22/Triority-v1.4.22.apk",
+  "sha256": "C634409216628AC1FE3668714559BDBD661B6B3EB96CAC9E27A5441768583CB5",
+  "releaseNotes": "Widget captures process immediately with more reliable reminder times and retry handling. OpenAI GPT-6 Luna is available with your personal API key; included AI remains Gemini.",
+  "releaseNotesUrl": "https://github.com/3Dendeavors/Triority/releases/tag/v1.4.22",
   "required": false
 }
